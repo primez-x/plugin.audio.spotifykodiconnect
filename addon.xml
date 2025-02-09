@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<addon id="plugin.audio.spotify" version="1.3.13" name="Spotify" provider-name="glk1001">
+<addon id="plugin.audio.spotify" version="1.3.14" name="Spotify" provider-name="glk1001">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
         <import addon="xbmc.addon" version="18.9.701" />
@@ -20,10 +20,10 @@
         <disclaimer lang="en_GB">This product uses the SPOTIFY WEB API but is not endorsed, certified or otherwise approved in any way by Spotify. Spotify is the registered trademark of Spotify AB.</disclaimer>
         <source>https://github.com/glk1001/plugin.audio.spotify</source>
         <website>https://github.com/glk1001/glk1001.github.io</website>
-        <news>v1.3.13-test (2025-01-09)
-Changed default album retrieval for 'artists' to just albums and singles instead of everything. And added more logging to figure how many cached/non-cached things the plugin is retrieving.
+        <news>v1.3.14 (2025-02-10)
+Upgraded python 'bottle' module to version '0.14-dev'. Now works with python 3.13.
+1.3.13: Changed default album retrieval for 'artists' to just albums and singles instead of everything. And added more logging to figure how many cached/non-cached things the plugin is retrieving.
 1.3.12: Added a workaround setting "problem_with_terminate_streaming" to not terminate streaming early. Added for Raspberry Pi devices.
-1.3.11: Fixed 'all albums' for artist menu. Added extra artist track options. Cleaned menus.
         </news>
         <assets>
             <icon>resources/icon.png</icon>
