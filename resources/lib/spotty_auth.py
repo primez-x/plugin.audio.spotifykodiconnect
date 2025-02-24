@@ -14,7 +14,6 @@ from utils import log_msg, log_exception, ADDON_ID
 
 ZEROCONF_PORT = 10001
 
-CLIENT_ID = "2eb96f9b37494be1824999d58028a305"
 SPOTTY_SCOPE = [
     "user-read-playback-state",
     "user-read-currently-playing",
@@ -34,11 +33,14 @@ SPOTTY_SCOPE = [
 
 
 class SpottyAuth:
-    def __init__(self, spotty: Spotty):
+    def __init__(self, spotty: Spotty, client_id: str):
         self.__spotty = spotty
+        self.client_id = client_id
 
     def start_zeroconf_authenticate(self) -> Union[None, subprocess.Popen]:
         try:
+            log_msg(f"Starting zeroconf setup with port: {ZEROCONF_PORT}.")
+
             if os.path.exists(self.__spotty.get_spotty_credentials_file()):
                 os.replace(
                     self.__spotty.get_spotty_credentials_file(),
@@ -84,7 +86,7 @@ class SpottyAuth:
         return f'{msg}\n\n"{cred_file}".'
 
     def renew_token(self) -> None:
-        log_msg("Retrieving auth token....", LOGDEBUG)
+        log_msg(f"Retrieving auth token for client_id '{self.client_id}'...", LOGDEBUG)
 
         auth_token = self.__get_retry_auth_token()
         if not auth_token:
@@ -125,7 +127,7 @@ class SpottyAuth:
         try:
             args = [
                 "--client-id",
-                CLIENT_ID,
+                self.client_id,
                 "--scope",
                 ",".join(SPOTTY_SCOPE),
                 "--save-token",

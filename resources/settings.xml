@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <settings>
     <category label="11054">
+        <setting id="user_client_id" type="text" default="2eb96f9b37494be1824999d58028a305"
+                 label="11087" help="User's developer 'client_id'"/>
         <setting id="my_recently_played_playlist_name" type="text" default="My Recently Played"
                  label="11069" help="Disable by setting string to NONE"/>
         <setting id="gap_between_playlist_tracks" type="number" default="0" label="11070"

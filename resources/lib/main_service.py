@@ -49,7 +49,8 @@ class MainService:
         self.__spotty_helper: SpottyHelper = SpottyHelper()
         self.__spotty = spotty.get_spotty(self.__spotty_helper)
 
-        self.__spotty_auth: SpottyAuth = SpottyAuth(self.__spotty)
+        client_id = SPOTIFY_ADDON.getSetting("user_client_id")
+        self.__spotty_auth: SpottyAuth = SpottyAuth(self.__spotty, client_id)
         self.__auth_token_expires_at = ""
 
         # Workaround to make Kodi use it's VideoPlayer to play http audio streams.

@@ -16,6 +16,7 @@ import simplecache
 import spotipy
 import spotty
 import utils
+from spotipy import SpotifyException
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import *
@@ -111,9 +112,20 @@ class PluginContent:
     def check_auth_and_refresh_spotipy(self):
         auth_token: str = utils.get_cached_auth_token()
         if auth_token:
-            self.init_spotipy(auth_token)
-            return
+            log_msg(f"Got cached auth_token '{auth_token}'.")
+            try_authenticate = False
+            try:
+                self.init_spotipy(auth_token)
+            except SpotifyException as exc:
+                log_exception(exc, f"HTTPError init_spotipy error: http_status = {exc.http_status}")
+                if exc.http_status == 401:
+                    try_authenticate = True
+            except Exception as exc:
+                log_exception(exc, "PluginContent init_spotipy error")
+            if not try_authenticate:
+                return
 
+        log_msg(f"Cold not get valid cached auth_token. Attempting to authenticate.")
         self.authenticate_plugin_after_login_failure()
 
     def refresh_spotipy(self):
@@ -144,7 +156,8 @@ class PluginContent:
         dialog = xbmcgui.Dialog()
         dialog_title = self.__addon.getAddonInfo("name")
 
-        spotty_auth = SpottyAuth(self.__spotty)
+        client_id = self.__addon.getSetting("user_client_id")
+        spotty_auth = SpottyAuth(self.__spotty, client_id)
 
         zeroconf_auth = spotty_auth.start_zeroconf_authenticate()
         if zeroconf_auth is None:
