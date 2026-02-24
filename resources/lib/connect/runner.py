@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Starts LibreSpot (Connect receiver) and the onevent player loop.
-Requires librespot binary on PATH (e.g. install on CoreELEC).
+Uses bundled librespot binary from addon bin/ if present (bin/librespot or bin/librespot.exe on Windows).
 """
 import os
 
 import xbmcaddon
+import xbmcvfs
 
 import utils
 from utils import ADDON_ID, log_msg, log_exception
@@ -19,7 +20,7 @@ def run(stop_event=None):
     addon = xbmcaddon.Addon(ADDON_ID)
     if addon.getSetting('connect_receiver') != 'true':
         return
-    addon_path = addon.getAddonInfo('path')
+    addon_path = xbmcvfs.translatePath(addon.getAddonInfo('path'))
     onevent_path = os.path.join(addon_path, 'bin', 'onevent.py')
     if not os.path.isfile(onevent_path):
         log_msg('connect: onevent.py not found at %s' % onevent_path)
@@ -50,6 +51,6 @@ def run(stop_event=None):
                     while True:
                         time.sleep(60)
     except FileNotFoundError as e:
-        log_msg('connect: librespot binary not found. Install it (e.g. on CoreELEC: opkg install librespot). %s' % e, utils.LOGINFO)
+        log_msg('connect: librespot binary not found. Add addon/bin/librespot (or librespot.exe on Windows), or install librespot on the system (e.g. CoreELEC: opkg install librespot). %s' % e, utils.LOGINFO)
     except Exception as e:
         log_exception(e, 'connect: runner')

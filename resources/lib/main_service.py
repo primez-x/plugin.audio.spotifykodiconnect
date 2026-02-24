@@ -79,11 +79,13 @@ class MainService:
         problem_with_terminate_streaming = (
             SPOTIFY_ADDON.getSetting("problem_with_terminate_streaming").lower() == "true"
         )
+        stream_volume = self._get_stream_volume_setting()
         self.__http_spotty_streamer: HTTPSpottyAudioStreamer = HTTPSpottyAudioStreamer(
             self.__spotty,
             gap_between_tracks,
             use_spotify_normalization,
             problem_with_terminate_streaming,
+            stream_volume,
         )
         self.__save_recently_played: SaveRecentlyPlayed = SaveRecentlyPlayed()
         self.__http_spotty_streamer.set_notify_track_finished(self.__save_track_to_recently_played)
@@ -115,14 +117,16 @@ class MainService:
 
         loop_counter = 0
         loop_wait_in_secs = 6
+        use_normalization = SPOTIFY_ADDON.getSetting("use_spotify_normalization").lower() == "true"
+        stream_volume = self._get_stream_volume_setting()
         while True:
             loop_counter += 1
             if (loop_counter % 10) == 0:
                 log_msg(f"Main loop continuing. Loop counter: {loop_counter}.")
-
-            self.__http_spotty_streamer.use_normalization(
-                SPOTIFY_ADDON.getSetting("use_spotify_normalization").lower() == "true"
-            )
+                use_normalization = SPOTIFY_ADDON.getSetting("use_spotify_normalization").lower() == "true"
+                stream_volume = self._get_stream_volume_setting()
+            self.__http_spotty_streamer.use_normalization(use_normalization)
+            self.__http_spotty_streamer.set_stream_volume(stream_volume)
 
             # Monitor authorization.
             if self.__auth_token_expires_at == "":
@@ -182,6 +186,14 @@ class MainService:
 
         t = threading.Thread(target=_sync, daemon=True)
         t.start()
+
+    def _get_stream_volume_setting(self) -> int:
+        """Read Spotify stream volume setting (1-100)."""
+        try:
+            v = int(SPOTIFY_ADDON.getSetting("spotify_stream_volume") or 35)
+            return max(1, min(100, v))
+        except (TypeError, ValueError):
+            return 35
 
     def __renew_token(self) -> None:
         try:

@@ -13,15 +13,12 @@ SPOTIFY_TRACK_PREFIX = "spotify:track:"
 SPOTTY_AUDIO_CHUNK_SIZE = 524288
 
 SPOTIFY_BITRATE = "320"
-SPOTTY_INITIAL_VOLUME = "50"
 SPOTTY_GAIN_TYPE = "track"
-SPOTTY_STREAMING_DEFAULT_ARGS = [
+SPOTTY_STREAMING_BASE_ARGS = [
     "--disable-audio-cache",
     "--disable-discovery",
     "--bitrate",
     SPOTIFY_BITRATE,
-    "--initial-volume",
-    SPOTTY_INITIAL_VOLUME,
 ]
 SPOTTY_STREAMING_NORMALIZATION_ARGS = [
     "--enable-volume-normalisation",
@@ -30,9 +27,19 @@ SPOTTY_STREAMING_NORMALIZATION_ARGS = [
 ]
 
 
+def _clamp_volume(value: int) -> int:
+    """Clamp volume to 1-100 for spotty --initial-volume."""
+    try:
+        v = int(value)
+        return max(1, min(100, v))
+    except (TypeError, ValueError):
+        return 35
+
+
 class SpottyAudioStreamer:
-    def __init__(self, spotty: Spotty):
+    def __init__(self, spotty: Spotty, initial_volume: int = 35):
         self.__spotty = spotty
+        self.initial_volume = _clamp_volume(initial_volume)
 
         self.__track_id: str = ""
         self.__track_duration: int = 0
@@ -44,6 +51,9 @@ class SpottyAudioStreamer:
         self.__terminated = False
 
         self.use_normalization = True
+
+    def set_initial_volume(self, value: int) -> None:
+        self.initial_volume = _clamp_volume(value)
 
     def get_track_length(self) -> int:
         return self.__track_length
@@ -87,7 +97,8 @@ class SpottyAudioStreamer:
             self.__log_start_reading_audio(track_id_uri)
 
             # Execute the spotty process, then collect stdout.
-            args = SPOTTY_STREAMING_DEFAULT_ARGS.copy()
+            args = SPOTTY_STREAMING_BASE_ARGS.copy()
+            args += ["--initial-volume", str(self.initial_volume)]
             if self.use_normalization:
                 args += SPOTTY_STREAMING_NORMALIZATION_ARGS
             args += ["--single-track", track_id_uri]
@@ -141,7 +152,10 @@ class SpottyAudioStreamer:
             f"Start transfer for track '{self.__track_id}' - range begin: {range_begin}",
             LOGDEBUG,
         )
-        log_msg(f"Use Spotify normalization: {self.use_normalization}.", LOGDEBUG)
+        log_msg(
+            f"Use Spotify normalization: {self.use_normalization}, initial volume: {self.initial_volume}.",
+            LOGDEBUG,
+        )
 
     def __log_send_wav_header(self) -> None:
         log_msg(

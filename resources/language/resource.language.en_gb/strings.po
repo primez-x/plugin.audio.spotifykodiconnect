@@ -156,6 +156,14 @@ msgctxt "#11075"
 msgid "Use Spotify normalization when playing tracks"
 msgstr ""
 
+msgctxt "#11095"
+msgid "Spotify stream volume (1-100)"
+msgstr ""
+
+msgctxt "#11096"
+msgid "Volume level of the incoming Spotify stream. Lower the value (e.g. 25-50) if Spotify sounds louder than other sources like Plex."
+msgstr ""
+
 msgctxt "#11076"
 msgid "Authenticate the plugin"
 msgstr ""

@@ -3,12 +3,36 @@ import os
 import shlex
 import socket
 import subprocess
+import sys
 import threading
 
 import xbmcaddon
+import xbmcvfs
 
 import utils
 from utils import ADDON_ID, log_msg, log_exception
+
+
+def _get_librespot_binary_path(addon_path):
+    """Resolve path to librespot binary: bundled addon/bin/ (platform-specific name) or same path for error message."""
+    addon_path = xbmcvfs.translatePath(addon_path)
+    bin_dir = os.path.join(addon_path, 'bin')
+    if sys.platform == 'win32':
+        candidates = [
+            os.path.join(bin_dir, 'librespot.exe'),
+            os.path.join(bin_dir, 'librespot'),
+        ]
+    else:
+        candidates = [os.path.join(bin_dir, 'librespot')]
+    for path in candidates:
+        if os.path.isfile(path):
+            if sys.platform != 'win32':
+                try:
+                    os.chmod(path, 0o755)
+                except Exception:
+                    pass
+            return path
+    return candidates[0]
 
 
 class Librespot:
@@ -23,7 +47,7 @@ class Librespot:
         name = name.format(socket.gethostname())
         addon = xbmcaddon.Addon(ADDON_ID)
         addon_path = addon.getAddonInfo('path')
-        librespot_path = os.path.join(addon_path, 'bin', 'librespot')
+        librespot_path = _get_librespot_binary_path(addon_path)
         self.command = [
             librespot_path,
             '--bitrate', f'{bitrate}',

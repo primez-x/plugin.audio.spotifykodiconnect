@@ -20,7 +20,7 @@ import utils
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import *
-from utils import ADDON_ID, PROXY_PORT, log_exception, log_msg, get_chunks
+from utils import ADDON_ID, LOGINFO, PROXY_PORT, log_exception, log_msg, get_chunks
 
 try:
     import playlist_sync as _playlist_sync
@@ -72,7 +72,9 @@ def _art_for_item(thumb_url: str, fallback_icon_path: str = None) -> Dict[str, s
 class PluginContent:
     __addon: xbmcaddon.Addon = xbmcaddon.Addon(id=ADDON_ID)
     __win: xbmcgui.Window = xbmcgui.Window(utils.ADDON_WINDOW_ID)
-    __addon_icon_path = os.path.join(__addon.getAddonInfo("path"), "resources")
+    __addon_icon_path = os.path.join(
+        xbmcvfs.translatePath(__addon.getAddonInfo("path")), "resources"
+    )
     __action = ""
     __spotty: spotty.Spotty = None
     __spotipy: spotipy.Spotify = None
@@ -118,8 +120,12 @@ class PluginContent:
 
             if self.__action:
                 log_msg(f"Evaluating action '{self.__action}'.")
-                action = f"self.{self.__action}"
-                eval(action)()
+                handler = self._get_action_handler(self.__action)
+                if handler:
+                    handler()
+                else:
+                    log_msg(f"Unknown action '{self.__action}'.", LOGINFO)
+                    xbmcplugin.endOfDirectory(handle=self.__addon_handle)
             else:
                 log_msg("Browsing main and starting background precache.")
                 self.__browse_main()
@@ -150,9 +156,10 @@ class PluginContent:
 
     def init_spotipy(self, auth_token: str) -> None:
         self.__spotipy: spotipy.Spotify = spotipy.Spotify(auth=auth_token)
-        self.__userid: str = self.__spotipy.me()["id"]
-        self.__username: str = self.__spotipy.me()["email"]
-        self.__user_country = self.__spotipy.me()["country"]
+        me = self.__spotipy.me()
+        self.__userid = me["id"]
+        self.__username = me.get("email") or me.get("id") or ""
+        self.__user_country = me.get("country") or ""
 
     def authenticate_plugin_after_login_failure(self) -> None:
         self.authenticate_plugin(
@@ -246,6 +253,13 @@ class PluginContent:
         if filt:
             self.__filter = filt[0]
 
+    def _get_action_handler(self, action: str):
+        """Return bound method for action name; avoids eval and restricts to callable attributes."""
+        if not action or not isinstance(action, str) or action.startswith("_"):
+            return None
+        meth = getattr(self, action, None)
+        return meth if callable(meth) else None
+
     def __cache_checksum(self, opt_value: Any = None) -> str:
         """simple cache checksum based on a few most important values"""
         result = self.__cached_checksum
@@ -268,22 +282,19 @@ class PluginContent:
         return result
 
     def __build_url(self, query: Dict[str, str]) -> str:
-        query_encoded = {}
-        for key, value in list(query.items()):
-            if isinstance(key, str):
-                key = key.encode("utf-8")
-            if isinstance(value, str):
-                value = value.encode("utf-8")
-            query_encoded[key] = value
-
-        return self.__base_url + "?" + urllib.parse.urlencode(query_encoded)
+        return self.__base_url + "?" + urllib.parse.urlencode(
+            [(k, str(v)) for k, v in query.items() if v is not None]
+        )
 
     def delete_cache_db(self) -> None:
         log_msg("Deleting plugin cache...")
         simple_db_cache_addon = xbmcaddon.Addon(ADDON_ID)
         db_path = simple_db_cache_addon.getAddonInfo("profile")
         db_file = xbmcvfs.translatePath(f"{db_path}/simplecache.db")
-        os.remove(db_file)
+        try:
+            os.remove(db_file)
+        except OSError:
+            pass
         log_msg(f"Deleted simplecache database file {db_file}.")
 
         dialog = xbmcgui.Dialog()
@@ -512,7 +523,7 @@ class PluginContent:
                 result["items"] += self.__spotipy.current_user_top_artists(limit=20, offset=count)[
                     "items"
                 ]
-                count += 50
+                count += 20
             artists = self.__prepare_artist_listitems(result["items"])
             self.cache.set(cache_str, artists, checksum=checksum)
             cache_log(
@@ -1327,9 +1338,8 @@ class PluginContent:
             for artist in self.__get_followed_artists():
                 followed_artists.append(artist["id"])
 
+        artists = [a for a in artists if a]
         for artist in artists:
-            if not artist:
-                return []
             if artist.get("artist"):
                 artist = artist["artist"]
             if artist.get("images"):
@@ -1851,7 +1861,6 @@ class PluginContent:
             market=self.__user_country,
         )
 
-        log_msg(result)
         xbmcplugin.setProperty(
             self.__addon_handle, "FolderName", xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID)
         )
@@ -1928,13 +1937,12 @@ class PluginContent:
             params["offset"] = [str(self.__offset + self.__limit)]
             url = f"plugin://{ADDON_ID}/"
 
-            for key, value in list(params.items()):
+            for key, value in params.items():
+                v = value[0] if isinstance(value, (list, tuple)) and value else value
                 if key == "action":
-                    url += f"?{key}={value[0]}"
-                elif key == "offset":
-                    url += f"&{key}={value}"
+                    url += f"?{key}={v}"
                 else:
-                    url += f"&{key}={value[0]}"
+                    url += f"&{key}={v}"
 
             li = xbmcgui.ListItem(xbmc.getLocalizedString(KODI_NEXT_PAGE_STR_ID), path=url)
             li.setProperty("do_not_analyze", "true")

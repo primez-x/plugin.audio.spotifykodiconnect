@@ -131,17 +131,13 @@ def cache_value_in_kodi(kodi_property_id: str, value: Any):
     win.setProperty(kodi_property_id, value)
 
 
-def get_cached_value_from_kodi(kodi_property_id: str, wait_ms: int = 500) -> Any:
+def get_cached_value_from_kodi(kodi_property_id: str, wait_ms: int = 100) -> Any:
     win = xbmcgui.Window(ADDON_WINDOW_ID)
-
-    count = 10
-    while count > 0:
+    for _ in range(50):
         value = win.getProperty(kodi_property_id)
         if value:
             return value
         xbmc.sleep(wait_ms)
-        count -= 1
-
     return None
 
 

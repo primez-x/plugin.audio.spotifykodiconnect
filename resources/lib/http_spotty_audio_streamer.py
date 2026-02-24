@@ -8,6 +8,15 @@ from spotty_audio_streamer import SpottyAudioStreamer
 from utils import log_msg, LOGDEBUG
 
 
+def _clamp_stream_volume(value) -> int:
+    """Clamp stream volume setting to 1-100."""
+    try:
+        v = int(value)
+        return max(1, min(100, v))
+    except (TypeError, ValueError):
+        return 35
+
+
 class HTTPSpottyAudioStreamer:
     def __init__(
         self,
@@ -15,12 +24,15 @@ class HTTPSpottyAudioStreamer:
         gap_between_tracks: int = 0,
         use_normalization: bool = True,
         problem_with_terminate_streaming=False,
+        stream_volume: int = 35,
     ):
         self.__spotty: Spotty = spotty
         self.__gap_between_tracks: int = gap_between_tracks
         self.__problem_with_terminate_streaming = problem_with_terminate_streaming
 
-        self.__spotty_streamer: SpottyAudioStreamer = SpottyAudioStreamer(self.__spotty)
+        self.__spotty_streamer: SpottyAudioStreamer = SpottyAudioStreamer(
+            self.__spotty, initial_volume=_clamp_stream_volume(stream_volume)
+        )
         self.__spotty_streamer.use_normalization = use_normalization
 
         self.__is_streaming = False
@@ -28,6 +40,9 @@ class HTTPSpottyAudioStreamer:
 
     def use_normalization(self, value):
         self.__spotty_streamer.use_normalization = value
+
+    def set_stream_volume(self, value: int) -> None:
+        self.__spotty_streamer.set_initial_volume(value)
 
     def set_notify_track_finished(self, func: Callable[[str], None]) -> None:
         self.__spotty_streamer.set_notify_track_finished(func)

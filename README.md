@@ -20,7 +20,7 @@ Unofficial Spotify music addon for Kodi, inspired by the “Kodi Connect” styl
   “Play playlist” starts the first track right away and queues the rest in the background so playback begins without a long wait.
 
 - **Spotify Connect receiver (LibreSpot)**  
-  Optional: enable “Connect receiver” in addon settings to run LibreSpot. Your Kodi device then appears as a speaker in the Spotify app on your iPhone or other devices—tap “Connect to a device” and choose it to stream and control playback from the phone while audio plays on Kodi. Requires the **librespot** binary (e.g. on CoreELEC: `opkg install librespot` or install from your distro). Backends: PulseAudio RTP (Kodi plays the stream) or ALSA (direct to device).
+  Optional: enable “Connect receiver” in addon settings to run LibreSpot. Your Kodi device then appears as a speaker in the Spotify app on your iPhone or other devices—tap “Connect to a device” and choose it to stream and control playback from the phone while audio plays on Kodi. You can use a **bundled** librespot binary for a fully standalone addon: place the librespot binary in the addon’s `bin/` folder (e.g. `bin/librespot` on Linux/Android/CoreELEC, or `bin/librespot.exe` on Windows). If no binary is in `bin/`, the addon will try the system `librespot` (e.g. `opkg install librespot` on CoreELEC). Backends: PulseAudio RTP (Kodi plays the stream) or ALSA (direct to device).
 
 ## Requirements
 
