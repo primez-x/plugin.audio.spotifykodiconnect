@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Up Next Music overlay - Arctic Fuse 3 style layout (self-contained). -->
+<window>
+    <onload>Dialog.Close(fullscreeninfo,true)</onload>
+    <onload>Dialog.Close(videoosd,true)</onload>
+    <onload>Dialog.Close(musicosd,true)</onload>
+    <animation type="WindowOpen" reversible="false">
+        <effect type="fade" start="0" end="100" time="400" />
+        <effect type="slide" start="0,-400" end="0,0" time="400" />
+    </animation>
+    <animation type="WindowClose" reversible="false">
+        <effect type="fade" start="100" end="0" time="400" />
+        <effect type="slide" start="0,0" end="0,-400" time="400" />
+    </animation>
+    <controls>
+        <!-- Bottom-up dimming scrim to emphasize Up Next overlay -->
+        <control type="image">
+            <left>0</left>
+            <right>0</right>
+            <bottom>0</bottom>
+            <height>500</height>
+            <texture colordiffuse="CC000000">common/white.png</texture>
+        </control>
+        <!-- OSD_Info_Dimensions style: height 400, bottom 80 -->
+        <control type="group">
+            <height>400</height>
+            <bottom>80</bottom>
+            <control type="group">
+                <!-- Title line: "Next track" + remaining time -->
+                <control type="label">
+                    <left>80</left>
+                    <right>80</right>
+                    <top>-140</top>
+                    <height>40</height>
+                    <font>font13</font>
+                    <textcolor>FFFFFFFF</textcolor>
+                    <label>$ADDON[plugin.audio.spotifykodiconnect 11103]  [COLOR FF00BFFF]$INFO[Window.Property(remaining), ,][/COLOR] [LOWERCASE]sec...[/LOWERCASE]</label>
+                </control>
+                <!-- Content block: right 80, width 350, height 350 (right-side widget) -->
+                <control type="group">
+                    <right>80</right>
+                    <top>-70</top>
+                    <height>350</height>
+                    <width>350</width>
+                    <!-- Square image 231x231 -->
+                    <control type="group">
+                        <width>231</width>
+                        <height>231</height>
+                        <control type="image">
+                            <width>231</width>
+                            <height>231</height>
+                            <texture colordiffuse="FF333333">common/white.png</texture>
+                            <visible>String.IsEmpty(Window.Property(thumb)) + String.IsEmpty(Window.Property(landscape)) + String.IsEmpty(Window.Property(fanart))</visible>
+                        </control>
+                        <control type="image">
+                            <width>231</width>
+                            <height>231</height>
+                            <texture>$INFO[Window.Property(landscape)]</texture>
+                            <aspectratio>scale</aspectratio>
+                            <visible>!String.IsEmpty(Window.Property(landscape))</visible>
+                        </control>
+                        <control type="image">
+                            <width>231</width>
+                            <height>231</height>
+                            <texture>$INFO[Window.Property(fanart)]</texture>
+                            <aspectratio>scale</aspectratio>
+                            <visible>String.IsEmpty(Window.Property(landscape)) + !String.IsEmpty(Window.Property(fanart))</visible>
+                        </control>
+                        <control type="image">
+                            <width>231</width>
+                            <height>231</height>
+                            <texture>$INFO[Window.Property(thumb)]</texture>
+                            <aspectratio>scale</aspectratio>
+                            <visible>String.IsEmpty(Window.Property(landscape)) + String.IsEmpty(Window.Property(fanart))</visible>
+                        </control>
+                        <!-- Progress bar -->
+                        <control type="progress" id="3014">
+                            <left>0</left>
+                            <right>0</right>
+                            <height>4</height>
+                            <centerbottom>-15</centerbottom>
+                            <texturebg colordiffuse="33FFFFFF">common/white.png</texturebg>
+                            <midtexture colordiffuse="FF00BFFF">common/white.png</midtexture>
+                        </control>
+                    </control>
+                    <!-- Labels: title • artist (right-aligned) -->
+                    <control type="group">
+                        <top>231</top>
+                        <left>0</left>
+                        <right>0</right>
+                        <height>80</height>
+                        <control type="label">
+                            <top>10</top>
+                            <height>67</height>
+                            <align>right</align>
+                            <aligny>top</aligny>
+                            <font>font12</font>
+                            <textcolor>FFFFFFFF</textcolor>
+                            <label>$INFO[Window.Property(title)] [COLOR 99FFFFFF]•[/COLOR] $INFO[Window.Property(artist)]</label>
+                        </control>
+                    </control>
+                </control>
+            </control>
+        </control>
+    </controls>
+</window>

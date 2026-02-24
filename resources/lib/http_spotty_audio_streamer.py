@@ -23,14 +23,16 @@ class HTTPSpottyAudioStreamer:
         spotty: Spotty,
         gap_between_tracks: int = 0,
         use_normalization: bool = True,
-        problem_with_terminate_streaming=False,
         stream_volume: int = 35,
         prebuffer_manager=None,
         on_track_started_callback: Optional[Callable[[str, float], None]] = None,
     ):
         self.__spotty: Spotty = spotty
         self.__gap_between_tracks: int = gap_between_tracks
-        self.__problem_with_terminate_streaming = problem_with_terminate_streaming
+        # Always avoid terminating the current streamer on overlapping requests.
+        # This reduces the risk of early stream termination when Kodi issues
+        # multiple HTTP range requests for the same track.
+        self.__problem_with_terminate_streaming = True
         self.__prebuffer_manager = prebuffer_manager
         self.__on_track_started = on_track_started_callback or (lambda _id, _dur: None)
 
@@ -153,9 +155,23 @@ class HTTPSpottyAudioStreamer:
             log_msg(f"Full request, content length = {range_end- range_begin}.", LOGDEBUG)
         else:
             status = "206 Partial Content"
-            stream_range = bottle.request.headers["Range"].split("bytes=")[1].split("-")
-            range_begin = int(stream_range[0])
-            range_end = int(stream_range[1]) if stream_range[1].isdigit() else file_size
+            try:
+                parts = bottle.request.headers["Range"].strip().split("bytes=", 1)[1].split("-", 1)
+                start_s = parts[0].strip() if parts else ""
+                end_s = parts[1].strip() if len(parts) > 1 else ""
+                if not start_s and end_s.isdigit():
+                    # Suffix range: last N bytes (e.g. "bytes=-500")
+                    suffix = int(end_s)
+                    range_begin = max(0, file_size - suffix)
+                    range_end = file_size
+                else:
+                    range_begin = int(start_s) if start_s else 0
+                    range_end = int(end_s) if end_s.isdigit() else file_size
+                range_begin = max(0, min(range_begin, file_size))
+                range_end = max(range_begin, min(range_end, file_size))
+            except (ValueError, IndexError, KeyError):
+                range_begin = 0
+                range_end = file_size
             content_range = f"bytes {range_begin}-{range_end}/{file_size}"
             log_msg(
                 f"Partial request, range = {content_range}," f" length = {range_end - range_begin}",

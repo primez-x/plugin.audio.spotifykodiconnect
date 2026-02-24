@@ -25,24 +25,17 @@ def run(stop_event=None):
     if not os.path.isfile(onevent_path):
         log_msg('connect: onevent.py not found at %s' % onevent_path)
         return
-    backend = addon.getSetting('connect_backend') or 'pulseaudio_rtp'
     device_name = addon.getSetting('connect_device_name') or 'Spotify Kodi Connect@{}'
     options = addon.getSetting('connect_options') or ''
     dnd_kodi = addon.getSetting('connect_dnd_kodi') == 'true'
-    alsa_device = addon.getSetting('connect_alsa_device') or 'hw:2,0'
+    alsa_device = addon.getSetting('connect_alsa_device') or 'hw:0,0'
     try:
-        if backend == 'alsa':
-            from . import librespot_alsa
-            librespot_class = librespot_alsa.Librespot
-            kwargs = dict(onevent_path=onevent_path, name=device_name, options=options, alsa_device=alsa_device)
-        else:
-            from . import librespot_pulseaudio_rtp
-            librespot_class = librespot_pulseaudio_rtp.Librespot
-            kwargs = dict(onevent_path=onevent_path, name=device_name, options=options,
-                         pa_rtp_device='spotify_kodi_connect', pa_rtp_port='24643')
+        from . import librespot_alsa
+        librespot_class = librespot_alsa.Librespot
+        kwargs = dict(onevent_path=onevent_path, name=device_name, options=options, alsa_device=alsa_device)
         with librespot_class(**kwargs) as librespot:
             with librespot.get_player(librespot=librespot, dnd_kodi=dnd_kodi) as player:
-                log_msg('connect: receiver started (backend=%s)' % backend)
+                log_msg('connect: receiver started (backend=alsa)')
                 if stop_event:
                     while not stop_event.wait(timeout=2.0):
                         pass
@@ -51,6 +44,6 @@ def run(stop_event=None):
                     while True:
                         time.sleep(60)
     except FileNotFoundError as e:
-        log_msg('connect: librespot binary not found. Add addon/bin/librespot (or librespot.exe on Windows), or install librespot on the system (e.g. CoreELEC: opkg install librespot). %s' % e, utils.LOGINFO)
+        log_msg('connect: librespot binary not found. On CoreELEC/Linux the addon tries opkg install librespot automatically; if that failed, run "opkg install librespot" over SSH. Otherwise add addon/bin/librespot (or librespot.exe on Windows). %s' % e, utils.LOGINFO)
     except Exception as e:
         log_exception(e, 'connect: runner')

@@ -4,9 +4,6 @@ Unofficial Spotify music addon for Kodi, inspired by the “Kodi Connect” styl
 
 ## Improvements over plugin.audio.spotify
 
-- **Spotify playlists as real Kodi playlists (like PlexKodiConnect)**  
-  Your Spotify playlists are synced to Kodi’s Music playlists folder as `.m3u` files. They show up under **Music → Playlists** as native Kodi playlists, not as addon folders. Play from there like any other playlist. Sync runs automatically after login and every 30 minutes; you can also use **Refresh Kodi playlists** from the addon menu.
-
 - **Consistent art everywhere**  
   Album/artist/playlist art is set for all list types (thumb, poster, fanart, icon). Playlists and song lists no longer show missing art in some views.
 
@@ -35,6 +32,17 @@ Unofficial Spotify music addon for Kodi, inspired by the “Kodi Connect” styl
 3. Use **Music → Add-ons → Spotify Kodi Connect** (or your skin’s equivalent).
 
 You can run this addon alongside the original `plugin.audio.spotify`; it uses a different addon id and proxy port (52309) and its own auth/cache.
+
+## Troubleshooting: Connect receiver (LibreSpot) and service.librespot
+
+- **Run only one LibreSpot instance.** If you have both **Spotify Kodi Connect** (with “Connect receiver” enabled) and the **service.librespot** addon installed, they both start at Kodi boot and each tries to run librespot. That can cause “failed to initialize” and the device not appearing in the Spotify app. **Fix:** Use either the Connect receiver inside this addon **or** service.librespot, not both. Disable the other (e.g. disable “Connect receiver” in this addon’s settings, or disable/remove the service.librespot addon).
+
+- **“Failed to initialize” / “librespot failed 1/5” … “failed too many times”.** The real error is printed by the librespot binary. In the Kodi log, search for lines starting with `librespot:` — that is librespot’s stderr and will show the actual reason (e.g. zeroconf/discovery bind failure, wrong ALSA device, PulseAudio not available).
+
+- **CoreELEC / AM6B+ (and similar):**
+  - Prefer the **ALSA** backend in Connect settings (default). PulseAudio RTP often isn’t available on CoreELEC.
+  - If using ALSA, set **Connect ALSA device** to the correct device. Default is `hw:2,0`; on your box it might be `hw:0,0` or `hw:1,0`. Run `aplay -L` over SSH to list devices and pick the right one (e.g. the HDMI or analog output you use).
+  - Use the system librespot: `opkg install librespot` so the binary matches your architecture (e.g. aarch64). If you use a bundled binary in the addon’s `bin/` folder, it must be built for your device (e.g. ARM64 for AM6B+).
 
 ## Credits
 

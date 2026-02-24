@@ -22,11 +22,6 @@ from spotty_helper import SpottyHelper
 from string_ids import *
 from utils import ADDON_ID, LOGINFO, PROXY_PORT, log_exception, log_msg, get_chunks
 
-try:
-    import playlist_sync as _playlist_sync
-except Exception:
-    _playlist_sync = None
-
 MUSIC_ARTISTS_ICON = "icon_music_artists.png"
 MUSIC_TOP_ARTISTS_ICON = "icon_music_top_artists.png"
 MUSIC_SONGS_ICON = "icon_music_songs.png"
@@ -308,22 +303,11 @@ class PluginContent:
         xbmc.executebuiltin("Container.Refresh")
 
     def refresh_kodi_playlists(self) -> None:
-        """Sync Spotify playlists to Kodi as real playlists (Music → Playlists)."""
+        """
+        Legacy hook for native playlist sync.
+        No-op now that .m3u playlist generation has been removed.
+        """
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if not _playlist_sync:
-            return
-        try:
-            _playlist_sync.sync_playlists_to_kodi(self.__spotipy)
-            xbmc.executebuiltin(
-                "Notification(%s,%s,%s)"
-                % (
-                    self.__addon.getAddonInfo("name"),
-                    self.__addon.getLocalizedString(REFRESH_KODI_PLAYLISTS_STR_ID),
-                    3000,
-                )
-            )
-        except Exception as exc:
-            log_exception(exc, "refresh_kodi_playlists")
 
     def __add_track_listitems(self, tracks, append_artist_to_label: bool = False) -> None:
         list_items = self.__get_track_list(tracks, append_artist_to_label)

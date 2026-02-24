@@ -250,7 +250,7 @@ msgstr "Name shown in Spotify app (e.g. Spotify Kodi Connect@hostname)"
 
 msgctxt "#11092"
 msgid "ALSA device"
-msgstr "e.g. hw:2,0 (only when Backend = ALSA)"
+msgstr "e.g. hw:0,0 (run aplay -L to list devices)"
 
 msgctxt "#11093"
 msgid "Do not disturb Kodi"
@@ -259,3 +259,47 @@ msgstr "Pause Connect when Kodi plays something else"
 msgctxt "#11094"
 msgid "Extra librespot options"
 msgstr "Optional: e.g. --bitrate 160"
+
+msgctxt "#11109"
+msgid "ALSA output device (e.g. hw:0,0). Run aplay -L on the device to list; hw:0,0 is often HDMI on CoreELEC."
+msgstr ""
+
+msgctxt "#11099"
+msgid "Enable Up Next"
+msgstr "Enable Up Next"
+
+msgctxt "#11100"
+msgid "Show the built-in Next Track overlay near the end of the current track."
+msgstr ""
+
+msgctxt "#11106"
+msgid "Up Next"
+msgstr "Up Next"
+
+msgctxt "#11101"
+msgid "Preview duration (seconds)"
+msgstr "Preview duration (seconds)"
+
+msgctxt "#11102"
+msgid "How many seconds before the track ends to show the next track overlay (5–45). This value also drives the prebuffer duration (clamped to 5–30)."
+msgstr ""
+
+msgctxt "#11103"
+msgid "Next track"
+msgstr ""
+
+msgctxt "#11104"
+msgid "Play next"
+msgstr ""
+
+msgctxt "#11105"
+msgid "Close"
+msgstr ""
+
+msgctxt "#11107"
+msgid "Pre-buffer next track"
+msgstr "Pre-buffer next track"
+
+msgctxt "#11108"
+msgid "When enabled, the prebuffer duration is derived from the Up Next preview duration (clamped to 5–30 seconds)."
+msgstr ""

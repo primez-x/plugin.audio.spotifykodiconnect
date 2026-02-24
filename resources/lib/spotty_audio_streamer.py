@@ -87,11 +87,20 @@ class SpottyAudioStreamer:
 
             self.__log_start_transfer(range_begin)
 
-            # Send the wav header.
+            # File layout is [WAV header][PCM from spotty]. range_begin/range_len
+            # are file offsets. Spotty only outputs PCM, so we must skip
+            # (range_begin - header_len) bytes of PCM when seeking, not range_begin.
+            header_len = len(self.__wav_header)
             if range_begin == 0:
-                bytes_sent = len(self.__wav_header)
+                bytes_sent = header_len
                 self.__log_send_wav_header()
                 yield self.__wav_header
+            elif range_begin < header_len:
+                # Range starts inside the header (rare).
+                tail = self.__wav_header[range_begin:]
+                to_send = min(len(tail), range_len)
+                yield tail[:to_send]
+                bytes_sent = to_send
 
             track_id_uri = SPOTIFY_TRACK_PREFIX + self.__track_id
             self.__log_start_reading_audio(track_id_uri)
@@ -106,9 +115,11 @@ class SpottyAudioStreamer:
             self.__log_spotty_return_code(spotty_process)
             self.__last_spotty_pid = spotty_process.pid
 
-            # Ignore the first x bytes to match the range request.
-            if range_begin != 0:
-                spotty_process.stdout.read(range_begin)
+            # Skip PCM bytes so that we start at file offset range_begin.
+            # File offset range_begin = header + (range_begin - header_len) PCM bytes.
+            if range_begin >= header_len:
+                pcm_skip = range_begin - header_len
+                spotty_process.stdout.read(pcm_skip)
 
             # Loop as long as there's something to output.
             while bytes_sent < range_len:

@@ -229,3 +229,43 @@ msgstr "All 'appears on' albums for artist"
 msgctxt "#11086"
 msgid "Set to 'True', if there is a problem with early stream termination"
 msgstr "Set to 'True', if there is a problem with early stream termination"
+
+msgctxt "#11099"
+msgid "Enable Up Next"
+msgstr ""
+
+msgctxt "#11100"
+msgid "Show the built-in Next Track overlay near the end of the current track."
+msgstr ""
+
+msgctxt "#11106"
+msgid "Up Next"
+msgstr ""
+
+msgctxt "#11101"
+msgid "Preview duration (seconds)"
+msgstr ""
+
+msgctxt "#11102"
+msgid "How many seconds before the track ends to show the next track overlay (5–45). This value also drives the prebuffer duration (clamped to 5–30)."
+msgstr ""
+
+msgctxt "#11103"
+msgid "Next track"
+msgstr ""
+
+msgctxt "#11104"
+msgid "Play next"
+msgstr ""
+
+msgctxt "#11105"
+msgid "Close"
+msgstr ""
+
+msgctxt "#11107"
+msgid "Pre-buffer next track"
+msgstr ""
+
+msgctxt "#11108"
+msgid "When enabled, the prebuffer duration is derived from the Up Next preview duration (clamped to 5–30 seconds)."
+msgstr ""

@@ -9,10 +9,16 @@
           <control type="toggle"/>
         </setting>
         <setting id="spotify_stream_volume" type="slider" default="35" label="11095" help="11096" range="1,1,100" option="int"/>
-        <setting id="problem_with_terminate_streaming" type="bool" default="false" label="11086">
+    </category>
+
+    <category label="11106">
+        <setting id="upnext_enabled" type="bool" default="true" label="11099" help="11100">
           <control type="toggle"/>
         </setting>
-        <setting id="prebuffer_seconds" type="slider" default="15" label="11097" help="11098" range="5,1,30" option="int"/>
+        <setting id="upnext_preview_seconds" type="number" default="15" label="11101" help="11102"/>
+        <setting id="upnext_prebuffer_enabled" type="bool" default="true" label="11107" help="11108">
+          <control type="toggle"/>
+        </setting>
     </category>
 
     <category label="11055">
@@ -28,9 +34,8 @@
         <setting id="connect_receiver" type="bool" default="false" label="11089">
           <control type="toggle"/>
         </setting>
-        <setting id="connect_backend" type="enum" values="pulseaudio_rtp|alsa" default="pulseaudio_rtp" label="11090"/>
         <setting id="connect_device_name" type="text" default="Spotify Kodi Connect@{}" label="11091"/>
-        <setting id="connect_alsa_device" type="text" default="hw:2,0" label="11092" subsetting="true" visible="eq(-1,1)"/>
+        <setting id="connect_alsa_device" type="text" default="hw:0,0" label="11092" help="11109"/>
         <setting id="connect_dnd_kodi" type="bool" default="false" label="11093">
           <control type="toggle"/>
         </setting>

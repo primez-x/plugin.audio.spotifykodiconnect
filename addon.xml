@@ -21,7 +21,6 @@
         <source>https://github.com/</source>
         <news>v1.0.0
 - Fork of plugin.audio.spotify with Kodi Connect–style improvements.
-- Spotify playlists as real Kodi playlists: synced to Music → Playlists as .m3u files (like PlexKodiConnect), not addon folders.
 - Spotify Connect receiver (LibreSpot): optional integration so you can stream/control from iPhone or other devices to Kodi (requires librespot binary).
 - Consistent art: thumb, poster, fanart, and icon set for albums, artists, playlists, and tracks so every list view shows art.
 - Correct metadata: proper Kodi music info types (year, duration, tracknumber, albumartist, etc.) for reliable tagging.

@@ -20,15 +20,14 @@ from save_recently_played import SaveRecentlyPlayed
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import HTTP_VIDEO_RULE_ADDED_STR_ID
-from upnext import send_upnext_signal_and_return_next_track
+from playlist_next import get_next_playlist_item, parse_track_url
 from utils import ADDON_ID, PROXY_PORT, log_msg, log_exception
 
 try:
-    import spotipy
-    import playlist_sync
-    HAS_PLAYLIST_SYNC = True
+    import upnext_music
+    HAS_UPNEXT_MUSIC = True
 except Exception:
-    HAS_PLAYLIST_SYNC = False
+    HAS_UPNEXT_MUSIC = False
 
 try:
     from connect import runner as connect_runner
@@ -65,8 +64,6 @@ class MainService:
 
         self.__spotty_auth: SpottyAuth = SpottyAuth(self.__spotty)
         self.__auth_token_expires_at = ""
-        self.__last_playlist_sync = 0.0
-        self.__playlist_sync_interval_sec = 30 * 60  # 30 minutes
         self.__connect_stop = threading.Event()
         self.__connect_thread = None
 
@@ -75,14 +72,14 @@ class MainService:
         add_http_video_rule()
 
         gap_between_tracks = int(SPOTIFY_ADDON.getSetting("gap_between_playlist_tracks"))
-        use_spotify_normalization = (
-            SPOTIFY_ADDON.getSetting("use_spotify_normalization").lower() == "true"
-        )
-        problem_with_terminate_streaming = (
-            SPOTIFY_ADDON.getSetting("problem_with_terminate_streaming").lower() == "true"
-        )
-        stream_volume = self._get_stream_volume_setting()
+        # Use fixed defaults: normalization and stream volume no longer user settings
+        # (Kodi controls playback/audio; these had no effect on CoreELEC Kodi).
+        use_spotify_normalization = True
+        stream_volume = 50
         prebuffer_seconds = self._get_prebuffer_seconds_setting()
+        self.__prebuffer_enabled = (
+            SPOTIFY_ADDON.getSetting("upnext_prebuffer_enabled").lower() == "true"
+        )
         self.__prebuffer_manager: PrebufferManager = PrebufferManager(
             self.__spotty,
             initial_volume=stream_volume,
@@ -93,7 +90,6 @@ class MainService:
             self.__spotty,
             gap_between_tracks,
             use_spotify_normalization,
-            problem_with_terminate_streaming,
             stream_volume,
             prebuffer_manager=self.__prebuffer_manager,
             on_track_started_callback=self.__on_track_started,
@@ -104,12 +100,31 @@ class MainService:
         bottle_manager.route_all(self.__http_spotty_streamer)
 
     def __on_track_started(self, track_id: str, duration_sec: float) -> None:
-        """Notify Up Next and start pre-buffering the next track."""
+        """Optionally show Up Next overlay and pre-buffer the next track."""
         try:
-            next_track_id, next_duration = send_upnext_signal_and_return_next_track(
-                track_id, duration_sec
+            current_item, next_item = get_next_playlist_item()
+            if not next_item:
+                if HAS_UPNEXT_MUSIC:
+                    upnext_music.cancel_notification()
+                return
+
+            next_track_id, next_duration = parse_track_url(next_item.get("file") or "")
+            if not next_track_id or next_duration is None:
+                if HAS_UPNEXT_MUSIC:
+                    upnext_music.cancel_notification()
+                return
+
+            upnext_enabled = SPOTIFY_ADDON.getSetting("upnext_enabled").lower() == "true"
+            prebuffer_enabled = (
+                SPOTIFY_ADDON.getSetting("upnext_prebuffer_enabled").lower() == "true"
             )
-            if next_track_id and next_duration is not None:
+
+            if HAS_UPNEXT_MUSIC and upnext_enabled:
+                upnext_music.start_notification_thread(duration_sec, next_item, next_duration)
+            elif HAS_UPNEXT_MUSIC:
+                upnext_music.cancel_notification()
+
+            if prebuffer_enabled:
                 self.__prebuffer_manager.start_prebuffer(next_track_id, next_duration)
         except Exception:
             pass
@@ -139,28 +154,30 @@ class MainService:
 
         loop_counter = 0
         loop_wait_in_secs = 6
-        use_normalization = SPOTIFY_ADDON.getSetting("use_spotify_normalization").lower() == "true"
-        stream_volume = self._get_stream_volume_setting()
+        use_normalization = True
+        stream_volume = 50
         while True:
             loop_counter += 1
             if (loop_counter % 10) == 0:
                 log_msg(f"Main loop continuing. Loop counter: {loop_counter}.")
-                use_normalization = SPOTIFY_ADDON.getSetting("use_spotify_normalization").lower() == "true"
-                stream_volume = self._get_stream_volume_setting()
             self.__http_spotty_streamer.use_normalization(use_normalization)
             self.__http_spotty_streamer.set_stream_volume(stream_volume)
             self.__prebuffer_manager.set_volume(stream_volume)
             self.__prebuffer_manager.set_use_normalization(use_normalization)
-            self.__prebuffer_manager.set_prebuffer_seconds(
-                self._get_prebuffer_seconds_setting()
+            self.__prebuffer_manager.set_prebuffer_seconds(self._get_prebuffer_seconds_setting())
+            prebuffer_enabled_now = (
+                SPOTIFY_ADDON.getSetting("upnext_prebuffer_enabled").lower() == "true"
             )
+            if self.__prebuffer_enabled and not prebuffer_enabled_now:
+                # User disabled prebuffer; stop any in-flight work.
+                self.__prebuffer_manager.cancel_prebuffer()
+            self.__prebuffer_enabled = prebuffer_enabled_now
 
             # Monitor authorization.
             if self.__auth_token_expires_at == "":
                 log_msg("Spotify not yet authorized.")
                 log_msg("Refreshing auth token now.")
                 self.__renew_token()
-                self._run_playlist_sync_if_authenticated()
             elif (int(self.__auth_token_expires_at) - 60) <= int(time.time()):
                 expire_time = int(self.__auth_token_expires_at)
                 time_now = int(time.time())
@@ -171,13 +188,6 @@ class MainService:
                 )
                 log_msg("Refreshing auth token now.")
                 self.__renew_token()
-                self._run_playlist_sync_if_authenticated()
-
-            # Periodic sync: Spotify playlists → Kodi .m3u (Music → Playlists)
-            if HAS_PLAYLIST_SYNC and self.__auth_token_expires_at:
-                now = time.time()
-                if now - self.__last_playlist_sync >= self.__playlist_sync_interval_sec:
-                    self._run_playlist_sync_if_authenticated()
 
             if abort_app(loop_wait_in_secs):
                 log_msg("Aborting the main service.")
@@ -196,37 +206,13 @@ class MainService:
         bottle_manager.stop_thread()
         log_msg("Main service stopped.")
 
-    def _run_playlist_sync_if_authenticated(self) -> None:
-        """Run playlist sync in a background thread if we have a token."""
-        if not HAS_PLAYLIST_SYNC:
-            return
-        auth_token = utils.get_cached_auth_token()
-        if not auth_token:
-            return
-        self.__last_playlist_sync = time.time()
-
-        def _sync():
-            try:
-                sp = spotipy.Spotify(auth=auth_token)
-                playlist_sync.sync_playlists_to_kodi(sp)
-            except Exception as e:
-                log_exception(e, "playlist_sync from service")
-
-        t = threading.Thread(target=_sync, daemon=True)
-        t.start()
-
-    def _get_stream_volume_setting(self) -> int:
-        """Read Spotify stream volume setting (1-100)."""
-        try:
-            v = int(SPOTIFY_ADDON.getSetting("spotify_stream_volume") or 35)
-            return max(1, min(100, v))
-        except (TypeError, ValueError):
-            return 35
-
     def _get_prebuffer_seconds_setting(self) -> int:
-        """Read pre-buffer next track setting in seconds (5–30)."""
+        """
+        Prebuffer duration (seconds). Driven by Up Next preview duration.
+        Clamped to 5–30 for memory safety.
+        """
         try:
-            v = int(SPOTIFY_ADDON.getSetting("prebuffer_seconds") or 15)
+            v = int(SPOTIFY_ADDON.getSetting("upnext_preview_seconds") or 15)
             return _clamp_prebuffer_seconds(v)
         except (TypeError, ValueError):
             return _clamp_prebuffer_seconds(15)
