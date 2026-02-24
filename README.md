@@ -20,7 +20,7 @@ Unofficial Spotify music addon for Kodi, inspired by the “Kodi Connect” styl
   The “Album description / Artist biography” style boxes (e.g. in Arctic Fuse 3’s music OSD) are filled from Spotify: release date, label, copyright, genre for albums, and artist genres/followers for artists. Spotify’s API does not provide narrative biography or album liner notes; those would require scraper augmentation (e.g. MusicBrainz, Last.fm) if desired.
 
 - **Performance**  
-  Extra song info (album/artist descriptions) is optional (setting “Fetch extra song info”), capped per list (40 albums, 50 artists), and fetched in parallel (album and artist API calls run in two threads). Saved-track and followed-artist lookups run in parallel with track loading. Playlist “Play” queues the rest in a background thread; precache and Up Next run in background threads.
+  Extra song info uses **streaming enrichment**: the list appears immediately with basic data; a background thread then fetches album (label, copyright) and artist (genres, followers) data for all items in parallel and refreshes the container so descriptions fill in without blocking the UI. The setting “Fetch extra song info” can disable this. Saved-track and followed-artist lookups run in parallel with track loading. Playlist “Play” queues the rest in a background thread; precache also runs in background threads.
 
 ## Metadata: what comes from Spotify
 

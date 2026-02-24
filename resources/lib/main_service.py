@@ -3,6 +3,7 @@
     Spotify Kodi Connect - service: spotty + playlist sync to Kodi (real playlists).
 """
 
+import threading
 import time
 
 import xbmc
@@ -20,13 +21,8 @@ from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import HTTP_VIDEO_RULE_ADDED_STR_ID
 from playlist_next import get_next_playlist_item, parse_track_url
+from upnext_broadcast import broadcast_to_service_upnextmusic
 from utils import ADDON_ID, PROXY_PORT, log_msg, log_exception
-
-try:
-    import upnext_music
-    HAS_UPNEXT_MUSIC = True
-except Exception:
-    HAS_UPNEXT_MUSIC = False
 
 SAVE_TO_RECENTLY_PLAYED_FILE = True
 SPOTIFY_ADDON = xbmcaddon.Addon(id=ADDON_ID)
@@ -91,32 +87,52 @@ class MainService:
         bottle_manager.route_all(self.__http_spotty_streamer)
 
     def __on_track_started(self, track_id: str, duration_sec: float) -> None:
-        """Optionally show Up Next overlay and pre-buffer the next track."""
+        """Pre-buffer the next track if available; broadcast to service.upnextmusic."""
         try:
             current_item, next_item = get_next_playlist_item()
             if not next_item:
-                if HAS_UPNEXT_MUSIC:
-                    upnext_music.cancel_notification()
                 return
 
             next_track_id, next_duration = parse_track_url(next_item.get("file") or "")
             if not next_track_id or next_duration is None:
-                if HAS_UPNEXT_MUSIC:
-                    upnext_music.cancel_notification()
                 return
 
-            upnext_enabled = SPOTIFY_ADDON.getSetting("upnext_enabled").lower() == "true"
             prebuffer_enabled = (
                 SPOTIFY_ADDON.getSetting("upnext_prebuffer_enabled").lower() == "true"
             )
-
-            if HAS_UPNEXT_MUSIC and upnext_enabled:
-                upnext_music.start_notification_thread(duration_sec, next_item, next_duration)
-            elif HAS_UPNEXT_MUSIC:
-                upnext_music.cancel_notification()
-
             if prebuffer_enabled:
                 self.__prebuffer_manager.start_prebuffer(next_track_id, next_duration)
+
+            # Broadcast to Up Next - Music service so it can show next-track overlay.
+            # Delay briefly so Kodi playlist position has advanced; then service.reset_queue()
+            # removes the correct (previous) item.
+            broadcast_enabled = (
+                SPOTIFY_ADDON.getSetting("broadcast_to_service_upnextmusic").lower()
+                != "false"
+            )
+            if broadcast_enabled:
+                def _do_broadcast():
+                    time.sleep(2)
+                    try:
+                        current_item, next_item = get_next_playlist_item()
+                        if not next_item:
+                            return
+                        notification_sec = 15
+                        v = SPOTIFY_ADDON.getSetting("upnext_preview_seconds") or "15"
+                        try:
+                            notification_sec = max(5, min(60, int(v)))
+                        except (TypeError, ValueError):
+                            pass
+                        broadcast_to_service_upnextmusic(
+                            current_item,
+                            next_item,
+                            int(duration_sec),
+                            notification_seconds=notification_sec,
+                        )
+                    except Exception:
+                        pass
+                t = threading.Thread(target=_do_broadcast, daemon=True)
+                t.start()
         except Exception:
             pass
 
@@ -185,8 +201,8 @@ class MainService:
 
     def _get_prebuffer_seconds_setting(self) -> int:
         """
-        Prebuffer duration (seconds). Driven by Up Next preview duration.
-        Clamped to 5–30 for memory safety.
+        Prebuffer duration (seconds) derived from the user-configured
+        preview duration setting. Clamped to 5–30 for memory safety.
         """
         try:
             v = int(SPOTIFY_ADDON.getSetting("upnext_preview_seconds") or 15)

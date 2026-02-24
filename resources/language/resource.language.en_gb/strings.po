@@ -309,5 +309,13 @@ msgid "Fetch extra song info"
 msgstr "Fetch extra song info"
 
 msgctxt "#11110"
-msgid "When enabled, fetches album label/copyright and artist genres/followers for the description boxes. Disable for faster list loading."
-msgstr "When enabled, fetches album label/copyright and artist genres/followers for the description boxes. Disable for faster list loading."
+msgid "When enabled, list appears immediately; album/artist details are fetched in the background and the list refreshes with descriptions. Disable to skip enrichment."
+msgstr "When enabled, list appears immediately; album/artist details are fetched in the background and the list refreshes with descriptions. Disable to skip enrichment."
+
+msgctxt "#11111"
+msgid "Broadcast to Up Next - Music service"
+msgstr "Broadcast to Up Next - Music service"
+
+msgctxt "#11112"
+msgid "When enabled, sends next-track data to the Up Next - Music service addon so it can show the next-track overlay. Disable if you use only the built-in overlay or another addon."
+msgstr "When enabled, sends next-track data to the Up Next - Music service addon so it can show the next-track overlay. Disable if you use only the built-in overlay or another addon."

@@ -9,14 +9,7 @@
           <control type="toggle"/>
         </setting>
         <setting id="spotify_stream_volume" type="slider" default="35" label="11095" help="11096" range="1,1,100" option="int"/>
-    </category>
-
-    <category label="11106">
-        <setting id="upnext_enabled" type="bool" default="true" label="11099" help="11100">
-          <control type="toggle"/>
-        </setting>
-        <setting id="upnext_preview_seconds" type="number" default="15" label="11101" help="11102"/>
-        <setting id="upnext_prebuffer_enabled" type="bool" default="true" label="11107" help="11108">
+        <setting id="broadcast_to_service_upnextmusic" type="bool" default="true" label="11111" help="11112">
           <control type="toggle"/>
         </setting>
     </category>

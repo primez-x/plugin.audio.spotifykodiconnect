@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import sys
@@ -21,6 +22,13 @@ from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import *
 from utils import ADDON_ID, LOGINFO, PROXY_PORT, log_exception, log_msg, get_chunks
+
+# Window property keys for streaming enrichment (show list fast, then enrich in background)
+_HOME_WINDOW_ID = 10000
+_PROP_ENRICHED_ALBUMS = "Spotify.EnrichedAlbums"
+_PROP_ENRICHED_ARTISTS = "Spotify.EnrichedArtists"
+_PROP_PENDING_ALBUMS = "Spotify.PendingEnrichmentAlbums"
+_PROP_PENDING_ARTISTS = "Spotify.PendingEnrichmentArtists"
 
 MUSIC_ARTISTS_ICON = "icon_music_artists.png"
 MUSIC_TOP_ARTISTS_ICON = "icon_music_top_artists.png"
@@ -378,6 +386,102 @@ class PluginContent:
                 parts.append("%d followers." % followers)
         return " ".join(parts).strip() if parts else ""
 
+    def _merge_enrichment_into_tracks(self, tracks: List[Dict[str, Any]]) -> None:
+        """Merge Window-stored enriched album/artist data into track dicts (mutates in place)."""
+        try:
+            win = xbmcgui.Window(_HOME_WINDOW_ID)
+            alb_json = win.getProperty(_PROP_ENRICHED_ALBUMS)
+            art_json = win.getProperty(_PROP_ENRICHED_ARTISTS)
+            if not alb_json and not art_json:
+                return
+            album_data = json.loads(alb_json) if alb_json else {}
+            artist_data = json.loads(art_json) if art_json else {}
+            for t in tracks:
+                aid = (t.get("album") or {}).get("id")
+                if aid and aid in album_data:
+                    alb = album_data[aid]
+                    if not t.get("album"):
+                        t["album"] = {}
+                    t["album"]["label"] = alb.get("label") or ""
+                    t["album"]["copyrights"] = alb.get("copyrights") or []
+                artist_id = t.get("artistid")
+                if artist_id and artist_id in artist_data:
+                    art = artist_data[artist_id]
+                    followers = art.get("followers")
+                    genres = art.get("genres") or []
+                    t["artist_genres"] = " / ".join(genres) if genres else ""
+                    t["artist_followers"] = (
+                        followers.get("total", -1) if followers else -1
+                    )
+            win.clearProperty(_PROP_ENRICHED_ALBUMS)
+            win.clearProperty(_PROP_ENRICHED_ARTISTS)
+        except (TypeError, ValueError, RuntimeError):
+            pass
+
+    def _start_streaming_enrichment_thread(self) -> None:
+        """Start background thread to fetch all pending album/artist data, then refresh container."""
+        try:
+            win = xbmcgui.Window(_HOME_WINDOW_ID)
+            pending_albums = win.getProperty(_PROP_PENDING_ALBUMS)
+            pending_artists = win.getProperty(_PROP_PENDING_ARTISTS)
+            if not pending_albums and not pending_artists:
+                return
+            win.clearProperty(_PROP_PENDING_ALBUMS)
+            win.clearProperty(_PROP_PENDING_ARTISTS)
+            album_ids = [x.strip() for x in pending_albums.split(",") if x.strip()]
+            artist_ids = [x.strip() for x in pending_artists.split(",") if x.strip()]
+            spotipy_client = self.__spotipy
+            market = self.__user_country
+
+            def _run():
+                album_data = {}
+                artist_data = {}
+
+                def _fetch_albums():
+                    for chunk in get_chunks(album_ids, 20):
+                        try:
+                            for alb in spotipy_client.albums(chunk, market=market).get(
+                                "albums", []
+                            ):
+                                if alb and alb.get("id"):
+                                    album_data[alb["id"]] = {
+                                        "label": alb.get("label") or "",
+                                        "copyrights": alb.get("copyrights") or [],
+                                    }
+                        except Exception:
+                            pass
+
+                def _fetch_artists():
+                    for chunk in get_chunks(artist_ids, 50):
+                        try:
+                            for art in spotipy_client.artists(chunk).get("artists", []):
+                                if art and art.get("id"):
+                                    artist_data[art["id"]] = {
+                                        "followers": art.get("followers"),
+                                        "genres": art.get("genres") or [],
+                                    }
+                        except Exception:
+                            pass
+
+                t_alb = threading.Thread(target=_fetch_albums, daemon=True)
+                t_art = threading.Thread(target=_fetch_artists, daemon=True)
+                t_alb.start()
+                t_art.start()
+                t_alb.join()
+                t_art.join()
+                try:
+                    w = xbmcgui.Window(_HOME_WINDOW_ID)
+                    w.setProperty(_PROP_ENRICHED_ALBUMS, json.dumps(album_data))
+                    w.setProperty(_PROP_ENRICHED_ARTISTS, json.dumps(artist_data))
+                    xbmc.executebuiltin("Container.Refresh")
+                except Exception:
+                    pass
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+        except (RuntimeError, Exception):
+            pass
+
     def __get_track_item(
         self, track: Dict[str, Any], append_artist_to_label: bool = False
     ) -> Tuple[str, xbmcgui.ListItem]:
@@ -589,10 +693,12 @@ class PluginContent:
             cache_log(
                 f'Retrieved {_get_len(tracks)} UNCACHED top tracks for user "{self.__userid}".'
             )
+        self._merge_enrichment_into_tracks(tracks)
         self.__add_track_listitems(tracks, True)
 
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+        self._start_streaming_enrichment_thread()
         if self.default_view_songs:
             xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
@@ -692,6 +798,7 @@ class PluginContent:
         album = self.__spotipy.album(self.__album_id, market=self.__user_country)
         xbmcplugin.setProperty(self.__addon_handle, "FolderName", album["name"])
         tracks = self.__get_album_tracks(album)
+        self._merge_enrichment_into_tracks(tracks)
         if album.get("album_type") == "compilation":
             self.__add_track_listitems(tracks, True)
         else:
@@ -703,6 +810,7 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_SONG_RATING)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_ARTIST)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+        self._start_streaming_enrichment_thread()
         if self.default_view_songs:
             xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
@@ -715,6 +823,7 @@ class PluginContent:
         )
         tracks = self.__spotipy.artist_top_tracks(self.__artist_id, country=self.__user_country)
         tracks = self.__prepare_track_listitems(tracks=tracks["tracks"])
+        self._merge_enrichment_into_tracks(tracks)
         self.__add_track_listitems(tracks)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_TRACKNUM)
@@ -722,6 +831,7 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_VIDEO_YEAR)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_SONG_RATING)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+        self._start_streaming_enrichment_thread()
         if self.default_view_songs:
             xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
@@ -796,9 +906,12 @@ class PluginContent:
         xbmcplugin.setContent(self.__addon_handle, "songs")
         playlist_details = self.__get_playlist_details(self.__playlist_id)
         xbmcplugin.setProperty(self.__addon_handle, "FolderName", playlist_details["name"])
-        self.__add_track_listitems(playlist_details["tracks"]["items"], True)
+        items = playlist_details["tracks"]["items"]
+        self._merge_enrichment_into_tracks(items)
+        self.__add_track_listitems(items, True)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+        self._start_streaming_enrichment_thread()
         if self.default_view_songs:
             xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
@@ -1151,62 +1264,24 @@ class PluginContent:
 
             new_tracks.append(track)
 
-        # Enrich with full album (label, copyrights) and artist (genres, followers) for descriptions.
-        # Optional (setting), capped, and run in parallel to keep UI responsive.
+        # Streaming enrichment: if we already have enriched data (from a background refresh), merge and return.
+        try:
+            win = xbmcgui.Window(_HOME_WINDOW_ID)
+            if win.getProperty(_PROP_ENRICHED_ALBUMS) or win.getProperty(_PROP_ENRICHED_ARTISTS):
+                self._merge_enrichment_into_tracks(new_tracks)
+                return new_tracks
+        except RuntimeError:
+            pass
+
+        # Otherwise: optional (setting). If fetch_extra, set Pending so caller starts background thread (no cap).
         fetch_extra = self.__addon.getSetting("fetch_extra_song_info").lower() == "true"
-        if fetch_extra:
-            # Cap to limit API round-trips (2 album chunks + 1 artist chunk max)
-            album_ids_list = list(album_ids_to_fetch)[:40]
-            artist_ids_list = list(artist_ids_to_fetch)[:50]
-        else:
-            album_ids_list = []
-            artist_ids_list = []
-
-        if album_ids_list or artist_ids_list:
-            album_data = {}
-            artist_data = {}
-            market = self.__user_country
-
-            def _fetch_albums():
-                for chunk in get_chunks(album_ids_list, 20):
-                    try:
-                        for alb in self.__spotipy.albums(chunk, market=market).get("albums", []):
-                            if alb and alb.get("id"):
-                                album_data[alb["id"]] = alb
-                    except Exception:
-                        pass
-
-            def _fetch_artists():
-                for chunk in get_chunks(artist_ids_list, 50):
-                    try:
-                        for art in self.__spotipy.artists(chunk).get("artists", []):
-                            if art and art.get("id"):
-                                artist_data[art["id"]] = art
-                    except Exception:
-                        pass
-
-            t_alb = threading.Thread(target=_fetch_albums, daemon=True)
-            t_art = threading.Thread(target=_fetch_artists, daemon=True)
-            t_alb.start()
-            t_art.start()
-            t_alb.join()
-            t_art.join()
-
-            for t in new_tracks:
-                aid = (t.get("album") or {}).get("id")
-                if aid and aid in album_data:
-                    alb = album_data[aid]
-                    if not t.get("album"):
-                        t["album"] = {}
-                    t["album"]["label"] = alb.get("label") or ""
-                    t["album"]["copyrights"] = alb.get("copyrights") or []
-                artist_id = t.get("artistid")
-                if artist_id and artist_id in artist_data:
-                    art = artist_data[artist_id]
-                    followers = (art.get("followers") or {}).get("total")
-                    genres = art.get("genres") or []
-                    t["artist_genres"] = " / ".join(genres) if genres else ""
-                    t["artist_followers"] = followers if followers is not None else -1
+        if fetch_extra and (album_ids_to_fetch or artist_ids_to_fetch):
+            try:
+                win = xbmcgui.Window(_HOME_WINDOW_ID)
+                win.setProperty(_PROP_PENDING_ALBUMS, ",".join(album_ids_to_fetch))
+                win.setProperty(_PROP_PENDING_ARTISTS, ",".join(artist_ids_to_fetch))
+            except RuntimeError:
+                pass
 
         return new_tracks
 
@@ -1803,9 +1878,11 @@ class PluginContent:
             self.__addon_handle, "FolderName", xbmc.getLocalizedString(KODI_SONGS_STR_ID)
         )
         tracks = self.__get_saved_tracks()
+        self._merge_enrichment_into_tracks(tracks)
         self.__add_track_listitems(tracks, True)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+        self._start_streaming_enrichment_thread()
         if self.default_view_songs:
             xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
@@ -1928,11 +2005,13 @@ class PluginContent:
         )
 
         tracks = self.__prepare_track_listitems(tracks=result["tracks"]["items"])
+        self._merge_enrichment_into_tracks(tracks)
         self.__add_track_listitems(tracks, True)
         self.__add_next_button(result["tracks"]["total"])
 
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+        self._start_streaming_enrichment_thread()
 
         if self.default_view_songs:
             xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
