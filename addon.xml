@@ -1,0 +1,36 @@
+<?xml version='1.0' encoding='utf-8'?>
+<addon id="plugin.audio.spotifykodiconnect" version="1.0.0" name="Spotify Kodi Connect" provider-name="Spotify Kodi Connect">
+    <requires>
+        <import addon="xbmc.python" version="3.0.0" />
+        <import addon="xbmc.addon" version="18.9.701" />
+        <import addon="script.module.certifi" version="2023.5.7" />
+        <import addon="script.module.chardet" version="5.1.0" />
+        <import addon="script.module.idna" version="3.4.0" />
+        <import addon="script.module.requests" version="2.31.0" />
+        <import addon="script.module.urllib3" version="1.26.16" />
+    </requires>
+    <extension point="xbmc.python.pluginsource" library="plugin.py">
+        <provides>audio</provides>
+    </extension>
+    <extension library="service.py" point="xbmc.service" />
+    <extension point="xbmc.addon.metadata">
+        <platform>all</platform>
+        <summary lang="en_GB">Spotify for Kodi with consistent art, metadata, and background loading (Kodi Connect style)</summary>
+        <description lang="en_GB">Unofficial Spotify music plugin for Kodi. Improves on the original Spotify addon with consistent album/artist art in all views (including playlists), correct metadata tags, and background loading so navigation and playback feel smooth. Requires Spotify Premium.</description>
+        <disclaimer lang="en_GB">This product uses the SPOTIFY WEB API but is not endorsed, certified or otherwise approved in any way by Spotify. Spotify is the registered trademark of Spotify AB.</disclaimer>
+        <source>https://github.com/</source>
+        <news>v1.0.0
+- Fork of plugin.audio.spotify with Kodi Connect–style improvements.
+- Spotify playlists as real Kodi playlists: synced to Music → Playlists as .m3u files (like PlexKodiConnect), not addon folders.
+- Spotify Connect receiver (LibreSpot): optional integration so you can stream/control from iPhone or other devices to Kodi (requires librespot binary).
+- Consistent art: thumb, poster, fanart, and icon set for albums, artists, playlists, and tracks so every list view shows art.
+- Correct metadata: proper Kodi music info types (year, duration, tracknumber, albumartist, etc.) for reliable tagging.
+- Background precache: library precache runs in a thread so the main menu appears immediately.
+- Smoother playlist play: first track starts quickly; remaining tracks are queued in the background.
+        </news>
+        <assets>
+            <icon>resources/icon.png</icon>
+            <fanart>resources/fanart.jpg</fanart>
+        </assets>
+    </extension>
+</addon>

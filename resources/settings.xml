@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<settings>
+    <category label="11054">
+        <setting id="my_recently_played_playlist_name" type="text" default="My Recently Played"
+                 label="11069" help="Disable by setting string to NONE"/>
+        <setting id="gap_between_playlist_tracks" type="number" default="0" label="11070"
+	         help="Gap between tracks when playing a playlist (secs)"/>
+        <setting id="use_spotify_normalization" type="bool" default="true" label="11075">
+          <control type="toggle"/>
+        </setting>
+        <setting id="problem_with_terminate_streaming" type="bool" default="false" label="11086">
+          <control type="toggle"/>
+        </setting>
+    </category>
+
+    <category label="11055">
+        <setting id="categoryDefaultView" type="text" default="" label="11020"/>
+        <setting id="playlistDefaultView" type="text" default="" label="11031"/>
+        <setting id="artistDefaultView" type="text" default="" label="11032"/>
+        <setting id="albumDefaultView" type="text" default="" label="11033"/>
+        <setting id="songDefaultView" type="text" default="" label="11034"/>
+        <setting id="appendArtistToTitle" type="bool" default="false" label="11030"/>
+    </category>
+
+    <category label="11088">
+        <setting id="connect_receiver" type="bool" default="false" label="11089">
+          <control type="toggle"/>
+        </setting>
+        <setting id="connect_backend" type="enum" values="pulseaudio_rtp|alsa" default="pulseaudio_rtp" label="11090"/>
+        <setting id="connect_device_name" type="text" default="Spotify Kodi Connect@{}" label="11091"/>
+        <setting id="connect_alsa_device" type="text" default="hw:2,0" label="11092" subsetting="true" visible="eq(-1,1)"/>
+        <setting id="connect_dnd_kodi" type="bool" default="false" label="11093">
+          <control type="toggle"/>
+        </setting>
+        <setting id="connect_options" type="text" default="" label="11094"/>
+    </category>
+</settings>
