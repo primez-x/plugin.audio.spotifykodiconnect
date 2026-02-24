@@ -164,6 +164,14 @@ msgctxt "#11096"
 msgid "Volume level of the incoming Spotify stream. Lower the value (e.g. 25-50) if Spotify sounds louder than other sources like Plex."
 msgstr ""
 
+msgctxt "#11097"
+msgid "Pre-buffer next track (seconds)"
+msgstr ""
+
+msgctxt "#11098"
+msgid "How many seconds of the next track to load in the background (5–30). Higher values reduce gap between tracks but use more memory."
+msgstr ""
+
 msgctxt "#11076"
 msgid "Authenticate the plugin"
 msgstr ""

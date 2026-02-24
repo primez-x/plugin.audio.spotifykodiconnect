@@ -15,10 +15,12 @@ import spotty
 import utils
 from http_spotty_audio_streamer import HTTPSpottyAudioStreamer
 from http_video_player_setter import HttpVideoPlayerSetter
+from prebuffer import PrebufferManager, _clamp_prebuffer_seconds
 from save_recently_played import SaveRecentlyPlayed
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import HTTP_VIDEO_RULE_ADDED_STR_ID
+from upnext import send_upnext_signal_and_return_next_track
 from utils import ADDON_ID, PROXY_PORT, log_msg, log_exception
 
 try:
@@ -80,17 +82,37 @@ class MainService:
             SPOTIFY_ADDON.getSetting("problem_with_terminate_streaming").lower() == "true"
         )
         stream_volume = self._get_stream_volume_setting()
+        prebuffer_seconds = self._get_prebuffer_seconds_setting()
+        self.__prebuffer_manager: PrebufferManager = PrebufferManager(
+            self.__spotty,
+            initial_volume=stream_volume,
+            use_normalization=use_spotify_normalization,
+            prebuffer_seconds=prebuffer_seconds,
+        )
         self.__http_spotty_streamer: HTTPSpottyAudioStreamer = HTTPSpottyAudioStreamer(
             self.__spotty,
             gap_between_tracks,
             use_spotify_normalization,
             problem_with_terminate_streaming,
             stream_volume,
+            prebuffer_manager=self.__prebuffer_manager,
+            on_track_started_callback=self.__on_track_started,
         )
         self.__save_recently_played: SaveRecentlyPlayed = SaveRecentlyPlayed()
         self.__http_spotty_streamer.set_notify_track_finished(self.__save_track_to_recently_played)
 
         bottle_manager.route_all(self.__http_spotty_streamer)
+
+    def __on_track_started(self, track_id: str, duration_sec: float) -> None:
+        """Notify Up Next and start pre-buffering the next track."""
+        try:
+            next_track_id, next_duration = send_upnext_signal_and_return_next_track(
+                track_id, duration_sec
+            )
+            if next_track_id and next_duration is not None:
+                self.__prebuffer_manager.start_prebuffer(next_track_id, next_duration)
+        except Exception:
+            pass
 
     def __save_track_to_recently_played(self, track_id: str) -> None:
         if SAVE_TO_RECENTLY_PLAYED_FILE:
@@ -127,6 +149,11 @@ class MainService:
                 stream_volume = self._get_stream_volume_setting()
             self.__http_spotty_streamer.use_normalization(use_normalization)
             self.__http_spotty_streamer.set_stream_volume(stream_volume)
+            self.__prebuffer_manager.set_volume(stream_volume)
+            self.__prebuffer_manager.set_use_normalization(use_normalization)
+            self.__prebuffer_manager.set_prebuffer_seconds(
+                self._get_prebuffer_seconds_setting()
+            )
 
             # Monitor authorization.
             if self.__auth_token_expires_at == "":
@@ -163,6 +190,7 @@ class MainService:
         self.__connect_stop.set()
         if self.__connect_thread and self.__connect_thread.is_alive():
             self.__connect_thread.join(timeout=5)
+        self.__prebuffer_manager.cancel_prebuffer()
         self.__http_spotty_streamer.stop()
         self.__spotty_helper.kill_all_spotties()
         bottle_manager.stop_thread()
@@ -194,6 +222,14 @@ class MainService:
             return max(1, min(100, v))
         except (TypeError, ValueError):
             return 35
+
+    def _get_prebuffer_seconds_setting(self) -> int:
+        """Read pre-buffer next track setting in seconds (5–30)."""
+        try:
+            v = int(SPOTIFY_ADDON.getSetting("prebuffer_seconds") or 15)
+            return _clamp_prebuffer_seconds(v)
+        except (TypeError, ValueError):
+            return _clamp_prebuffer_seconds(15)
 
     def __renew_token(self) -> None:
         try:

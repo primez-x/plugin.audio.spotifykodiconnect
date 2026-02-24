@@ -1,6 +1,6 @@
 import threading
 import time
-from typing import Callable
+from typing import Callable, Optional
 
 import bottle
 from spotty import Spotty
@@ -25,10 +25,14 @@ class HTTPSpottyAudioStreamer:
         use_normalization: bool = True,
         problem_with_terminate_streaming=False,
         stream_volume: int = 35,
+        prebuffer_manager=None,
+        on_track_started_callback: Optional[Callable[[str, float], None]] = None,
     ):
         self.__spotty: Spotty = spotty
         self.__gap_between_tracks: int = gap_between_tracks
         self.__problem_with_terminate_streaming = problem_with_terminate_streaming
+        self.__prebuffer_manager = prebuffer_manager
+        self.__on_track_started = on_track_started_callback or (lambda _id, _dur: None)
 
         self.__spotty_streamer: SpottyAudioStreamer = SpottyAudioStreamer(
             self.__spotty, initial_volume=_clamp_stream_volume(stream_volume)
@@ -46,6 +50,12 @@ class HTTPSpottyAudioStreamer:
 
     def set_notify_track_finished(self, func: Callable[[str], None]) -> None:
         self.__spotty_streamer.set_notify_track_finished(func)
+
+    def set_on_track_started(self, func: Callable[[str, float], None]) -> None:
+        self.__on_track_started = func or (lambda _id, _dur: None)
+
+    def set_prebuffer_manager(self, manager) -> None:
+        self.__prebuffer_manager = manager
 
     def stop(self) -> None:
         log_msg("Stopping spotty audio streaming.", LOGDEBUG)
@@ -98,13 +108,41 @@ class HTTPSpottyAudioStreamer:
             f" track length {self.__spotty_streamer.get_track_length()}."
         )
 
+        try:
+            self.__on_track_started(track_id, float(duration))
+        except Exception:
+            pass
+
         file_size = self.__spotty_streamer.get_track_length()
         range_begin = 0
         range_end = file_size
 
-        def generate() -> str:
-            range_len = range_end - range_begin
-            return self.__spotty_streamer.send_part_audio_stream(range_len, range_begin)
+        def generate():
+            r_begin = range_begin
+            r_end = range_end
+            r_len = r_end - r_begin
+            prebuf, has_prebuf = (
+                (self.__prebuffer_manager.get_and_clear_prebuffer(track_id))
+                if self.__prebuffer_manager
+                else (None, False)
+            )
+            if has_prebuf and prebuf:
+                prebuffer_len = len(prebuf)
+                if r_begin < prebuffer_len:
+                    end_from_buf = min(r_end, prebuffer_len)
+                    yield prebuf[r_begin:end_from_buf]
+                if r_end > prebuffer_len:
+                    rest_begin = max(r_begin, prebuffer_len)
+                    rest_len = r_end - rest_begin
+                    for chunk in self.__spotty_streamer.send_part_audio_stream(
+                        rest_len, rest_begin
+                    ):
+                        yield chunk
+            else:
+                for chunk in self.__spotty_streamer.send_part_audio_stream(
+                    r_len, r_begin
+                ):
+                    yield chunk
 
         request_range = bottle.request.headers.get("Range", "")
         log_msg(f"Request header range: '{request_range}'.", LOGDEBUG)
