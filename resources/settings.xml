@@ -22,23 +22,14 @@
     </category>
 
     <category label="11055">
+        <setting id="fetch_extra_song_info" type="bool" default="true" label="11109" help="11110">
+          <control type="toggle"/>
+        </setting>
         <setting id="categoryDefaultView" type="text" default="" label="11020"/>
         <setting id="playlistDefaultView" type="text" default="" label="11031"/>
         <setting id="artistDefaultView" type="text" default="" label="11032"/>
         <setting id="albumDefaultView" type="text" default="" label="11033"/>
         <setting id="songDefaultView" type="text" default="" label="11034"/>
         <setting id="appendArtistToTitle" type="bool" default="false" label="11030"/>
-    </category>
-
-    <category label="11088">
-        <setting id="connect_receiver" type="bool" default="false" label="11089">
-          <control type="toggle"/>
-        </setting>
-        <setting id="connect_device_name" type="text" default="Spotify Kodi Connect@{}" label="11091"/>
-        <setting id="connect_alsa_device" type="text" default="hw:0,0" label="11092" help="11109"/>
-        <setting id="connect_dnd_kodi" type="bool" default="false" label="11093">
-          <control type="toggle"/>
-        </setting>
-        <setting id="connect_options" type="text" default="" label="11094"/>
     </category>
 </settings>

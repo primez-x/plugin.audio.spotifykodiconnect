@@ -13,25 +13,27 @@
         <effect type="slide" start="0,0" end="0,-400" time="400" />
     </animation>
     <controls>
-        <!-- Bottom-up dimming scrim to emphasize Up Next overlay -->
+        <!-- Black gradient from bottom (Arctic Fuse 3 OSD_Background_Dim style) -->
         <control type="image">
             <left>0</left>
             <right>0</right>
             <bottom>0</bottom>
             <height>500</height>
-            <texture colordiffuse="CC000000">common/white.png</texture>
+            <texture colordiffuse="E6000000" border="4,0,4,0">common/gradient-v.png</texture>
         </control>
         <!-- OSD_Info_Dimensions style: height 400, bottom 80 -->
         <control type="group">
             <height>400</height>
             <bottom>80</bottom>
             <control type="group">
-                <!-- Title line: "Next track" + remaining time -->
+                <!-- Title line: "Next track" + remaining time (right side for music; video Up Next is left) -->
                 <control type="label">
-                    <left>80</left>
                     <right>80</right>
+                    <width>350</width>
                     <top>-140</top>
                     <height>40</height>
+                    <align>right</align>
+                    <aligny>center</aligny>
                     <font>font13</font>
                     <textcolor>FFFFFFFF</textcolor>
                     <label>$ADDON[plugin.audio.spotifykodiconnect 11103]  [COLOR FF00BFFF]$INFO[Window.Property(remaining), ,][/COLOR] [LOWERCASE]sec...[/LOWERCASE]</label>

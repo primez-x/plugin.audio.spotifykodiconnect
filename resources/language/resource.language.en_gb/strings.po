@@ -303,3 +303,11 @@ msgstr "Pre-buffer next track"
 msgctxt "#11108"
 msgid "When enabled, the prebuffer duration is derived from the Up Next preview duration (clamped to 5–30 seconds)."
 msgstr ""
+
+msgctxt "#11109"
+msgid "Fetch extra song info"
+msgstr "Fetch extra song info"
+
+msgctxt "#11110"
+msgid "When enabled, fetches album label/copyright and artist genres/followers for the description boxes. Disable for faster list loading."
+msgstr "When enabled, fetches album label/copyright and artist genres/followers for the description boxes. Disable for faster list loading."

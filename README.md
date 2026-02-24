@@ -16,8 +16,18 @@ Unofficial Spotify music addon for Kodi, inspired by the “Kodi Connect” styl
 - **Smoother playlist play**  
   “Play playlist” starts the first track right away and queues the rest in the background so playback begins without a long wait.
 
-- **Spotify Connect receiver (LibreSpot)**  
-  Optional: enable “Connect receiver” in addon settings to run LibreSpot. Your Kodi device then appears as a speaker in the Spotify app on your iPhone or other devices—tap “Connect to a device” and choose it to stream and control playback from the phone while audio plays on Kodi. You can use a **bundled** librespot binary for a fully standalone addon: place the librespot binary in the addon’s `bin/` folder (e.g. `bin/librespot` on Linux/Android/CoreELEC, or `bin/librespot.exe` on Windows). If no binary is in `bin/`, the addon will try the system `librespot` (e.g. `opkg install librespot` on CoreELEC). Backends: PulseAudio RTP (Kodi plays the stream) or ALSA (direct to device).
+- **Additional song info**  
+  The “Album description / Artist biography” style boxes (e.g. in Arctic Fuse 3’s music OSD) are filled from Spotify: release date, label, copyright, genre for albums, and artist genres/followers for artists. Spotify’s API does not provide narrative biography or album liner notes; those would require scraper augmentation (e.g. MusicBrainz, Last.fm) if desired.
+
+- **Performance**  
+  Extra song info (album/artist descriptions) is optional (setting “Fetch extra song info”), capped per list (40 albums, 50 artists), and fetched in parallel (album and artist API calls run in two threads). Saved-track and followed-artist lookups run in parallel with track loading. Playlist “Play” queues the rest in a background thread; precache and Up Next run in background threads.
+
+## Metadata: what comes from Spotify
+
+- **Tracks:** title, artist(s), album, duration, year, track/disc number, genre, art (thumb/album art), popularity (mapped to rating).
+- **Albums:** name, artists, release date, art, label, copyrights (after a batch fetch when building lists).
+- **Artists:** name, genres, follower count (after a batch fetch when building lists).  
+- **Not in Spotify’s API:** artist biography, album liner notes or long description. Skins that show “Album description / Artist biography” get the above metadata formatted as short descriptions; for full bios you’d need to plug in a music scraper or external source.
 
 ## Requirements
 
@@ -32,17 +42,6 @@ Unofficial Spotify music addon for Kodi, inspired by the “Kodi Connect” styl
 3. Use **Music → Add-ons → Spotify Kodi Connect** (or your skin’s equivalent).
 
 You can run this addon alongside the original `plugin.audio.spotify`; it uses a different addon id and proxy port (52309) and its own auth/cache.
-
-## Troubleshooting: Connect receiver (LibreSpot) and service.librespot
-
-- **Run only one LibreSpot instance.** If you have both **Spotify Kodi Connect** (with “Connect receiver” enabled) and the **service.librespot** addon installed, they both start at Kodi boot and each tries to run librespot. That can cause “failed to initialize” and the device not appearing in the Spotify app. **Fix:** Use either the Connect receiver inside this addon **or** service.librespot, not both. Disable the other (e.g. disable “Connect receiver” in this addon’s settings, or disable/remove the service.librespot addon).
-
-- **“Failed to initialize” / “librespot failed 1/5” … “failed too many times”.** The real error is printed by the librespot binary. In the Kodi log, search for lines starting with `librespot:` — that is librespot’s stderr and will show the actual reason (e.g. zeroconf/discovery bind failure, wrong ALSA device, PulseAudio not available).
-
-- **CoreELEC / AM6B+ (and similar):**
-  - Prefer the **ALSA** backend in Connect settings (default). PulseAudio RTP often isn’t available on CoreELEC.
-  - If using ALSA, set **Connect ALSA device** to the correct device. Default is `hw:2,0`; on your box it might be `hw:0,0` or `hw:1,0`. Run `aplay -L` over SSH to list devices and pick the right one (e.g. the HDMI or analog output you use).
-  - Use the system librespot: `opkg install librespot` so the binary matches your architecture (e.g. aarch64). If you use a bundled binary in the addon’s `bin/` folder, it must be built for your device (e.g. ARM64 for AM6B+).
 
 ## Credits
 

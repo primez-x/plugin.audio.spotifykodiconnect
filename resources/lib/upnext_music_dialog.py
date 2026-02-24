@@ -42,6 +42,7 @@ class UpNextMusicDialog(WindowXMLDialog):
         self._progress_step_size = 0
         self._current_progress_percent = 100
         self._progress_control = None
+        self._initial_remaining_sec = None
         self.action_exitkeys_id = [10, 13]
         WindowXMLDialog.__init__(self, xml_filename, path, skin, res)
 
@@ -51,6 +52,10 @@ class UpNextMusicDialog(WindowXMLDialog):
 
     def set_progress_step_size(self, step):
         self._progress_step_size = step
+
+    def set_initial_remaining(self, remaining_sec):
+        """Set countdown seconds so label and bar show correctly when dialog opens."""
+        self._initial_remaining_sec = max(0, int(remaining_sec))
 
     def onInit(self):
         self._set_info()
@@ -65,6 +70,8 @@ class UpNextMusicDialog(WindowXMLDialog):
         self.setProperty("title", item.get("title", ""))
         self.setProperty("artist", item.get("artist", ""))
         self.setProperty("runtime", str(item.get("runtime", 0)))
+        if self._initial_remaining_sec is not None:
+            self.setProperty("remaining", "%02d" % self._initial_remaining_sec)
 
     def _prepare_progress_control(self):
         try:
@@ -74,6 +81,8 @@ class UpNextMusicDialog(WindowXMLDialog):
             self._progress_control = None
 
     def update_progress_control(self, remaining=None, runtime=None):
+        # Drive bar by remaining time: percent = (remaining / total) * 100 would need total;
+        # we use step-based countdown so bar empties over remaining seconds.
         self._current_progress_percent = max(
             0,
             self._current_progress_percent - self._progress_step_size,

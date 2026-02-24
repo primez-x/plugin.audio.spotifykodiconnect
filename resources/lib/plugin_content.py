@@ -335,6 +335,49 @@ class PluginContent:
 
         return list_items
 
+    def _track_album_description(self, track: Dict[str, Any], album: Dict[str, Any]) -> str:
+        """Build album description from Spotify data (release date, label, copyright, genre)."""
+        parts = []
+        release_date = (album or {}).get("release_date") or ""
+        if release_date:
+            parts.append("Released %s." % release_date)
+        label = (album or {}).get("label")
+        if label:
+            parts.append("Label: %s." % label)
+        copyrights = (album or {}).get("copyrights")
+        if copyrights and isinstance(copyrights, list):
+            texts = [c.get("text") for c in copyrights if c.get("text")]
+            if texts:
+                parts.append(" ".join(texts))
+        genre = track.get("genre")
+        if genre:
+            g = genre if isinstance(genre, str) else " / ".join(genre) if genre else ""
+            if g:
+                parts.append("Genre: %s." % g)
+        return " ".join(parts).strip() if parts else ""
+
+    def _track_artist_description(self, track: Dict[str, Any]) -> str:
+        """Build artist description from Spotify data (genres, followers). No biography in API."""
+        parts = []
+        if track.get("artist_genres"):
+            genres = track["artist_genres"]
+            g = genres if isinstance(genres, str) else ", ".join(genres) if genres else ""
+            if g:
+                parts.append("Genres: %s." % g)
+        elif track.get("genre"):
+            g = track["genre"] if isinstance(track["genre"], str) else " / ".join(track["genre"])
+            if g:
+                parts.append("Genre: %s." % g)
+        followers = track.get("artist_followers")
+        if followers is not None and followers >= 0:
+            if followers >= 1_000_000:
+                parts.append("%.1fM followers." % (followers / 1_000_000))
+            elif followers >= 1_000:
+                parts.append("%.1fK followers." % (followers / 1_000))
+            else:
+                parts.append("%d followers." % followers)
+        return " ".join(parts).strip() if parts else ""
+
     def __get_track_item(
         self, track: Dict[str, Any], append_artist_to_label: bool = False
     ) -> Tuple[str, xbmcgui.ListItem]:
@@ -365,6 +408,13 @@ class PluginContent:
         if album.get("album_type") == "compilation":
             info["albumartist"] = ["Various Artists"]
         li.setInfo("music", info)
+        # Fill "Additional song info" / context boxes (Album description / Artist biography)
+        album_desc = self._track_album_description(track, album)
+        artist_desc = self._track_artist_description(track)
+        if album_desc:
+            li.setProperty("Album_Description", album_desc)
+        if artist_desc:
+            li.setProperty("Artist_Description", artist_desc)
         li.setArt(_art_for_item(track.get("thumb") or "", "DefaultMusicSongs.png"))
         li.setProperty("spotifytrackid", track["id"])
         li.setContentLookup(False)
@@ -1010,17 +1060,33 @@ class PluginContent:
 
         new_tracks: List[Dict[str, Any]] = []
 
+        # Fetch saved_track_ids and followed_artists in parallel (with track fetch when needed)
+        saved_result = [None]
+        followed_result = [None]
+
+        def _get_saved():
+            saved_result[0] = self.__get_saved_track_ids()
+
+        def _get_followed():
+            followed_result[0] = self.__get_followed_artists()
+
+        t_saved = threading.Thread(target=_get_saved, daemon=True)
+        t_followed = threading.Thread(target=_get_followed, daemon=True)
+        t_saved.start()
+        t_followed.start()
+
         # For tracks, we always get the full details unless full tracks already supplied.
         if track_ids and not tracks:
             for chunk in get_chunks(track_ids, 20):
                 tracks += self.__spotipy.tracks(chunk, market=self.__user_country)["tracks"]
 
-        saved_track_ids = self.__get_saved_track_ids()
+        t_saved.join()
+        t_followed.join()
+        saved_track_ids = saved_result[0] or []
+        followed_artists = [a["id"] for a in (followed_result[0] or [])]
 
-        followed_artists = []
-        for artist in self.__get_followed_artists():
-            followed_artists.append(artist["id"])
-
+        album_ids_to_fetch = set()
+        artist_ids_to_fetch = set()
         for track in tracks:
             if track.get("track"):
                 track = track["track"]
@@ -1076,7 +1142,71 @@ class PluginContent:
                 track, saved_track_ids, playlist_details, followed_artists
             )
 
+            album_id = (track.get("album") or {}).get("id")
+            if album_id and not (track.get("album") or {}).get("label"):
+                album_ids_to_fetch.add(album_id)
+            artist_id = track.get("artistid")
+            if artist_id and "artist_genres" not in track:
+                artist_ids_to_fetch.add(artist_id)
+
             new_tracks.append(track)
+
+        # Enrich with full album (label, copyrights) and artist (genres, followers) for descriptions.
+        # Optional (setting), capped, and run in parallel to keep UI responsive.
+        fetch_extra = self.__addon.getSetting("fetch_extra_song_info").lower() == "true"
+        if fetch_extra:
+            # Cap to limit API round-trips (2 album chunks + 1 artist chunk max)
+            album_ids_list = list(album_ids_to_fetch)[:40]
+            artist_ids_list = list(artist_ids_to_fetch)[:50]
+        else:
+            album_ids_list = []
+            artist_ids_list = []
+
+        if album_ids_list or artist_ids_list:
+            album_data = {}
+            artist_data = {}
+            market = self.__user_country
+
+            def _fetch_albums():
+                for chunk in get_chunks(album_ids_list, 20):
+                    try:
+                        for alb in self.__spotipy.albums(chunk, market=market).get("albums", []):
+                            if alb and alb.get("id"):
+                                album_data[alb["id"]] = alb
+                    except Exception:
+                        pass
+
+            def _fetch_artists():
+                for chunk in get_chunks(artist_ids_list, 50):
+                    try:
+                        for art in self.__spotipy.artists(chunk).get("artists", []):
+                            if art and art.get("id"):
+                                artist_data[art["id"]] = art
+                    except Exception:
+                        pass
+
+            t_alb = threading.Thread(target=_fetch_albums, daemon=True)
+            t_art = threading.Thread(target=_fetch_artists, daemon=True)
+            t_alb.start()
+            t_art.start()
+            t_alb.join()
+            t_art.join()
+
+            for t in new_tracks:
+                aid = (t.get("album") or {}).get("id")
+                if aid and aid in album_data:
+                    alb = album_data[aid]
+                    if not t.get("album"):
+                        t["album"] = {}
+                    t["album"]["label"] = alb.get("label") or ""
+                    t["album"]["copyrights"] = alb.get("copyrights") or []
+                artist_id = t.get("artistid")
+                if artist_id and artist_id in artist_data:
+                    art = artist_data[artist_id]
+                    followers = (art.get("followers") or {}).get("total")
+                    genres = art.get("genres") or []
+                    t["artist_genres"] = " / ".join(genres) if genres else ""
+                    t["artist_followers"] = followers if followers is not None else -1
 
         return new_tracks
 

@@ -70,10 +70,21 @@ def _get_audio_player_time():
         return None, None
 
 
+def _unwrap_playlist_item(item):
+    """Kodi Playlist.GetItems returns { item: { title, artist, art, ... }, duration }. Use inner item."""
+    if not item:
+        return item
+    inner = item.get("item")
+    if inner is not None:
+        return inner
+    return item
+
+
 def _next_item_info_for_dialog(next_item, next_duration_sec):
     """Build dict for UpNextMusicDialog from playlist next_item."""
     if not next_item:
         return {"title": "", "artist": "", "art": {}, "runtime": 0}
+    next_item = _unwrap_playlist_item(next_item)
     art = next_item.get("art") or {}
     artist = next_item.get("artist")
     if isinstance(artist, list):
@@ -82,14 +93,17 @@ def _next_item_info_for_dialog(next_item, next_duration_sec):
         artist = ""
     else:
         artist = str(artist)
+    # Support Kodi art keys: thumb, album.thumb, etc.
+    thumb = art.get("thumb") or art.get("album") or ""
+    fanart_val = art.get("fanart", "")
     return {
         "title": (next_item.get("title") or next_item.get("label") or "").strip() or "Unknown",
         "artist": artist,
         "art": {
-            "thumb": art.get("thumb", ""),
-            "tvshow.landscape": art.get("thumb", ""),
-            "tvshow.fanart": art.get("fanart", ""),
-            "fanart": art.get("fanart", ""),
+            "thumb": thumb,
+            "tvshow.landscape": thumb,
+            "tvshow.fanart": fanart_val,
+            "fanart": fanart_val,
         },
         "runtime": next_duration_sec or 0,
     }
@@ -155,24 +169,37 @@ def _wait_and_show_dialog(
         remaining = notification_seconds
     step = _calculate_progress_steps(remaining)
     dialog.set_progress_step_size(step)
+    dialog.set_initial_remaining(remaining)
+
+    def _update_while_visible():
+        player = xbmc.Player()
+        while not cancel_event.is_set():
+            if not player.isPlaying():
+                try:
+                    dialog.close()
+                except Exception:
+                    pass
+                return
+            try:
+                t = player.getTime()
+                total = player.getTotalTime()
+            except RuntimeError:
+                return
+            if total - t <= 1:
+                try:
+                    dialog.close()
+                except Exception:
+                    pass
+                return
+            if dialog.is_cancel() or dialog.is_play_next():
+                return
+            remaining_sec = int(total - t)
+            dialog.update_progress_control(remaining=remaining_sec, runtime=remaining_sec)
+            time.sleep(0.1)
+
+    updater = threading.Thread(target=_update_while_visible, daemon=True)
+    updater.start()
     dialog.show()
-    # Update progress until playback near end or user closes
-    player = xbmc.Player()
-    while not cancel_event.is_set():
-        if not player.isPlaying():
-            break
-        try:
-            t = player.getTime()
-            total = player.getTotalTime()
-        except RuntimeError:
-            break
-        if total - t <= 1:
-            break
-        if dialog.is_cancel() or dialog.is_play_next():
-            break
-        remaining = int(total - t)
-        dialog.update_progress_control(remaining=remaining, runtime=remaining)
-        time.sleep(0.1)
     try:
         dialog.close()
     except Exception:

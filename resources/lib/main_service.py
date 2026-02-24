@@ -3,7 +3,6 @@
     Spotify Kodi Connect - service: spotty + playlist sync to Kodi (real playlists).
 """
 
-import threading
 import time
 
 import xbmc
@@ -28,12 +27,6 @@ try:
     HAS_UPNEXT_MUSIC = True
 except Exception:
     HAS_UPNEXT_MUSIC = False
-
-try:
-    from connect import runner as connect_runner
-    HAS_CONNECT_RECEIVER = True
-except Exception:
-    HAS_CONNECT_RECEIVER = False
 
 SAVE_TO_RECENTLY_PLAYED_FILE = True
 SPOTIFY_ADDON = xbmcaddon.Addon(id=ADDON_ID)
@@ -64,8 +57,6 @@ class MainService:
 
         self.__spotty_auth: SpottyAuth = SpottyAuth(self.__spotty)
         self.__auth_token_expires_at = ""
-        self.__connect_stop = threading.Event()
-        self.__connect_thread = None
 
         # Workaround to make Kodi use it's VideoPlayer to play http audio streams.
         # If we don't do this, then Kodi uses PAPlayer which does not stream.
@@ -139,17 +130,6 @@ class MainService:
         bottle_manager.start_thread(PROXY_PORT)
         log_msg(f"Started bottle with port {PROXY_PORT}.")
 
-        # Start Spotify Connect receiver (LibreSpot) if enabled
-        if HAS_CONNECT_RECEIVER and SPOTIFY_ADDON.getSetting("connect_receiver") == "true":
-            self.__connect_stop.clear()
-            self.__connect_thread = threading.Thread(
-                target=connect_runner.run,
-                kwargs={"stop_event": self.__connect_stop},
-                daemon=True,
-            )
-            self.__connect_thread.start()
-            log_msg("Connect receiver thread started.")
-
         self.__renew_token()
 
         loop_counter = 0
@@ -197,9 +177,6 @@ class MainService:
 
     def __close(self) -> None:
         log_msg("Shutdown requested.")
-        self.__connect_stop.set()
-        if self.__connect_thread and self.__connect_thread.is_alive():
-            self.__connect_thread.join(timeout=5)
         self.__prebuffer_manager.cancel_prebuffer()
         self.__http_spotty_streamer.stop()
         self.__spotty_helper.kill_all_spotties()
