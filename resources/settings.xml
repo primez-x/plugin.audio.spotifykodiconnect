@@ -21,16 +21,8 @@
         <setting id="enable_content_lookup" type="bool" default="false" label="11113" help="11114">
           <control type="toggle"/>
         </setting>
-        <setting id="content_provider" type="string" default="musicbrainz" label="11117" help="11118" visible="eq(-1,true)">
-          <constraints>
-            <options>
-              <option label="11120">lastfm</option>
-              <option label="11121">musicbrainz</option>
-            </options>
-          </constraints>
-          <control type="spinner" format="string"/>
-        </setting>
-        <setting id="lastfm_api_key" type="text" default="" label="11115" help="11116" visible="eq(-2,true)+eq(-1,lastfm)"/>
+        <setting id="content_provider" type="enum" default="1" label="11117" help="11118" lvalues="11120|11121"/>
+        <setting id="lastfm_api_key" type="text" default="" label="11115" help="11116"/>
         <setting id="appendArtistToTitle" type="bool" default="false" label="11030">
           <control type="toggle"/>
         </setting>

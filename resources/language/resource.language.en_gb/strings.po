@@ -246,7 +246,7 @@ msgstr "PulseAudio RTP (Kodi plays stream) or ALSA (direct)"
 
 msgctxt "#11091"
 msgid "Device name"
-msgstr "Name shown in Spotify app (e.g. Spotify Kodi Connect@hostname)"
+msgstr "Name shown in Spotify app (e.g. SpotifyKodiConnect@hostname)"
 
 msgctxt "#11092"
 msgid "ALSA device"

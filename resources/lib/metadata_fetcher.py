@@ -119,12 +119,18 @@ def fetch_artist_bio_musicbrainz(artist_name: str) -> str:
 
 
 def fetch_artist_bio_lastfm(artist_name: str, api_key: str) -> str:
+    """Fetch artist biography from Last.fm artist.getInfo. Returns empty on failure."""
+    bio, _ = fetch_artist_info_lastfm(artist_name, api_key)
+    return bio
+
+
+def fetch_artist_info_lastfm(artist_name: str, api_key: str) -> tuple:
     """
-    Fetch artist biography from Last.fm artist.getInfo.
-    Returns empty string on failure or if no bio.
+    Fetch artist biography and image URL from Last.fm artist.getInfo (one request).
+    Returns (bio_str, image_url_str). Either may be empty.
     """
     if not artist_name or not api_key or not requests:
-        return ""
+        return ("", "")
     try:
         r = requests.get(
             LASTFM_API_BASE,
@@ -141,17 +147,24 @@ def fetch_artist_bio_lastfm(artist_name: str, api_key: str) -> str:
         r.raise_for_status()
         data = r.json()
         artist = (data or {}).get("artist") or {}
-        bio = artist.get("bio") or {}
-        content = (bio.get("content") or "").strip()
-        if content:
-            # Last.fm often appends "Read more on Last.fm" - optionally trim
+        bio = (artist.get("bio") or {}).get("content") or ""
+        bio = bio.strip()
+        if bio:
             read_more = "Read more on Last.fm"
-            if content.endswith(read_more):
-                content = content[: -len(read_more)].strip()
-            return content
+            if bio.endswith(read_more):
+                bio = bio[: -len(read_more)].strip()
+        image_url = ""
+        for img in (artist.get("image") or []):
+            if isinstance(img, dict) and img.get("size") in ("extralarge", "large", "medium"):
+                url = (img.get("#text") or "").strip()
+                if url:
+                    image_url = url
+                    if img.get("size") == "extralarge":
+                        break
+        return (bio, image_url)
     except Exception:
         pass
-    return ""
+    return ("", "")
 
 
 def fetch_album_description(artist_name: str, album_name: str, api_key: str) -> str:

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Next Track overlay: built-in "next track" overlay for Spotify Kodi Connect.
+Next Track overlay: built-in "next track" overlay for SpotifyKodiConnect.
 Runs when enabled in settings; uses music-appropriate defaults (e.g. always
 continue playback when user does nothing). Does not depend on service.nexttrack.
 

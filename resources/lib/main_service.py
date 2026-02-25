@@ -1,6 +1,6 @@
 """
     plugin.audio.spotifykodiconnect
-    Spotify Kodi Connect - service: spotty + playlist sync to Kodi (real playlists).
+    SpotifyKodiConnect - service: spotty + playlist sync to Kodi (real playlists).
 """
 
 import threading

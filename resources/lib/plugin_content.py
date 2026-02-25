@@ -25,7 +25,7 @@ from utils import ADDON_ID, LOGINFO, PROXY_PORT, log_exception, log_msg, get_chu
 
 try:
     from metadata_fetcher import (
-        fetch_artist_bio_lastfm,
+        fetch_artist_info_lastfm,
         fetch_artist_bio_musicbrainz,
         fetch_album_description,
         PROVIDER_OFF,
@@ -33,7 +33,7 @@ try:
         PROVIDER_MUSICBRAINZ,
     )
 except ImportError:
-    fetch_artist_bio_lastfm = None
+    fetch_artist_info_lastfm = None
     fetch_artist_bio_musicbrainz = None
     fetch_album_description = None
     PROVIDER_OFF = "0"
@@ -45,6 +45,7 @@ _HOME_WINDOW_ID = 10000
 _PROP_ENRICHED_ALBUMS = "Spotify.EnrichedAlbums"
 _PROP_ENRICHED_ARTISTS = "Spotify.EnrichedArtists"
 _PROP_ENRICHED_ARTIST_BIOS = "Spotify.EnrichedArtistBios"
+_PROP_ENRICHED_ARTIST_IMAGES = "Spotify.EnrichedArtistImages"
 _PROP_ENRICHED_ALBUM_DESCRIPTIONS = "Spotify.EnrichedAlbumDescriptions"
 _PROP_PENDING_ALBUMS = "Spotify.PendingEnrichmentAlbums"
 _PROP_PENDING_ARTISTS = "Spotify.PendingEnrichmentArtists"
@@ -406,13 +407,15 @@ class PluginContent:
             win = xbmcgui.Window(_HOME_WINDOW_ID)
             alb_json = win.getProperty(_PROP_ENRICHED_ALBUMS)
             art_json = win.getProperty(_PROP_ENRICHED_ARTISTS)
-            artist_bios_json = win.getProperty(_PROP_ENRICHED_ARTIST_BIOS)
+                artist_bios_json = win.getProperty(_PROP_ENRICHED_ARTIST_BIOS)
+            artist_images_json = win.getProperty(_PROP_ENRICHED_ARTIST_IMAGES)
             album_descs_json = win.getProperty(_PROP_ENRICHED_ALBUM_DESCRIPTIONS)
-            if not alb_json and not art_json and not artist_bios_json and not album_descs_json:
+            if not alb_json and not art_json and not artist_bios_json and not artist_images_json and not album_descs_json:
                 return
             album_data = json.loads(alb_json) if alb_json else {}
             artist_data = json.loads(art_json) if art_json else {}
             artist_bios = json.loads(artist_bios_json) if artist_bios_json else {}
+            artist_images = json.loads(artist_images_json) if artist_images_json else {}
             album_descriptions = json.loads(album_descs_json) if album_descs_json else {}
             for t in tracks:
                 aid = (t.get("album") or {}).get("id")
@@ -435,9 +438,12 @@ class PluginContent:
                     )
                 if artist_id and artist_id in artist_bios:
                     t["artist_bio"] = artist_bios[artist_id]
+                if artist_id and artist_id in artist_images:
+                    t["artist_fanart_url"] = artist_images[artist_id]
             win.clearProperty(_PROP_ENRICHED_ALBUMS)
             win.clearProperty(_PROP_ENRICHED_ARTISTS)
             win.clearProperty(_PROP_ENRICHED_ARTIST_BIOS)
+            win.clearProperty(_PROP_ENRICHED_ARTIST_IMAGES)
             win.clearProperty(_PROP_ENRICHED_ALBUM_DESCRIPTIONS)
         except (TypeError, ValueError, RuntimeError):
             pass
@@ -500,11 +506,18 @@ class PluginContent:
                 artist_bios = {}
                 album_descriptions = {}
                 enable_lookup = self.__addon.getSetting("enable_content_lookup").lower() == "true"
-                provider = (self.__addon.getSetting("content_provider") or "").strip().lower()
+                raw_provider = (self.__addon.getSetting("content_provider") or "").strip()
+                # Settings enum: 0 = Last.fm, 1 = MusicBrainz (legacy: "lastfm"/"musicbrainz")
+                if raw_provider == "0":
+                    provider = PROVIDER_LASTFM
+                elif raw_provider == "1":
+                    provider = PROVIDER_MUSICBRAINZ
+                else:
+                    provider = raw_provider.lower()
                 if enable_lookup and provider:
                     if provider == PROVIDER_LASTFM:
                         api_key = self.__addon.getSetting("lastfm_api_key") or ""
-                        if api_key and fetch_artist_bio_lastfm and fetch_album_description:
+                        if api_key and fetch_artist_info_lastfm and fetch_album_description:
                             for aid in album_ids:
                                 alb = album_data.get(aid)
                                 if alb:
@@ -515,14 +528,17 @@ class PluginContent:
                                         if desc:
                                             album_descriptions[aid] = desc
                                         xbmc.sleep(250)
+                            artist_images = {}
                             for art_id in artist_ids:
                                 art = artist_data.get(art_id)
                                 if art:
                                     aname = art.get("name") or ""
                                     if aname:
-                                        bio = fetch_artist_bio_lastfm(aname, api_key)
+                                        bio, image_url = fetch_artist_info_lastfm(aname, api_key)
                                         if bio:
                                             artist_bios[art_id] = bio
+                                        if image_url:
+                                            artist_images[art_id] = image_url
                                         xbmc.sleep(250)
                     elif provider == PROVIDER_MUSICBRAINZ and fetch_artist_bio_musicbrainz:
                         for art_id in artist_ids:
@@ -540,6 +556,8 @@ class PluginContent:
                     w.setProperty(_PROP_ENRICHED_ARTISTS, json.dumps(artist_data))
                     if artist_bios:
                         w.setProperty(_PROP_ENRICHED_ARTIST_BIOS, json.dumps(artist_bios))
+                    if artist_images:
+                        w.setProperty(_PROP_ENRICHED_ARTIST_IMAGES, json.dumps(artist_images))
                     if album_descriptions:
                         w.setProperty(_PROP_ENRICHED_ALBUM_DESCRIPTIONS, json.dumps(album_descriptions))
                     xbmc.executebuiltin("Container.Refresh")
@@ -589,7 +607,11 @@ class PluginContent:
             li.setProperty("Album_Description", album_desc)
         if artist_desc:
             li.setProperty("Artist_Description", artist_desc)
-        li.setArt(_art_for_item(track.get("thumb") or "", "DefaultMusicSongs.png"))
+        art = _art_for_item(track.get("thumb") or "", "DefaultMusicSongs.png")
+        artist_fanart = track.get("artist_fanart_url")
+        if artist_fanart:
+            art["artist.fanart"] = artist_fanart
+        li.setArt(art)
         li.setProperty("spotifytrackid", track["id"])
         li.setContentLookup(False)
         li.addContextMenuItems(track.get("contextitems") or [], True)

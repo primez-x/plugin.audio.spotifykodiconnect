@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<addon id="plugin.audio.spotifykodiconnect" version="1.0.0" name="Spotify Kodi Connect" provider-name="Spotify Kodi Connect">
+<addon id="plugin.audio.spotifykodiconnect" version="1.0.0" name="SpotifyKodiConnect" provider-name="SpotifyKodiConnect">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
         <import addon="xbmc.addon" version="18.9.701" />

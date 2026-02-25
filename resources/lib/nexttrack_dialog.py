@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Next Track widget for Spotify Kodi Connect.
+Next Track widget for SpotifyKodiConnect.
 Sets Home window (10000) properties that the skin reads to render a
 non-blocking "Next Track" overlay. No modal dialog is opened.
 """

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Next-track helpers for Spotify Kodi Connect.
+Next-track helpers for SpotifyKodiConnect.
 
 This module intentionally contains **no** integration with the external
 `service.nexttrack` addon (no JSONRPC.NotifyAll, no nexttrack_data signals).
