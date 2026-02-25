@@ -340,6 +340,10 @@ msgctxt "#11121"
 msgid "MusicBrainz (Wikipedia)"
 msgstr "MusicBrainz (Wikipedia)"
 
+msgctxt "#11122"
+msgid "Welcome"
+msgstr ""
+
 msgctxt "#11117"
 msgid "Content provider"
 msgstr "Content provider"

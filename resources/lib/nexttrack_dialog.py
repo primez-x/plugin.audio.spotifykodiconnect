@@ -1,112 +1,87 @@
 # -*- coding: utf-8 -*-
 """
-Next Track dialog for Spotify Kodi Connect.
-Shows a non-blocking "Next track" overlay with music-specific layout (title,
-artist, art). The overlay is informational only: there are no on-screen
-Play/Close buttons; users can dismiss it via back/close, and playback always
-continues normally.
+Next Track widget for Spotify Kodi Connect.
+Sets Home window (10000) properties that the skin reads to render a
+non-blocking "Next Track" overlay. No modal dialog is opened.
 """
 from __future__ import absolute_import, unicode_literals
 
 from datetime import datetime, timedelta
 
-import xbmc
-import xbmcaddon
-import xbmcvfs
-from xbmcgui import WindowXMLDialog
+import xbmcgui
 
-from utils import ADDON_ID
-
-ACTION_NAV_BACK = 92
+PROP_PREFIX = "NextTrack."
+_HOME = xbmcgui.Window(10000)
 
 
-def addon_path():
-    """Return the addon root path (for WindowXMLDialog)."""
-    raw = xbmcaddon.Addon(id=ADDON_ID).getAddonInfo("path")
-    path = xbmcvfs.translatePath(raw)
-    if isinstance(path, bytes):
-        path = path.decode("utf-8")
-    return path
+def _set_prop(key, value):
+    _HOME.setProperty(key, str(value) if value is not None else "")
 
 
-def _localize(string_id):
-    return xbmcaddon.Addon(id=ADDON_ID).getLocalizedString(string_id)
+def _clear_prop(key):
+    _HOME.clearProperty(key)
 
 
-class NextTrackDialog(WindowXMLDialog):
-    """Dialog showing next track (title, artist, art) as a non-blocking overlay."""
+class NextTrackDialog:
+    """Property-based next-track widget (non-blocking, no dialog window)."""
 
-    def __init__(self, xml_filename, path, skin="default", res="1080i"):
+    def __init__(self, *_args, **_kwargs):
         self._item = None
         self._dismissed = False
         self._progress_step_size = 0
         self._current_progress_percent = 100
-        self._progress_control = None
         self._initial_remaining_sec = None
-        self.action_exitkeys_id = [10, 13]
-        WindowXMLDialog.__init__(self, xml_filename, path, skin, res)
 
     def set_item(self, item):
-        """Set the next track item (dict with title, artist, art.thumb, etc.)."""
         self._item = item or {}
 
     def set_progress_step_size(self, step):
         self._progress_step_size = step
 
     def set_initial_remaining(self, remaining_sec):
-        """Set countdown seconds so label and bar show correctly when dialog opens."""
         self._initial_remaining_sec = max(0, int(remaining_sec))
 
-    def onInit(self):
+    def show(self):
         self._set_info()
-        self._prepare_progress_control()
+        _set_prop(PROP_PREFIX + "progress", "100")
+        _set_prop("service.nexttrack.dialog", "true")
+
+    def close(self):
+        _clear_prop("service.nexttrack.dialog")
+        for key in ("title", "artist", "album", "thumb", "fanart", "landscape",
+                     "clearart", "clearlogo", "poster", "year", "rating",
+                     "playcount", "runtime", "remaining", "endtime", "progress"):
+            _clear_prop(PROP_PREFIX + key)
 
     def _set_info(self):
         item = self._item or {}
         art = item.get("art") or {}
-        self.setProperty("thumb", art.get("thumb", ""))
-        self.setProperty("landscape", art.get("landscape", "") or art.get("thumb", ""))
-        self.setProperty("fanart", art.get("fanart", ""))
-        self.setProperty("title", item.get("title", ""))
-        self.setProperty("artist", item.get("artist", ""))
-        self.setProperty("runtime", str(item.get("runtime", 0)))
+        _set_prop(PROP_PREFIX + "thumb", art.get("thumb", ""))
+        _set_prop(PROP_PREFIX + "landscape", art.get("landscape", "") or art.get("thumb", ""))
+        _set_prop(PROP_PREFIX + "fanart", art.get("fanart", ""))
+        _set_prop(PROP_PREFIX + "title", item.get("title", ""))
+        artist = item.get("artist", "")
+        if isinstance(artist, list):
+            artist = artist[0] if artist else ""
+        _set_prop(PROP_PREFIX + "artist", artist)
+        _set_prop(PROP_PREFIX + "runtime", item.get("runtime", 0))
         if self._initial_remaining_sec is not None:
-            self.setProperty("remaining", "%02d" % self._initial_remaining_sec)
-
-    def _prepare_progress_control(self):
-        try:
-            self._progress_control = self.getControl(3014)
-            self._progress_control.setPercent(self._current_progress_percent)
-        except RuntimeError:
-            self._progress_control = None
+            _set_prop(PROP_PREFIX + "remaining", "%02d" % self._initial_remaining_sec)
 
     def update_progress_control(self, remaining=None, runtime=None):
         self._current_progress_percent = max(
             0,
             self._current_progress_percent - self._progress_step_size,
         )
-        if self._progress_control:
-            try:
-                self._progress_control.setPercent(self._current_progress_percent)
-            except RuntimeError:
-                pass
+        _set_prop(PROP_PREFIX + "progress", str(int(self._current_progress_percent)))
         if remaining is not None:
-            self.setProperty("remaining", "%02d" % remaining)
+            _set_prop(PROP_PREFIX + "remaining", "%02d" % remaining)
         if runtime is not None:
             end_time = datetime.now() + timedelta(seconds=runtime)
-            self.setProperty("endtime", end_time.strftime("%H:%M"))
+            _set_prop(PROP_PREFIX + "endtime", end_time.strftime("%H:%M"))
 
     def is_cancel(self):
         return self._dismissed
 
     def is_play_next(self):
         return False
-
-    def onClick(self, controlId):
-        self._dismissed = True
-        self.close()
-
-    def onAction(self, action):
-        if action == ACTION_NAV_BACK:
-            self._dismissed = True
-            self.close()

@@ -19,7 +19,7 @@ from prebuffer import PrebufferManager, _clamp_prebuffer_seconds
 from save_recently_played import SaveRecentlyPlayed
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
-from string_ids import HTTP_VIDEO_RULE_ADDED_STR_ID
+from string_ids import HTTP_VIDEO_RULE_ADDED_STR_ID, WELCOME_AUTHENTICATED_STR_ID
 from playlist_next import get_next_playlist_item, parse_track_url
 from nexttrack_broadcast import broadcast_to_nexttrack
 from utils import ADDON_ID, PROXY_PORT, log_msg, log_exception
@@ -53,6 +53,7 @@ class MainService:
 
         self.__spotty_auth: SpottyAuth = SpottyAuth(self.__spotty)
         self.__auth_token_expires_at = ""
+        self.__welcome_msg = True
 
         # Workaround to make Kodi use it's VideoPlayer to play http audio streams.
         # If we don't do this, then Kodi uses PAPlayer which does not stream.
@@ -211,6 +212,21 @@ class MainService:
         try:
             self.__spotty_auth.renew_token()
             self.__auth_token_expires_at = utils.get_cached_auth_token_expires_at()
+            if self.__welcome_msg:
+                self.__welcome_msg = False
+                self.__show_welcome_notification()
         except Exception as exc:
             log_exception(exc, "Could not renew Spotify auth token")
             self.__auth_token_expires_at = ""
+
+    def __show_welcome_notification(self) -> None:
+        try:
+            addon = xbmcaddon.Addon(id=ADDON_ID)
+            addon_name = addon.getAddonInfo("name")
+            username = utils.get_username()
+            welcome = addon.getLocalizedString(WELCOME_AUTHENTICATED_STR_ID)
+            msg = f"{welcome} {username}" if username else welcome
+            icon = addon.getAddonInfo("icon")
+            xbmcgui.Dialog().notification(addon_name, msg, icon=icon, time=2000, sound=False)
+        except Exception as exc:
+            log_exception(exc, "Could not show welcome notification")

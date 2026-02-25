@@ -2,7 +2,9 @@
 """
 Next Track overlay: built-in "next track" overlay for Spotify Kodi Connect.
 Runs when enabled in settings; uses music-appropriate defaults (e.g. always
-continue playback when user does nothing). Does not depend on service.upnext.
+continue playback when user does nothing). Does not depend on service.nexttrack.
+
+Sets Home window properties that the skin renders as a non-blocking widget.
 """
 from __future__ import absolute_import, unicode_literals
 
@@ -16,7 +18,7 @@ import xbmcaddon
 from utils import ADDON_ID, log_msg
 from xbmc import LOGDEBUG
 
-from nexttrack_dialog import NextTrackDialog, addon_path
+from nexttrack_dialog import NextTrackDialog
 
 ADDON = xbmcaddon.Addon(id=ADDON_ID)
 
@@ -127,7 +129,7 @@ def get_notification_seconds():
 
 
 def cancel_notification():
-    """Cancel any pending Next Track wait/dialog."""
+    """Cancel any pending Next Track wait/widget."""
     global _cancel_event, _notification_thread
     if _cancel_event:
         _cancel_event.set()
@@ -135,13 +137,13 @@ def cancel_notification():
         _notification_thread.join(timeout=2)
 
 
-def _wait_and_show_dialog(
+def _wait_and_show_widget(
     duration_sec,
     notification_seconds,
     next_item_info,
     cancel_event,
 ):
-    """Run in thread: wait until (duration - time) <= notification_seconds, then show dialog."""
+    """Run in thread: wait until (duration - time) <= notification_seconds, then show widget."""
     time_sec = total_sec = None
     while not cancel_event.is_set():
         time.sleep(1)
@@ -155,57 +157,42 @@ def _wait_and_show_dialog(
             break
     if cancel_event.is_set():
         return
-    path = addon_path()
-    dialog = NextTrackDialog(
-        "script-nexttrack-nexttrack.xml", path, "default", "1080i"
-    )
-    dialog.set_item(next_item_info)
+
+    widget = NextTrackDialog()
+    widget.set_item(next_item_info)
     remaining = max(0, (total_sec or duration_sec) - (time_sec or 0))
     if remaining <= 0:
         remaining = notification_seconds
     step = _calculate_progress_steps(remaining)
-    dialog.set_progress_step_size(step)
-    dialog.set_initial_remaining(remaining)
+    widget.set_progress_step_size(step)
+    widget.set_initial_remaining(remaining)
+    widget.show()
 
-    def _update_while_visible():
-        player = xbmc.Player()
-        while not cancel_event.is_set():
-            if not player.isPlaying():
-                try:
-                    dialog.close()
-                except Exception:
-                    pass
-                return
-            try:
-                t = player.getTime()
-                total = player.getTotalTime()
-            except RuntimeError:
-                return
-            if total - t <= 1:
-                try:
-                    dialog.close()
-                except Exception:
-                    pass
-                return
-            if dialog.is_cancel() or dialog.is_play_next():
-                return
-            remaining_sec = int(total - t)
-            dialog.update_progress_control(remaining=remaining_sec, runtime=remaining_sec)
-            time.sleep(0.1)
+    player = xbmc.Player()
+    while not cancel_event.is_set():
+        if not player.isPlaying():
+            widget.close()
+            return
+        try:
+            t = player.getTime()
+            total = player.getTotalTime()
+        except RuntimeError:
+            widget.close()
+            return
+        if total - t <= 1:
+            widget.close()
+            return
+        remaining_sec = int(total - t)
+        widget.update_progress_control(remaining=remaining_sec, runtime=remaining_sec)
+        time.sleep(0.1)
 
-    updater = threading.Thread(target=_update_while_visible, daemon=True)
-    updater.start()
-    dialog.show()
-    try:
-        dialog.close()
-    except Exception:
-        pass
+    widget.close()
 
 
 def start_notification_thread(duration_sec, next_item, next_duration_sec):
     """
     Cancel any previous notification thread and start a new one that will
-    show the Next Track dialog notification_seconds before track end.
+    show the Next Track widget notification_seconds before track end.
     """
     global _cancel_event, _notification_thread
     if _cancel_event:
@@ -216,7 +203,7 @@ def start_notification_thread(duration_sec, next_item, next_duration_sec):
     next_item_info = _next_item_info_for_dialog(next_item, next_duration_sec)
     notification_seconds = get_notification_seconds()
     _notification_thread = threading.Thread(
-        target=_wait_and_show_dialog,
+        target=_wait_and_show_widget,
         args=(
             duration_sec,
             notification_seconds,
