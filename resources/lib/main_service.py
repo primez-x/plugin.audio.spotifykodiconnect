@@ -21,7 +21,7 @@ from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import HTTP_VIDEO_RULE_ADDED_STR_ID
 from playlist_next import get_next_playlist_item, parse_track_url
-from upnext_broadcast import broadcast_to_service_upnextmusic
+from nexttrack_broadcast import broadcast_to_nexttrack
 from utils import ADDON_ID, PROXY_PORT, log_msg, log_exception
 
 SAVE_TO_RECENTLY_PLAYED_FILE = True
@@ -87,7 +87,7 @@ class MainService:
         bottle_manager.route_all(self.__http_spotty_streamer)
 
     def __on_track_started(self, track_id: str, duration_sec: float) -> None:
-        """Pre-buffer the next track if available; broadcast to service.upnextmusic."""
+        """Pre-buffer the next track if available; broadcast to service.nexttrack."""
         try:
             current_item, next_item = get_next_playlist_item()
             if not next_item:
@@ -103,11 +103,8 @@ class MainService:
             if prebuffer_enabled:
                 self.__prebuffer_manager.start_prebuffer(next_track_id, next_duration)
 
-            # Broadcast to Up Next - Music service so it can show next-track overlay.
-            # Delay briefly so Kodi playlist position has advanced; then service.reset_queue()
-            # removes the correct (previous) item.
             broadcast_enabled = (
-                SPOTIFY_ADDON.getSetting("broadcast_to_service_upnextmusic").lower()
+                SPOTIFY_ADDON.getSetting("broadcast_to_service_nexttrack").lower()
                 != "false"
             )
             if broadcast_enabled:
@@ -123,7 +120,7 @@ class MainService:
                             notification_sec = max(5, min(60, int(v)))
                         except (TypeError, ValueError):
                             pass
-                        broadcast_to_service_upnextmusic(
+                        broadcast_to_nexttrack(
                             current_item,
                             next_item,
                             int(duration_sec),

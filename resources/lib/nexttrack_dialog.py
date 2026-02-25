@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Up Next Music dialog for Spotify Kodi Connect.
+Next Track dialog for Spotify Kodi Connect.
 Shows a non-blocking "Next track" overlay with music-specific layout (title,
 artist, art). The overlay is informational only: there are no on-screen
 Play/Close buttons; users can dismiss it via back/close, and playback always
@@ -33,7 +33,7 @@ def _localize(string_id):
     return xbmcaddon.Addon(id=ADDON_ID).getLocalizedString(string_id)
 
 
-class UpNextMusicDialog(WindowXMLDialog):
+class NextTrackDialog(WindowXMLDialog):
     """Dialog showing next track (title, artist, art) as a non-blocking overlay."""
 
     def __init__(self, xml_filename, path, skin="default", res="1080i"):
@@ -65,8 +65,8 @@ class UpNextMusicDialog(WindowXMLDialog):
         item = self._item or {}
         art = item.get("art") or {}
         self.setProperty("thumb", art.get("thumb", ""))
-        self.setProperty("landscape", art.get("tvshow.landscape", "") or art.get("thumb", ""))
-        self.setProperty("fanart", art.get("tvshow.fanart", "") or art.get("fanart", ""))
+        self.setProperty("landscape", art.get("landscape", "") or art.get("thumb", ""))
+        self.setProperty("fanart", art.get("fanart", ""))
         self.setProperty("title", item.get("title", ""))
         self.setProperty("artist", item.get("artist", ""))
         self.setProperty("runtime", str(item.get("runtime", 0)))
@@ -81,8 +81,6 @@ class UpNextMusicDialog(WindowXMLDialog):
             self._progress_control = None
 
     def update_progress_control(self, remaining=None, runtime=None):
-        # Drive bar by remaining time: percent = (remaining / total) * 100 would need total;
-        # we use step-based countdown so bar empties over remaining seconds.
         self._current_progress_percent = max(
             0,
             self._current_progress_percent - self._progress_step_size,
@@ -102,11 +100,9 @@ class UpNextMusicDialog(WindowXMLDialog):
         return self._dismissed
 
     def is_play_next(self):
-        # Overlay is informational only; never drives playback decisions.
         return False
 
     def onClick(self, controlId):
-        # No clickable controls are defined in the skin; keep for safety.
         self._dismissed = True
         self.close()
 

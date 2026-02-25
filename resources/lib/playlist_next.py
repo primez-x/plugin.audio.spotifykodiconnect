@@ -3,7 +3,7 @@
 Next-track helpers for Spotify Kodi Connect.
 
 This module intentionally contains **no** integration with the external
-`service.upnext` addon (no JSONRPC.NotifyAll, no upnext_data signals).
+`service.nexttrack` addon (no JSONRPC.NotifyAll, no nexttrack_data signals).
 It only provides utilities to inspect Kodi's music playlist to determine
 the current and next queued track and to parse our stream URLs.
 """

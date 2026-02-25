@@ -9,7 +9,7 @@
           <control type="toggle"/>
         </setting>
         <setting id="spotify_stream_volume" type="slider" default="35" label="11095" help="11096" range="1,1,100" option="int"/>
-        <setting id="broadcast_to_service_upnextmusic" type="bool" default="true" label="11111" help="11112">
+        <setting id="broadcast_to_service_nexttrack" type="bool" default="true" label="11111" help="11112">
           <control type="toggle"/>
         </setting>
     </category>
@@ -18,11 +18,21 @@
         <setting id="fetch_extra_song_info" type="bool" default="true" label="11109" help="11110">
           <control type="toggle"/>
         </setting>
-        <setting id="categoryDefaultView" type="text" default="" label="11020"/>
-        <setting id="playlistDefaultView" type="text" default="" label="11031"/>
-        <setting id="artistDefaultView" type="text" default="" label="11032"/>
-        <setting id="albumDefaultView" type="text" default="" label="11033"/>
-        <setting id="songDefaultView" type="text" default="" label="11034"/>
-        <setting id="appendArtistToTitle" type="bool" default="false" label="11030"/>
+        <setting id="enable_content_lookup" type="bool" default="false" label="11113" help="11114">
+          <control type="toggle"/>
+        </setting>
+        <setting id="content_provider" type="string" default="musicbrainz" label="11117" help="11118" visible="eq(-1,true)">
+          <constraints>
+            <options>
+              <option label="11120">lastfm</option>
+              <option label="11121">musicbrainz</option>
+            </options>
+          </constraints>
+          <control type="spinner" format="string"/>
+        </setting>
+        <setting id="lastfm_api_key" type="text" default="" label="11115" help="11116" visible="eq(-2,true)+eq(-1,lastfm)"/>
+        <setting id="appendArtistToTitle" type="bool" default="false" label="11030">
+          <control type="toggle"/>
+        </setting>
     </category>
 </settings>

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Up Next Music: built-in "next track" overlay for Spotify Kodi Connect.
+Next Track overlay: built-in "next track" overlay for Spotify Kodi Connect.
 Runs when enabled in settings; uses music-appropriate defaults (e.g. always
 continue playback when user does nothing). Does not depend on service.upnext.
 """
@@ -16,11 +16,10 @@ import xbmcaddon
 from utils import ADDON_ID, log_msg
 from xbmc import LOGDEBUG
 
-from upnext_music_dialog import UpNextMusicDialog, addon_path
+from nexttrack_dialog import NextTrackDialog, addon_path
 
 ADDON = xbmcaddon.Addon(id=ADDON_ID)
 
-# Notification thread and cancel event; new track start cancels previous wait
 _cancel_event = None
 _notification_thread = None
 
@@ -81,7 +80,7 @@ def _unwrap_playlist_item(item):
 
 
 def _next_item_info_for_dialog(next_item, next_duration_sec):
-    """Build dict for UpNextMusicDialog from playlist next_item."""
+    """Build dict for NextTrackDialog from playlist next_item."""
     if not next_item:
         return {"title": "", "artist": "", "art": {}, "runtime": 0}
     next_item = _unwrap_playlist_item(next_item)
@@ -93,7 +92,6 @@ def _next_item_info_for_dialog(next_item, next_duration_sec):
         artist = ""
     else:
         artist = str(artist)
-    # Support Kodi art keys: thumb, album.thumb, etc.
     thumb = art.get("thumb") or art.get("album") or ""
     fanart_val = art.get("fanart", "")
     return {
@@ -101,8 +99,7 @@ def _next_item_info_for_dialog(next_item, next_duration_sec):
         "artist": artist,
         "art": {
             "thumb": thumb,
-            "tvshow.landscape": thumb,
-            "tvshow.fanart": fanart_val,
+            "landscape": thumb,
             "fanart": fanart_val,
         },
         "runtime": next_duration_sec or 0,
@@ -130,7 +127,7 @@ def get_notification_seconds():
 
 
 def cancel_notification():
-    """Cancel any pending Up Next Music wait/dialog (e.g. when feature is disabled)."""
+    """Cancel any pending Next Track wait/dialog."""
     global _cancel_event, _notification_thread
     if _cancel_event:
         _cancel_event.set()
@@ -158,10 +155,9 @@ def _wait_and_show_dialog(
             break
     if cancel_event.is_set():
         return
-    # Show dialog (music default = continue; we don't stop playback)
     path = addon_path()
-    dialog = UpNextMusicDialog(
-        "script-upnextmusic-upnext.xml", path, "default", "1080i"
+    dialog = NextTrackDialog(
+        "script-nexttrack-nexttrack.xml", path, "default", "1080i"
     )
     dialog.set_item(next_item_info)
     remaining = max(0, (total_sec or duration_sec) - (time_sec or 0))
@@ -209,7 +205,7 @@ def _wait_and_show_dialog(
 def start_notification_thread(duration_sec, next_item, next_duration_sec):
     """
     Cancel any previous notification thread and start a new one that will
-    show the Up Next Music dialog notification_seconds before track end.
+    show the Next Track dialog notification_seconds before track end.
     """
     global _cancel_event, _notification_thread
     if _cancel_event:
@@ -231,6 +227,6 @@ def start_notification_thread(duration_sec, next_item, next_duration_sec):
     )
     _notification_thread.start()
     log_msg(
-        "Up Next Music thread started (show in %s s)" % notification_seconds,
+        "Next Track thread started (show in %s s)" % notification_seconds,
         LOGDEBUG,
     )

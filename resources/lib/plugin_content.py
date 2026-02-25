@@ -23,10 +23,29 @@ from spotty_helper import SpottyHelper
 from string_ids import *
 from utils import ADDON_ID, LOGINFO, PROXY_PORT, log_exception, log_msg, get_chunks
 
+try:
+    from metadata_fetcher import (
+        fetch_artist_bio_lastfm,
+        fetch_artist_bio_musicbrainz,
+        fetch_album_description,
+        PROVIDER_OFF,
+        PROVIDER_LASTFM,
+        PROVIDER_MUSICBRAINZ,
+    )
+except ImportError:
+    fetch_artist_bio_lastfm = None
+    fetch_artist_bio_musicbrainz = None
+    fetch_album_description = None
+    PROVIDER_OFF = "0"
+    PROVIDER_LASTFM = "lastfm"
+    PROVIDER_MUSICBRAINZ = "musicbrainz"
+
 # Window property keys for streaming enrichment (show list fast, then enrich in background)
 _HOME_WINDOW_ID = 10000
 _PROP_ENRICHED_ALBUMS = "Spotify.EnrichedAlbums"
 _PROP_ENRICHED_ARTISTS = "Spotify.EnrichedArtists"
+_PROP_ENRICHED_ARTIST_BIOS = "Spotify.EnrichedArtistBios"
+_PROP_ENRICHED_ALBUM_DESCRIPTIONS = "Spotify.EnrichedAlbumDescriptions"
 _PROP_PENDING_ALBUMS = "Spotify.PendingEnrichmentAlbums"
 _PROP_PENDING_ARTISTS = "Spotify.PendingEnrichmentArtists"
 
@@ -109,11 +128,6 @@ class PluginContent:
             self.append_artist_to_title: bool = (
                 self.__addon.getSetting("appendArtistToTitle") == "true"
             )
-            self.default_view_songs: str = self.__addon.getSetting("songDefaultView")
-            self.default_view_artists: str = self.__addon.getSetting("artistDefaultView")
-            self.default_view_playlists: str = self.__addon.getSetting("playlistDefaultView")
-            self.default_view_albums: str = self.__addon.getSetting("albumDefaultView")
-            self.default_view_category: str = self.__addon.getSetting("categoryDefaultView")
 
             self.__spotty: spotty.Spotty = spotty.get_spotty(SpottyHelper())
 
@@ -392,10 +406,14 @@ class PluginContent:
             win = xbmcgui.Window(_HOME_WINDOW_ID)
             alb_json = win.getProperty(_PROP_ENRICHED_ALBUMS)
             art_json = win.getProperty(_PROP_ENRICHED_ARTISTS)
-            if not alb_json and not art_json:
+            artist_bios_json = win.getProperty(_PROP_ENRICHED_ARTIST_BIOS)
+            album_descs_json = win.getProperty(_PROP_ENRICHED_ALBUM_DESCRIPTIONS)
+            if not alb_json and not art_json and not artist_bios_json and not album_descs_json:
                 return
             album_data = json.loads(alb_json) if alb_json else {}
             artist_data = json.loads(art_json) if art_json else {}
+            artist_bios = json.loads(artist_bios_json) if artist_bios_json else {}
+            album_descriptions = json.loads(album_descs_json) if album_descs_json else {}
             for t in tracks:
                 aid = (t.get("album") or {}).get("id")
                 if aid and aid in album_data:
@@ -404,6 +422,8 @@ class PluginContent:
                         t["album"] = {}
                     t["album"]["label"] = alb.get("label") or ""
                     t["album"]["copyrights"] = alb.get("copyrights") or []
+                if aid and aid in album_descriptions:
+                    t["album_description"] = album_descriptions[aid]
                 artist_id = t.get("artistid")
                 if artist_id and artist_id in artist_data:
                     art = artist_data[artist_id]
@@ -413,8 +433,12 @@ class PluginContent:
                     t["artist_followers"] = (
                         followers.get("total", -1) if followers else -1
                     )
+                if artist_id and artist_id in artist_bios:
+                    t["artist_bio"] = artist_bios[artist_id]
             win.clearProperty(_PROP_ENRICHED_ALBUMS)
             win.clearProperty(_PROP_ENRICHED_ARTISTS)
+            win.clearProperty(_PROP_ENRICHED_ARTIST_BIOS)
+            win.clearProperty(_PROP_ENRICHED_ALBUM_DESCRIPTIONS)
         except (TypeError, ValueError, RuntimeError):
             pass
 
@@ -447,6 +471,8 @@ class PluginContent:
                                     album_data[alb["id"]] = {
                                         "label": alb.get("label") or "",
                                         "copyrights": alb.get("copyrights") or [],
+                                        "name": alb.get("name") or "",
+                                        "artists": alb.get("artists") or [],
                                     }
                         except Exception:
                             pass
@@ -459,6 +485,7 @@ class PluginContent:
                                     artist_data[art["id"]] = {
                                         "followers": art.get("followers"),
                                         "genres": art.get("genres") or [],
+                                        "name": art.get("name") or "",
                                     }
                         except Exception:
                             pass
@@ -469,10 +496,52 @@ class PluginContent:
                 t_art.start()
                 t_alb.join()
                 t_art.join()
+                # Optional: fetch biography/album description from chosen provider
+                artist_bios = {}
+                album_descriptions = {}
+                enable_lookup = self.__addon.getSetting("enable_content_lookup").lower() == "true"
+                provider = (self.__addon.getSetting("content_provider") or "").strip().lower()
+                if enable_lookup and provider:
+                    if provider == PROVIDER_LASTFM:
+                        api_key = self.__addon.getSetting("lastfm_api_key") or ""
+                        if api_key and fetch_artist_bio_lastfm and fetch_album_description:
+                            for aid in album_ids:
+                                alb = album_data.get(aid)
+                                if alb:
+                                    aname = (alb.get("artists") or [{}])[0].get("name") or ""
+                                    alname = alb.get("name") or ""
+                                    if aname and alname:
+                                        desc = fetch_album_description(aname, alname, api_key)
+                                        if desc:
+                                            album_descriptions[aid] = desc
+                                        xbmc.sleep(250)
+                            for art_id in artist_ids:
+                                art = artist_data.get(art_id)
+                                if art:
+                                    aname = art.get("name") or ""
+                                    if aname:
+                                        bio = fetch_artist_bio_lastfm(aname, api_key)
+                                        if bio:
+                                            artist_bios[art_id] = bio
+                                        xbmc.sleep(250)
+                    elif provider == PROVIDER_MUSICBRAINZ and fetch_artist_bio_musicbrainz:
+                        for art_id in artist_ids:
+                            art = artist_data.get(art_id)
+                            if art:
+                                aname = art.get("name") or ""
+                                if aname:
+                                    bio = fetch_artist_bio_musicbrainz(aname)
+                                    if bio:
+                                        artist_bios[art_id] = bio
+                                    xbmc.sleep(350)
                 try:
                     w = xbmcgui.Window(_HOME_WINDOW_ID)
                     w.setProperty(_PROP_ENRICHED_ALBUMS, json.dumps(album_data))
                     w.setProperty(_PROP_ENRICHED_ARTISTS, json.dumps(artist_data))
+                    if artist_bios:
+                        w.setProperty(_PROP_ENRICHED_ARTIST_BIOS, json.dumps(artist_bios))
+                    if album_descriptions:
+                        w.setProperty(_PROP_ENRICHED_ALBUM_DESCRIPTIONS, json.dumps(album_descriptions))
                     xbmc.executebuiltin("Container.Refresh")
                 except Exception:
                     pass
@@ -513,8 +582,9 @@ class PluginContent:
             info["albumartist"] = ["Various Artists"]
         li.setInfo("music", info)
         # Fill "Additional song info" / context boxes (Album description / Artist biography)
-        album_desc = self._track_album_description(track, album)
-        artist_desc = self._track_artist_description(track)
+        # Prefer external metadata (e.g. Last.fm) when present; else Spotify-only summary
+        album_desc = track.get("album_description") or self._track_album_description(track, album)
+        artist_desc = track.get("artist_bio") or self._track_artist_description(track)
         if album_desc:
             li.setProperty("Album_Description", album_desc)
         if artist_desc:
@@ -671,8 +741,6 @@ class PluginContent:
 
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_artists:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_artists})")
 
     def browse_top_tracks(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "songs")
@@ -699,8 +767,6 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
         self._start_streaming_enrichment_thread()
-        if self.default_view_songs:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
     def __get_explore_categories(self) -> List[Tuple[Any, str, Union[str, Any]]]:
         items = []
@@ -811,8 +877,6 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_ARTIST)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
         self._start_streaming_enrichment_thread()
-        if self.default_view_songs:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
     def artist_top_tracks(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "songs")
@@ -832,8 +896,6 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_SONG_RATING)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
         self._start_streaming_enrichment_thread()
-        if self.default_view_songs:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
     def related_artists(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "artists")
@@ -857,8 +919,6 @@ class PluginContent:
         self.__add_artist_listitems(artists)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_artists:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_artists})")
 
     def __get_playlist_details(self, playlist_id: str) -> Playlist:
         playlist = self.__spotipy.playlist(
@@ -912,8 +972,6 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
         self._start_streaming_enrichment_thread()
-        if self.default_view_songs:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
     def play_playlist(self) -> None:
         """Play entire playlist: start first track immediately, queue rest in background."""
@@ -971,8 +1029,6 @@ class PluginContent:
         xbmcplugin.setProperty(self.__addon_handle, "FolderName", playlists["category"])
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_category:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_category})")
 
     def follow_playlist(self) -> None:
         self.__spotipy.current_user_follow_playlist(self.__playlist_id)
@@ -1130,8 +1186,6 @@ class PluginContent:
         self.__add_playlist_listitems(playlists)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_playlists:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_playlists})")
 
     def __get_new_releases(self):
         albums = self.__spotipy.new_releases(country=self.__user_country, limit=50, offset=0)
@@ -1160,8 +1214,6 @@ class PluginContent:
         self.__add_album_listitems(albums)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_albums:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_albums})")
 
     def __prepare_track_listitems(
         self, track_ids=None, tracks=None, playlist_details=None, album_details=None
@@ -1765,8 +1817,6 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_SONG_RATING)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_albums:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_albums})")
 
     def __get_saved_album_ids(self) -> List[str]:
         albums = self.__spotipy.current_user_saved_albums(limit=1, offset=0)
@@ -1821,8 +1871,6 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
         xbmcplugin.setContent(self.__addon_handle, "albums")
-        if self.default_view_albums:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_albums})")
 
     def __get_saved_track_ids(self) -> List[str]:
         saved_tracks = self.__spotipy.current_user_saved_tracks(
@@ -1883,8 +1931,6 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
         self._start_streaming_enrichment_thread()
-        if self.default_view_songs:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
     def __get_saved_artists(self) -> List[Dict[str, Any]]:
         saved_albums = self.__get_saved_albums()
@@ -1924,8 +1970,6 @@ class PluginContent:
         self.__add_artist_listitems(artists)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_TITLE)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_artists:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_artists})")
 
     def __get_followed_artists(self) -> List[Dict[str, Any]]:
         artists = self.__spotipy.current_user_followed_artists(limit=50)
@@ -1963,8 +2007,6 @@ class PluginContent:
         self.__add_artist_listitems(artists)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_TITLE)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_artists:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_artists})")
 
     def search_artists(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "artists")
@@ -1987,8 +2029,6 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
-        if self.default_view_artists:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_artists})")
 
     def search_tracks(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "songs")
@@ -2013,8 +2053,6 @@ class PluginContent:
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
         self._start_streaming_enrichment_thread()
 
-        if self.default_view_songs:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
     def search_albums(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "albums")
@@ -2040,8 +2078,6 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
-        if self.default_view_albums:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_albums})")
 
     def search_playlists(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "files")
@@ -2062,8 +2098,6 @@ class PluginContent:
         self.__add_next_button(result["playlists"]["total"])
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
-        if self.default_view_playlists:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_playlists})")
 
     def search(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "files")

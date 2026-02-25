@@ -260,10 +260,6 @@ msgctxt "#11094"
 msgid "Extra librespot options"
 msgstr "Optional: e.g. --bitrate 160"
 
-msgctxt "#11109"
-msgid "ALSA output device (e.g. hw:0,0). Run aplay -L on the device to list; hw:0,0 is often HDMI on CoreELEC."
-msgstr ""
-
 msgctxt "#11099"
 msgid "Enable Up Next"
 msgstr "Enable Up Next"
@@ -313,9 +309,41 @@ msgid "When enabled, list appears immediately; album/artist details are fetched 
 msgstr "When enabled, list appears immediately; album/artist details are fetched in the background and the list refreshes with descriptions. Disable to skip enrichment."
 
 msgctxt "#11111"
-msgid "Broadcast to Up Next - Music service"
-msgstr "Broadcast to Up Next - Music service"
+msgid "Broadcast to Next Track service"
+msgstr "Broadcast to Next Track service"
 
 msgctxt "#11112"
-msgid "When enabled, sends next-track data to the Up Next - Music service addon so it can show the next-track overlay. Disable if you use only the built-in overlay or another addon."
-msgstr "When enabled, sends next-track data to the Up Next - Music service addon so it can show the next-track overlay. Disable if you use only the built-in overlay or another addon."
+msgid "When enabled, sends next-track data to the Next Track service addon so it can show the next-track overlay. Disable if you use only the built-in overlay or another addon."
+msgstr "When enabled, sends next-track data to the Next Track service addon so it can show the next-track overlay. Disable if you use only the built-in overlay or another addon."
+
+msgctxt "#11113"
+msgid "Enable content lookup"
+msgstr "Enable content lookup"
+
+msgctxt "#11114"
+msgid "When enabled, artist biography and album description are fetched from the chosen provider. Use Content provider below; if Last.fm is selected, enter your API key."
+msgstr "When enabled, artist biography and album description are fetched from the chosen provider. Use Content provider below; if Last.fm is selected, enter your API key."
+
+msgctxt "#11115"
+msgid "Last.fm API key (when Last.fm is selected)"
+msgstr "Last.fm API key (when Last.fm is selected)"
+
+msgctxt "#11116"
+msgid "Get a free API key at https://www.last.fm/api/account/create and paste it here when using Last.fm as the metadata provider."
+msgstr "Get a free API key at https://www.last.fm/api/account/create and paste it here when using Last.fm as the metadata provider."
+
+msgctxt "#11120"
+msgid "Last.fm"
+msgstr "Last.fm"
+
+msgctxt "#11121"
+msgid "MusicBrainz (Wikipedia)"
+msgstr "MusicBrainz (Wikipedia)"
+
+msgctxt "#11117"
+msgid "Content provider"
+msgstr "Content provider"
+
+msgctxt "#11118"
+msgid "Last.fm: artist bio and album wiki (API key required). MusicBrainz: artist bio via Wikipedia only; album description uses Spotify summary."
+msgstr "Last.fm: artist bio and album wiki (API key required). MusicBrainz: artist bio via Wikipedia only; album description uses Spotify summary."
