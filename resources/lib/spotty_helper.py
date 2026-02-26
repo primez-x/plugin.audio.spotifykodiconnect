@@ -26,13 +26,25 @@ class SpottyHelper:
             self.spotty_rust_env["TMPDIR"] = KODI_ANDROID_INTERNAL_WRITABLE_DIR
 
     def kill_all_spotties(self) -> None:
-        if platform.system() == "Windows":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            subprocess.Popen(["taskkill", "/IM", "spotty.exe"], startupinfo=startupinfo, shell=True)
-        else:
-            sp_binary_file = os.path.basename(self.spotty_binary_path)
-            os.system("killall --quiet " + sp_binary_file)
+        try:
+            if platform.system() == "Windows":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                subprocess.Popen(
+                    ["taskkill", "/F", "/IM", "spotty.exe"],
+                    startupinfo=startupinfo,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            elif self.spotty_binary_path:
+                sp_binary_file = os.path.basename(self.spotty_binary_path)
+                subprocess.Popen(
+                    ["killall", "--quiet", sp_binary_file],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except Exception as exc:
+            log_exception(exc, "Error killing spotty processes")
 
     @staticmethod
     def __get_spotty_path() -> Union[str, None]:

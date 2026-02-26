@@ -5,7 +5,7 @@ import signal
 import sys
 import time
 import unicodedata
-from traceback import format_exception
+import traceback
 from typing import Any, Dict, List, Tuple, Union
 
 import xbmc
@@ -37,7 +37,7 @@ def log_msg(msg: str, loglevel: int = LOGDEBUG, caller_name: str = "") -> None:
 
 def log_exception(exc: Exception, exception_details: str) -> None:
     the_caller_name = get_formatted_caller_name(inspect.stack()[1][1], inspect.stack()[1][3])
-    log_msg(" ".join(format_exception(exc)), loglevel=LOGERROR, caller_name=the_caller_name)
+    log_msg(" ".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), loglevel=LOGERROR, caller_name=the_caller_name)
     log_msg(f"Exception --> {exception_details}.", loglevel=LOGERROR, caller_name=the_caller_name)
 
 
@@ -50,11 +50,15 @@ def get_time_str(raw_time: int) -> str:
 
 
 def get_username() -> str:
+    """
+    Best-effort Spotify username for display/logging.
+
+    Older versions stored a dedicated "username" setting; newer flows may not.
+    Treat a missing value as empty instead of raising so callers can still
+    show generic messages without failing.
+    """
     addon = xbmcaddon.Addon(id=ADDON_ID)
-    spotify_username = addon.getSetting("username")
-    if not spotify_username:
-        raise Exception("Could not get spotify username.")
-    return spotify_username
+    return addon.getSetting("username") or ""
 
 
 def kill_this_plugin() -> None:
@@ -63,9 +67,11 @@ def kill_this_plugin() -> None:
 
 def kill_process_by_pid(pid: int) -> None:
     try:
-        if platform.system() != "Windows":
+        if platform.system() == "Windows":
+            os.kill(pid, signal.SIGTERM)
+        else:
             os.kill(pid, signal.SIGKILL)
-    except OSError:
+    except (OSError, ProcessLookupError):
         pass
 
 

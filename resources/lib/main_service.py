@@ -1,6 +1,6 @@
 """
     plugin.audio.spotifykodiconnect
-    SpotifyKodiConnect - service: spotty + playlist sync to Kodi (real playlists).
+    SpotifyKodiConnect - service: spotty + HTTP audio streaming to Kodi.
 """
 
 import threading
@@ -28,8 +28,11 @@ SAVE_TO_RECENTLY_PLAYED_FILE = True
 SPOTIFY_ADDON = xbmcaddon.Addon(id=ADDON_ID)
 
 
+_monitor = xbmc.Monitor()
+
+
 def abort_app(timeout_in_secs: int) -> bool:
-    return xbmc.Monitor().waitForAbort(timeout_in_secs)
+    return _monitor.waitForAbort(timeout_in_secs)
 
 
 def add_http_video_rule() -> None:
@@ -59,11 +62,12 @@ class MainService:
         # If we don't do this, then Kodi uses PAPlayer which does not stream.
         add_http_video_rule()
 
-        gap_between_tracks = int(SPOTIFY_ADDON.getSetting("gap_between_playlist_tracks"))
-        # Use fixed defaults: normalization and stream volume no longer user settings
-        # (Kodi controls playback/audio; these had no effect on CoreELEC Kodi).
-        use_spotify_normalization = True
-        stream_volume = 50
+        gap_between_tracks = int(SPOTIFY_ADDON.getSetting("gap_between_playlist_tracks") or 0)
+        use_spotify_normalization = SPOTIFY_ADDON.getSetting("use_spotify_normalization").lower() != "false"
+        try:
+            stream_volume = int(SPOTIFY_ADDON.getSetting("spotify_stream_volume") or 50)
+        except (TypeError, ValueError):
+            stream_volume = 50
         prebuffer_seconds = self._get_prebuffer_seconds_setting()
         self.__prebuffer_enabled = (
             SPOTIFY_ADDON.getSetting("upnext_prebuffer_enabled").lower() == "true"
@@ -83,7 +87,7 @@ class MainService:
             on_track_started_callback=self.__on_track_started,
         )
         self.__save_recently_played: SaveRecentlyPlayed = SaveRecentlyPlayed()
-        self.__http_spotty_streamer.set_notify_track_finished(self.__save_track_to_recently_played)
+        self.__http_spotty_streamer.set_notify_track_finished(self.__on_track_finished)
 
         bottle_manager.route_all(self.__http_spotty_streamer)
 
@@ -138,6 +142,11 @@ class MainService:
         if SAVE_TO_RECENTLY_PLAYED_FILE:
             self.__save_recently_played.save_track(track_id)
 
+    def __on_track_finished(self, track_id: str) -> None:
+        """Save to recently played and mark HTTP streamer as ended so next track can start."""
+        self.__save_track_to_recently_played(track_id)
+        self.__http_spotty_streamer.set_stream_ended()
+
     def run(self) -> None:
         log_msg("Starting main service loop.")
 
@@ -148,29 +157,21 @@ class MainService:
 
         loop_counter = 0
         loop_wait_in_secs = 6
-        use_normalization = True
-        stream_volume = 50
         while True:
             loop_counter += 1
             if (loop_counter % 10) == 0:
                 log_msg(f"Main loop continuing. Loop counter: {loop_counter}.")
-            self.__http_spotty_streamer.use_normalization(use_normalization)
-            self.__http_spotty_streamer.set_stream_volume(stream_volume)
-            self.__prebuffer_manager.set_volume(stream_volume)
-            self.__prebuffer_manager.set_use_normalization(use_normalization)
+
             self.__prebuffer_manager.set_prebuffer_seconds(self._get_prebuffer_seconds_setting())
             prebuffer_enabled_now = (
                 SPOTIFY_ADDON.getSetting("upnext_prebuffer_enabled").lower() == "true"
             )
             if self.__prebuffer_enabled and not prebuffer_enabled_now:
-                # User disabled prebuffer; stop any in-flight work.
                 self.__prebuffer_manager.cancel_prebuffer()
             self.__prebuffer_enabled = prebuffer_enabled_now
 
-            # Monitor authorization.
             if self.__auth_token_expires_at == "":
-                log_msg("Spotify not yet authorized.")
-                log_msg("Refreshing auth token now.")
+                log_msg("Spotify not yet authorized. Refreshing auth token now.")
                 self.__renew_token()
             elif (int(self.__auth_token_expires_at) - 60) <= int(time.time()):
                 expire_time = int(self.__auth_token_expires_at)
@@ -179,8 +180,8 @@ class MainService:
                     f"Spotify token expired."
                     f" Expire time: {utils.get_time_str(expire_time)} ({expire_time});"
                     f" time now: {utils.get_time_str(time_now)} ({time_now})."
+                    f" Refreshing auth token now."
                 )
-                log_msg("Refreshing auth token now.")
                 self.__renew_token()
 
             if abort_app(loop_wait_in_secs):

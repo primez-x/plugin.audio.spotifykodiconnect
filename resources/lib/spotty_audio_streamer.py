@@ -90,7 +90,22 @@ class SpottyAudioStreamer:
             # File layout is [WAV header][PCM from spotty]. range_begin/range_len
             # are file offsets. Spotty only outputs PCM, so we must skip
             # (range_begin - header_len) bytes of PCM when seeking, not range_begin.
+            track_id_uri = SPOTIFY_TRACK_PREFIX + self.__track_id
+            self.__log_start_reading_audio(track_id_uri)
+
+            # File layout is [WAV header][PCM from spotty]. range_begin/range_len
+            # are file offsets.
             header_len = len(self.__wav_header)
+            
+            # Calculate where we need to start in the PCM stream
+            pcm_target_offset = max(0, range_begin - header_len)
+            
+            # Use spotty's --start-position (in seconds) to avoid decoding everything from the beginning
+            # 44100 Hz * 2 channels * 2 bytes = 176400 bytes/sec
+            pcm_bytes_per_sec = 176400
+            start_sec = pcm_target_offset // pcm_bytes_per_sec
+            pcm_skip = pcm_target_offset % pcm_bytes_per_sec
+
             if range_begin == 0:
                 bytes_sent = header_len
                 self.__log_send_wav_header()
@@ -102,24 +117,33 @@ class SpottyAudioStreamer:
                 yield tail[:to_send]
                 bytes_sent = to_send
 
-            track_id_uri = SPOTIFY_TRACK_PREFIX + self.__track_id
-            self.__log_start_reading_audio(track_id_uri)
-
             # Execute the spotty process, then collect stdout.
             args = SPOTTY_STREAMING_BASE_ARGS.copy()
             args += ["--initial-volume", str(self.initial_volume)]
             if self.use_normalization:
                 args += SPOTTY_STREAMING_NORMALIZATION_ARGS
             args += ["--single-track", track_id_uri]
+            
+            # Add start-position if we are seeking into the track
+            if start_sec > 0:
+                args += ["--start-position", str(start_sec)]
+                
             spotty_process = self.__spotty.run_spotty(args)
             self.__log_spotty_return_code(spotty_process)
             self.__last_spotty_pid = spotty_process.pid
 
-            # Skip PCM bytes so that we start at file offset range_begin.
-            # File offset range_begin = header + (range_begin - header_len) PCM bytes.
-            if range_begin >= header_len:
-                pcm_skip = range_begin - header_len
-                spotty_process.stdout.read(pcm_skip)
+            # Skip the exact remaining PCM bytes so that we start perfectly on target
+            if pcm_skip > 0:
+                # We need to read and discard `pcm_skip` bytes
+                discarded = 0
+                while discarded < pcm_skip:
+                    if self.__terminated:
+                        return
+                    to_read = min(SPOTTY_AUDIO_CHUNK_SIZE, pcm_skip - discarded)
+                    chunk = spotty_process.stdout.read(to_read)
+                    if not chunk:
+                        break
+                    discarded += len(chunk)
 
             # Loop as long as there's something to output.
             while bytes_sent < range_len:

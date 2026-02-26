@@ -1,3 +1,9 @@
+"""
+HTTP server for Spotify audio streams. Policy: let Kodi drive.
+We only provide correct HTTP range semantics (Content-Length, Accept-Ranges,
+Content-Range) so Kodi's own cache/buffer settings (e.g. 512MB, 10x read)
+take full effect. No addon-side caching, throttling, or Cache-Control.
+"""
 import threading
 import time
 from typing import Callable, Optional
@@ -6,6 +12,9 @@ import bottle
 from spotty import Spotty
 from spotty_audio_streamer import SpottyAudioStreamer
 from utils import log_msg, LOGDEBUG
+
+# No debounce: serve every range request immediately so Kodi's seek bar and
+# Player.Progress update right away. Let Kodi drive; we just fulfill each request.
 
 
 def _clamp_stream_volume(value) -> int:
@@ -29,10 +38,6 @@ class HTTPSpottyAudioStreamer:
     ):
         self.__spotty: Spotty = spotty
         self.__gap_between_tracks: int = gap_between_tracks
-        # Always avoid terminating the current streamer on overlapping requests.
-        # This reduces the risk of early stream termination when Kodi issues
-        # multiple HTTP range requests for the same track.
-        self.__problem_with_terminate_streaming = True
         self.__prebuffer_manager = prebuffer_manager
         self.__on_track_started = on_track_started_callback or (lambda _id, _dur: None)
 
@@ -43,6 +48,7 @@ class HTTPSpottyAudioStreamer:
 
         self.__is_streaming = False
         self.__stream_lock = threading.Lock()
+        self.__current_track_id: Optional[str] = None
 
     def use_normalization(self, value):
         self.__spotty_streamer.use_normalization = value
@@ -52,6 +58,12 @@ class HTTPSpottyAudioStreamer:
 
     def set_notify_track_finished(self, func: Callable[[str], None]) -> None:
         self.__spotty_streamer.set_notify_track_finished(func)
+
+    def set_stream_ended(self) -> None:
+        """Mark that the current stream has finished so the next request starts fresh."""
+        with self.__stream_lock:
+            self.__is_streaming = False
+            self.__current_track_id = None
 
     def set_on_track_started(self, func: Callable[[str, float], None]) -> None:
         self.__on_track_started = func or (lambda _id, _dur: None)
@@ -68,83 +80,46 @@ class HTTPSpottyAudioStreamer:
 
     def __terminate_streaming(self) -> None:
         if self.__spotty_streamer.terminate_stream():
-            log_msg(f"Terminated running streamer.", LOGDEBUG)
+            log_msg("Terminated running streamer.", LOGDEBUG)
         else:
-            log_msg(f"No running streamer. Nothing to terminate.", LOGDEBUG)
+            log_msg("No running streamer. Nothing to terminate.", LOGDEBUG)
 
     SPOTTY_AUDIO_TRACK_ROUTE = "/track/<track_id>/<duration>"
-    # e.g., track_id = "2eHtBGvfD7PD7SiTl52Vxr", duration = 178.795
 
-    # IMPORTANT: If Kodi is running in non-buffered file mode (e.g., cache/buffermode=3 in
-    #   'advancedsettings.xml'), then 'CurlFile::Open' will do multiple HTTP GETs for a stream
-    #   and eventually request a partial range. That's why there's the added complication
-    #   of the '__is_streaming' flag and 'request ranges' code below. (Not to mention
-    #   requiring a multithreaded web server to handle the streaming.)
     def spotty_stream_audio_track(self, track_id: str, duration: str) -> bottle.Response:
         log_msg(f"GET request: {bottle.request}", LOGDEBUG)
 
-        if self.__is_streaming:
-            if self.__problem_with_terminate_streaming:
-                log_msg("Already streaming. But flag 'problem_with_terminate_streaming' = True,"
-                        " so NOT terminating current streamer.")
-            else:
-                with self.__stream_lock:
-                    log_msg("Already streaming. Terminating current streamer.")
-                    self.__terminate_streaming()
-
-        self.__is_streaming = True
-
-        if self.__gap_between_tracks:
-            # TODO - Can we improve on this? Sometimes, when playing a playlist
-            #        with no gap between tracks, Kodi does not shutdown the visualizer
-            #        before starting the next track and visualizer. So one visualizer
-            #        instance is stopping at the same time as another is starting.
-            # Give some time for visualizations to finish.
-            log_msg(f"Delay {self.__gap_between_tracks}s before starting track.")
-            time.sleep(self.__gap_between_tracks)
-
-        self.__spotty_streamer.set_track(track_id, float(duration))
-
-        log_msg(
-            f"Start streaming spotify track '{track_id}',"
-            f" track length {self.__spotty_streamer.get_track_length()}."
+        is_new_track = (
+            not self.__is_streaming
+            or self.__current_track_id != track_id
         )
 
-        try:
-            self.__on_track_started(track_id, float(duration))
-        except Exception:
-            pass
+        if is_new_track:
+            with self.__stream_lock:
+                if self.__is_streaming:
+                    self.__terminate_streaming()
+                self.__is_streaming = True
+                self.__current_track_id = track_id
+
+            if self.__gap_between_tracks:
+                log_msg(f"Delay {self.__gap_between_tracks}s before starting track.")
+                time.sleep(self.__gap_between_tracks)
+
+            self.__spotty_streamer.set_track(track_id, float(duration))
+
+            log_msg(
+                f"Start streaming spotify track '{track_id}',"
+                f" track length {self.__spotty_streamer.get_track_length()}."
+            )
+
+            try:
+                self.__on_track_started(track_id, float(duration))
+            except Exception:
+                pass
 
         file_size = self.__spotty_streamer.get_track_length()
         range_begin = 0
         range_end = file_size
-
-        def generate():
-            r_begin = range_begin
-            r_end = range_end
-            r_len = r_end - r_begin
-            prebuf, has_prebuf = (
-                (self.__prebuffer_manager.get_and_clear_prebuffer(track_id))
-                if self.__prebuffer_manager
-                else (None, False)
-            )
-            if has_prebuf and prebuf:
-                prebuffer_len = len(prebuf)
-                if r_begin < prebuffer_len:
-                    end_from_buf = min(r_end, prebuffer_len)
-                    yield prebuf[r_begin:end_from_buf]
-                if r_end > prebuffer_len:
-                    rest_begin = max(r_begin, prebuffer_len)
-                    rest_len = r_end - rest_begin
-                    for chunk in self.__spotty_streamer.send_part_audio_stream(
-                        rest_len, rest_begin
-                    ):
-                        yield chunk
-            else:
-                for chunk in self.__spotty_streamer.send_part_audio_stream(
-                    r_len, r_begin
-                ):
-                    yield chunk
 
         request_range = bottle.request.headers.get("Range", "")
         log_msg(f"Request header range: '{request_range}'.", LOGDEBUG)
@@ -152,7 +127,7 @@ class HTTPSpottyAudioStreamer:
         if not request_range or (request_range == "bytes=0-"):
             status = 200
             content_range = ""
-            log_msg(f"Full request, content length = {range_end- range_begin}.", LOGDEBUG)
+            log_msg(f"Full request, content length = {range_end - range_begin}.", LOGDEBUG)
         else:
             status = "206 Partial Content"
             try:
@@ -160,7 +135,6 @@ class HTTPSpottyAudioStreamer:
                 start_s = parts[0].strip() if parts else ""
                 end_s = parts[1].strip() if len(parts) > 1 else ""
                 if not start_s and end_s.isdigit():
-                    # Suffix range: last N bytes (e.g. "bytes=-500")
                     suffix = int(end_s)
                     range_begin = max(0, file_size - suffix)
                     range_end = file_size
@@ -174,10 +148,48 @@ class HTTPSpottyAudioStreamer:
                 range_end = file_size
             content_range = f"bytes {range_begin}-{range_end}/{file_size}"
             log_msg(
-                f"Partial request, range = {content_range}," f" length = {range_end - range_begin}",
+                f"Partial request, range = {content_range},"
+                f" length = {range_end - range_begin}",
                 LOGDEBUG,
             )
 
+        is_seek = not is_new_track and range_begin > 0
+        streamer = self.__spotty_streamer
+        prebuffer_mgr = self.__prebuffer_manager
+
+        def generate():
+            if is_seek:
+                self.__terminate_streaming()
+                log_msg(f"Seek to byte {range_begin}, streaming immediately.", LOGDEBUG)
+
+            r_begin = range_begin
+            r_end = range_end
+            r_len = r_end - r_begin
+            prebuf, has_prebuf = (
+                (prebuffer_mgr.get_and_clear_prebuffer(track_id))
+                if prebuffer_mgr
+                else (None, False)
+            )
+            if has_prebuf and prebuf:
+                prebuffer_len = len(prebuf)
+                if r_begin < prebuffer_len:
+                    end_from_buf = min(r_end, prebuffer_len)
+                    yield prebuf[r_begin:end_from_buf]
+                if r_end > prebuffer_len:
+                    rest_begin = max(r_begin, prebuffer_len)
+                    rest_len = r_end - rest_begin
+                    for chunk in streamer.send_part_audio_stream(
+                        rest_len, rest_begin
+                    ):
+                        yield chunk
+            else:
+                for chunk in streamer.send_part_audio_stream(
+                    r_len, r_begin
+                ):
+                    yield chunk
+
+        # Only what Kodi needs: status, size, range support. No Cache-Control so
+        # Kodi's cache settings (buffer size, read factor) take full precedence.
         bottle.response.status = status
         bottle.response.headers["Accept-Ranges"] = "bytes"
         bottle.response.content_type = "audio/x-wav"
@@ -186,8 +198,8 @@ class HTTPSpottyAudioStreamer:
             bottle.response.headers["Content-Range"] = content_range
 
         if bottle.request.method.upper() == "GET":
-            return bottle.Response(generate())
+            return generate()
 
-        return bottle.Response()
+        return ""
 
     spotty_stream_audio_track.route = SPOTTY_AUDIO_TRACK_ROUTE

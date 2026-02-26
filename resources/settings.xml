@@ -15,14 +15,6 @@
     </category>
 
     <category label="11055">
-        <setting id="fetch_extra_song_info" type="bool" default="true" label="11109" help="11110">
-          <control type="toggle"/>
-        </setting>
-        <setting id="enable_content_lookup" type="bool" default="false" label="11113" help="11114">
-          <control type="toggle"/>
-        </setting>
-        <setting id="content_provider" type="enum" default="1" label="11117" help="11118" lvalues="11120|11121"/>
-        <setting id="lastfm_api_key" type="text" default="" label="11115" help="11116"/>
         <setting id="appendArtistToTitle" type="bool" default="false" label="11030">
           <control type="toggle"/>
         </setting>

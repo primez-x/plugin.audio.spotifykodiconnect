@@ -17,33 +17,17 @@ Unofficial Spotify music addon for Kodi, inspired by the “Kodi Connect” styl
   “Play playlist” starts the first track right away and queues the rest in the background so playback begins without a long wait.
 
 - **Additional song info**  
-  The “Album description / Artist biography” area on the music OSD (skin label; e.g. Arctic Fuse 3) is filled with content from Spotify by default (release date, label, genre, etc.). Enable **Enable content lookup** and choose **Content provider** (**Last.fm** or **MusicBrainz (Wikipedia)**) to fetch richer biographies and album descriptions. With **Last.fm** selected, artist images from Last.fm are also set so the skin’s **Artist slideshow** can show artist photos instead of only album art.
+  The “Album description / Artist biography” area on the music OSD (skin label; e.g. Arctic Fuse 3) is filled from Spotify data only (release date, genre, etc.). No external scrapers or augmentation.
 
 - **Performance**  
-  Extra song info uses **streaming enrichment**: the list appears immediately with basic data; a background thread then fetches album (label, copyright) and artist (genres, followers) data for all items in parallel and refreshes the container so descriptions fill in without blocking the UI. The setting “Fetch extra song info” can disable this. Saved-track and followed-artist lookups run in parallel with track loading. Playlist “Play” queues the rest in a background thread; precache also runs in background threads.
+  Saved-track and followed-artist lookups run in parallel with track loading. Playlist “Play” queues the rest in a background thread; precache runs in background threads.
 
 ## Metadata: what comes from Spotify
 
 - **Tracks:** title, artist(s), album, duration, year, track/disc number, genre, art (thumb/album art), popularity (mapped to rating).
-- **Albums:** name, artists, release date, art, label, copyrights (after a batch fetch when building lists).
-- **Artists:** name, genres, follower count (after a batch fetch when building lists).  
-- **Not in Spotify’s API:** artist biography, album liner notes or long description. The heading “Album description / Artist biography” on the OSD is a fixed skin label; the addon fills the content (Spotify summary or, when content lookup is enabled, Last.fm/MusicBrainz text).
-
-### Optional: biography, album descriptions, and artist images (Last.fm or MusicBrainz)
-
-Turn on **Enable content lookup** in addon settings, then choose **Content provider**:
-
-- **Last.fm** – Artist biography, album description, and artist image from Last.fm. The artist image is set as `artist.fanart` so skins (e.g. Arctic Fuse 3’s “Artist slideshow”) can show it instead of reusing album art. Requires a free API key from [last.fm/api/account/create](https://www.last.fm/api/account/create).
-- **MusicBrainz (Wikipedia)** – Artist biography via MusicBrainz + Wikipedia (no API key). Album description falls back to the Spotify summary. The Wikipedia fetch uses the same MediaWiki API as the **script.wikipedia** addon (intro extract); we do not add it as a dependency so this addon stays lightweight and works headlessly in the background.
-
-### Kodi scrapers and Universal scrapers (metadata.album.universal / metadata.artists.universal)
-
-Kodi’s **Generic Artist Scraper**, **Generic Album Scraper**, and the **Universal Album/Artist Scraper** addons (`metadata.album.universal`, `metadata.artists.universal`) are invoked only by Kodi when scanning or querying **library** content. They are not callable from other addons: there is no public API to pass (artist name, album name) and get back biography or description. So they **cannot** be used to fill biography/description for Spotify plugin items. For plugin-only content, this addon fetches metadata itself using Last.fm or MusicBrainz + Wikipedia as above.
-
-For pure Spotify plugin use, the addon provides:
-
-1. **Correct minimum metadata** – song title, artist, album, year, duration, track/disc number, genre, etc. – mapped to Kodi’s music info types so tagging and sorting work reliably.
-2. **Optional external metadata** – Enable **Enable content lookup** and choose **Content provider** (**Last.fm** or **MusicBrainz (Wikipedia)**) for biography, album description, and (with Last.fm) artist images for the skin’s artist slideshow.
+- **Albums:** name, artists, release date, art (from the track/playlist/album API responses).
+- **Artists:** name (from track/album responses).  
+- The “Album description / Artist biography” OSD area is filled only from Spotify-derived data (e.g. release date, genre). No external scrapers (Last.fm, MusicBrainz, etc.) or content augmentation.
 
 ## Requirements
 
