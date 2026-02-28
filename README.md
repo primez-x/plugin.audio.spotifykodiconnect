@@ -41,7 +41,7 @@ Unofficial Spotify music addon for Kodi, inspired by the “Kodi Connect” styl
 2. Configure and authenticate once (same flow as the original Spotify addon).
 3. Use **Music → Add-ons → SpotifyKodiConnect** (or your skin’s equivalent).
 
-You can run this addon alongside the original `plugin.audio.spotify`; it uses a different addon id and proxy port (52309) and its own auth/cache.
+You can technically run this addon alongside the original `plugin.audio.spotify`; it uses a different addon id and proxy port (52309) and its own auth/cache, however that seems redundant and pointless as this is simply an upgraded iteration of that addon so you'd basically just have an older/inferior version of this app installed for no reason.
 
 ## Credits
 
