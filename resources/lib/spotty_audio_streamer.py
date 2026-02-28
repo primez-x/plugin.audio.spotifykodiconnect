@@ -1,3 +1,4 @@
+import json
 import struct
 import subprocess
 from io import BytesIO
@@ -9,8 +10,6 @@ from spotty import Spotty
 from utils import bytes_to_megabytes, kill_process_by_pid, log_msg, log_exception
 
 SPOTIFY_TRACK_PREFIX = "spotify:track:"
-# SPOTTY_AUDIO_CHUNK_SIZE = 20*1024
-SPOTTY_AUDIO_CHUNK_SIZE = 524288
 
 SPOTIFY_BITRATE = "320"
 SPOTTY_GAIN_TYPE = "track"
@@ -36,10 +35,32 @@ def _clamp_volume(value: int) -> int:
         return 35
 
 
+
+def _get_kodi_chunk_size() -> int:
+    """Dynamically get the user's chunk size setting from Kodi (cache.chunksize).
+    Defaults to 1MB if not found.
+    """
+    try:
+        import xbmc
+        raw = xbmc.executeJSONRPC(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "Settings.GetSettingValue",
+            "params": {"setting": "cache.chunksize"},
+            "id": 1
+        }))
+        res = json.loads(raw)
+        val = int(res.get("result", {}).get("value", 0))
+        if val > 0:
+            return val
+    except Exception:
+        pass
+    return 1048576  # Default fallback
+
 class SpottyAudioStreamer:
     def __init__(self, spotty: Spotty, initial_volume: int = 35):
         self.__spotty = spotty
         self.initial_volume = _clamp_volume(initial_volume)
+        self.chunk_size = _get_kodi_chunk_size()
 
         self.__track_id: str = ""
         self.__track_duration: int = 0
@@ -139,7 +160,7 @@ class SpottyAudioStreamer:
                 while discarded < pcm_skip:
                     if self.__terminated:
                         return
-                    to_read = min(SPOTTY_AUDIO_CHUNK_SIZE, pcm_skip - discarded)
+                    to_read = min(self.chunk_size, pcm_skip - discarded)
                     chunk = spotty_process.stdout.read(to_read)
                     if not chunk:
                         break
@@ -150,7 +171,7 @@ class SpottyAudioStreamer:
                 if self.__terminated:
                     return
 
-                frame = spotty_process.stdout.read(SPOTTY_AUDIO_CHUNK_SIZE)
+                frame = spotty_process.stdout.read(self.chunk_size)
                 if self.__terminated:
                     return
                 if not frame:

@@ -19,7 +19,7 @@ import utils
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import *
-from utils import ADDON_ID, LOGINFO, PROXY_PORT, log_exception, log_msg, get_chunks
+from utils import ADDON_ID, ADDON_WINDOW_ID, LOGINFO, PROXY_PORT, log_exception, log_msg, get_chunks
 
 MUSIC_ARTISTS_ICON = "icon_music_artists.png"
 MUSIC_TOP_ARTISTS_ICON = "icon_music_top_artists.png"
@@ -69,22 +69,30 @@ def _art_for_item(thumb_url: str, fallback_icon_path: str = None) -> Dict[str, s
     }
 
 
-def _art_for_track(track: Dict[str, Any], fallback_icon_path: str = None) -> Dict[str, str]:
-    """Build Kodi art from Spotify album.images (multiple sizes) for native list/fanart use."""
+def _art_for_track(
+    track: Dict[str, Any], fallback_icon_path: str = None, artist_fanart: str = None
+) -> Dict[str, str]:
+    """Build Kodi art from Spotify album.images; use largest (640) for all art so every location stays sharp.
+    If artist_fanart is set, add artist.fanart for Artist slideshow / Music OSD background."""
     album = track.get("album") or {}
     images = (album.get("images") or []) if isinstance(album, dict) else []
     if images:
-        # Spotify: images sorted by width descending; [0]=largest, [-1]=smallest
+        # Spotify: images sorted by width descending; [0]=largest (typically 640x640)
         largest = images[0].get("url") or ""
-        smallest = images[-1].get("url") if len(images) > 1 else largest
-        if largest or smallest:
-            return {
-                "fanart": largest or smallest,
-                "poster": largest or smallest,
-                "thumb": smallest or largest,
-                "icon": smallest or largest,
+        if largest:
+            art = {
+                "fanart": largest,
+                "poster": largest,
+                "thumb": largest,
+                "icon": largest,
             }
-    return _art_for_item(track.get("thumb") or "", fallback_icon_path)
+            if artist_fanart:
+                art["artist.fanart"] = artist_fanart
+            return art
+    base = _art_for_item(track.get("thumb") or "", fallback_icon_path)
+    if artist_fanart and base:
+        base["artist.fanart"] = artist_fanart
+    return base
 
 
 class PluginContent:
@@ -273,12 +281,12 @@ class PluginContent:
         "browse_artist_everything", "browse_artist_just_albums",
         "browse_artist_just_singles", "browse_artist_just_albums_and_singles",
         "browse_artist_just_compilations", "browse_artist_just_appears_on",
-        "artist_top_tracks", "related_artists",
+        "artist_top_tracks", "related_artists", "browse_radio",
         "search", "search_artists", "search_tracks", "search_albums", "search_playlists",
         "follow_playlist", "unfollow_playlist", "follow_artist", "unfollow_artist",
         "save_album", "remove_album", "save_track", "remove_track",
         "add_track_to_playlist", "remove_track_from_playlist",
-        "delete_cache_db", "refresh_listing",
+        "delete_cache_db", "refresh_listing", "toggle_liked",
         "authenticate_plugin_request",
     })
 
@@ -339,6 +347,28 @@ class PluginContent:
         self.__addon.setSetting("cache_checksum", time.strftime("%Y%m%d%H%M%S", time.gmtime()))
         log_msg(f"New cache_checksum = '{self.__addon.getSetting('cache_checksum')}'")
         xbmc.executebuiltin("Container.Refresh")
+
+    def toggle_liked(self) -> None:
+        """Add or remove current track from liked songs (for OSD button). Uses trackid param or Window property."""
+        track_id = self.__track_id
+        if not track_id:
+            track_id = xbmcgui.Window(ADDON_WINDOW_ID).getProperty("Spotify.CurrentTrackId") or ""
+        if not track_id:
+            xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+            return
+        self.__track_id = track_id
+        win = xbmcgui.Window(ADDON_WINDOW_ID)
+        liked = win.getProperty("Spotify.CurrentTrackLiked") == "true"
+        try:
+            if liked:
+                self.__spotipy.current_user_saved_tracks_delete([track_id])
+                win.setProperty("Spotify.CurrentTrackLiked", "false")
+            else:
+                self.__spotipy.current_user_saved_tracks_add([track_id])
+                win.setProperty("Spotify.CurrentTrackLiked", "true")
+        except Exception as exc:
+            log_exception(exc, "toggle_liked failed")
+        xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
     def __add_track_listitems(self, tracks, append_artist_to_label: bool = False) -> None:
         list_items = self.__get_track_list(tracks, append_artist_to_label)
@@ -459,7 +489,9 @@ class PluginContent:
         if artist_desc:
             li.setProperty("Artist_Description", artist_desc)
 
-        li.setArt(_art_for_track(track, "DefaultMusicSongs.png"))
+        li.setArt(_art_for_track(
+            track, "DefaultMusicSongs.png", track.get("artist_fanart") or ""
+        ))
         li.setProperty("spotifytrackid", track["id"])
         li.setContentLookup(False)
         li.addContextMenuItems(track.get("contextitems") or [], True)
@@ -774,6 +806,45 @@ class PluginContent:
             )
         self.__add_artist_listitems(artists)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
+        xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+
+    def browse_radio(self) -> None:
+        """Show recommended tracks (radio station) from artist and/or track seed."""
+        seed_artists = []
+        seed_tracks = []
+        if self.__artist_id:
+            seed_artists = [self.__artist_id]
+        if self.__track_id:
+            seed_tracks = [self.__track_id]
+        if not seed_artists and not seed_tracks:
+            xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+            return
+        try:
+            result = self.__spotipy.recommendations(
+                seed_artists=seed_artists if seed_artists else None,
+                seed_tracks=seed_tracks if seed_tracks else None,
+                limit=50,
+                country=self.__user_country,
+            )
+        except Exception as exc:
+            log_exception(exc, "browse_radio recommendations failed")
+            xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+            return
+        tracks = result.get("tracks") or []
+        if not tracks:
+            xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+            return
+        if self.__artist_name:
+            folder_name = f"{self.__artist_name} {self.__addon.getLocalizedString(RADIO_STR_ID)}"
+        else:
+            folder_name = self.__addon.getLocalizedString(RADIO_STR_ID)
+        xbmcplugin.setContent(self.__addon_handle, "songs")
+        xbmcplugin.setProperty(self.__addon_handle, "FolderName", folder_name)
+        prepared = self.__prepare_track_listitems(tracks=tracks)
+        self.__add_track_listitems(prepared, True)
+        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
+        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_TITLE)
+        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_ARTIST)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
     def __get_playlist_details(self, playlist_id: str) -> Playlist:
@@ -1158,7 +1229,33 @@ class PluginContent:
 
             new_tracks.append(track)
 
+        # Fetch artist images (GET /artists/) for Artist slideshow / Music OSD background
+        artist_ids = list({t.get("artistid") for t in new_tracks if t.get("artistid")})
+        artist_fanart_map = self.__get_artist_fanart_map(artist_ids)
+        for t in new_tracks:
+            t["artist_fanart"] = artist_fanart_map.get(t.get("artistid") or "", "")
+
         return new_tracks
+
+    def __get_artist_fanart_map(self, artist_ids: List[str]) -> Dict[str, str]:
+        """Fetch full artist objects (GET /artists/) and return artist_id -> largest image URL.
+        Used for Artist slideshow / Music OSD background (artist.fanart)."""
+        result: Dict[str, str] = {}
+        if not artist_ids:
+            return result
+        try:
+            for chunk in get_chunks(artist_ids, 50):
+                artists = self.__spotipy.artists(chunk).get("artists") or []
+                for artist in artists:
+                    if not artist or not artist.get("id"):
+                        continue
+                    images = artist.get("images") or []
+                    if images:
+                        # Spotify: images sorted by width descending; [0]=largest
+                        result[artist["id"]] = images[0].get("url") or ""
+        except Exception as e:
+            log_exception("artist fanart fetch", e)
+        return result
 
     def __get_playlist_track_context_menu_items(
         self, track, saved_track_ids, playlist_details, followed_artists: List[str]
@@ -1171,17 +1268,12 @@ class PluginContent:
             real_track_id = track["id"]
             real_track_uri = track["uri"]
 
-        context_items = [
-            (
-                self.__addon.getLocalizedString(REFRESH_LISTING_STR_ID),
-                f"RunPlugin(plugin://{ADDON_ID}/" f"?action={self.refresh_listing.__name__})",
-            )
-        ]
+        context_items = []
 
         if track["id"] in saved_track_ids:
             context_items.append(
                 (
-                    self.__addon.getLocalizedString(REMOVE_TRACKS_FROM_MY_MUSIC_STR_ID),
+                    self.__addon.getLocalizedString(REMOVE_FROM_LIKED_SONGS_STR_ID),
                     f"RunPlugin(plugin://{ADDON_ID}/"
                     f"?action={self.remove_track.__name__}&trackid={real_track_id})",
                 )
@@ -1189,7 +1281,7 @@ class PluginContent:
         else:
             context_items.append(
                 (
-                    self.__addon.getLocalizedString(SAVE_TRACKS_TO_MY_MUSIC_STR_ID),
+                    self.__addon.getLocalizedString(ADD_TO_LIKED_SONGS_STR_ID),
                     f"RunPlugin(plugin://{ADDON_ID}/"
                     f"?action={self.save_track.__name__}&trackid={real_track_id})",
                 )
@@ -1280,7 +1372,21 @@ class PluginContent:
                     f"?action={self.related_artists.__name__}&artistid={track['artistid']})",
                 )
             )
+            context_items.append(
+                (
+                    self.__addon.getLocalizedString(GO_TO_RADIO_STR_ID),
+                    f"Container.Update(plugin://{ADDON_ID}/"
+                    f"?action={self.browse_radio.__name__}&trackid={real_track_id}"
+                    f"&artistid={track['artistid']}&artistname={urllib.parse.quote(track.get('artist', ''))})",
+                )
+            )
 
+        context_items.append(
+            (
+                self.__addon.getLocalizedString(REFRESH_LISTING_STR_ID),
+                f"RunPlugin(plugin://{ADDON_ID}/?action={self.refresh_listing.__name__})",
+            )
+        )
         return context_items
 
     def __prepare_album_listitems(
@@ -1327,10 +1433,6 @@ class PluginContent:
     ) -> List[Tuple[str, str]]:
         context_items = [
             (
-                self.__addon.getLocalizedString(REFRESH_LISTING_STR_ID),
-                f"RunPlugin(plugin://{ADDON_ID}/" f"?action={self.refresh_listing.__name__})",
-            ),
-            (
                 xbmc.getLocalizedString(KODI_BROWSE_STR_ID),
                 f"Container.Update(plugin://{ADDON_ID}/"
                 f"?action={self.browse_album.__name__}&albumid={track['id']})",
@@ -1349,6 +1451,12 @@ class PluginContent:
                 self.__addon.getLocalizedString(RELATED_ARTISTS_STR_ID),
                 f"Container.Update(plugin://{ADDON_ID}/"
                 f"?action={self.related_artists.__name__}&artistid={track['artistid']})",
+            ),
+            (
+                self.__addon.getLocalizedString(GO_TO_RADIO_STR_ID),
+                f"Container.Update(plugin://{ADDON_ID}/"
+                f"?action={self.browse_radio.__name__}&trackid={track['id']}"
+                f"&artistid={track['artistid']}&artistname={urllib.parse.quote(track.get('artist', ''))})",
             ),
         ]
 
@@ -1369,6 +1477,12 @@ class PluginContent:
                 )
             )
 
+        context_items.append(
+            (
+                self.__addon.getLocalizedString(REFRESH_LISTING_STR_ID),
+                f"RunPlugin(plugin://{ADDON_ID}/?action={self.refresh_listing.__name__})",
+            )
+        )
         return context_items
 
     def __add_album_listitems(
@@ -1407,8 +1521,9 @@ class PluginContent:
         for artist in artists:
             if artist.get("artist"):
                 artist = artist["artist"]
+            # Use largest (first) image only; API returns same image in various sizes, widest first
             if artist.get("images"):
-                artist["thumb"] = artist["images"][0]["url"]
+                artist["thumb"] = artist["images"][0].get("url") or "DefaultMusicArtists.png"
             else:
                 artist["thumb"] = "DefaultMusicArtists.png"
 
@@ -1456,6 +1571,12 @@ class PluginContent:
                 self.__addon.getLocalizedString(ARTIST_TOP_TRACKS_STR_ID),
                 f"Container.Update(plugin://{ADDON_ID}/"
                 f"?action={self.artist_top_tracks.__name__}&artistid={artist['id']})",
+            ),
+            (
+                self.__addon.getLocalizedString(GO_TO_RADIO_STR_ID),
+                f"Container.Update(plugin://{ADDON_ID}/"
+                f"?action={self.browse_radio.__name__}&artistid={artist['id']}"
+                f"&artistname={urllib.parse.quote(artist.get('name', ''))})",
             ),
         ]
 
@@ -1550,10 +1671,6 @@ class PluginContent:
                 f"?action={self.play_playlist.__name__}&playlistid={playlist['id']}"
                 f"&ownerid={playlist['owner']['id']})",
             ),
-            (
-                self.__addon.getLocalizedString(REFRESH_LISTING_STR_ID),
-                f"RunPlugin(plugin://{ADDON_ID}/" f"?action={self.refresh_listing.__name__})",
-            ),
         ]
 
         if playlist["owner"]["id"] != self.__userid and playlist["id"] in followed_playlists:
@@ -1575,6 +1692,12 @@ class PluginContent:
                 )
             )
 
+        contextitems.append(
+            (
+                self.__addon.getLocalizedString(REFRESH_LISTING_STR_ID),
+                f"RunPlugin(plugin://{ADDON_ID}/?action={self.refresh_listing.__name__})",
+            )
+        )
         return contextitems
 
     def __add_playlist_listitems(self, playlists: List[Dict[str, Any]]) -> None:

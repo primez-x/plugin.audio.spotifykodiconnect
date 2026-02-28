@@ -94,6 +94,15 @@ class HTTPSpottyAudioStreamer:
             or self.__current_track_id != track_id
         )
 
+        prebuf_data, has_prebuf_data = None, False
+        if is_new_track and self.__prebuffer_manager:
+            prebuf_data, has_prebuf_data = self.__prebuffer_manager.get_and_clear_prebuffer(track_id)
+            if has_prebuf_data:
+                log_msg(
+                    f"Prebuffer hit for track {track_id} ({len(prebuf_data)} bytes).",
+                    LOGDEBUG,
+                )
+
         if is_new_track:
             with self.__stream_lock:
                 if self.__is_streaming:
@@ -112,10 +121,13 @@ class HTTPSpottyAudioStreamer:
                 f" track length {self.__spotty_streamer.get_track_length()}."
             )
 
-            try:
-                self.__on_track_started(track_id, float(duration))
-            except Exception:
-                pass
+            def _notify_started():
+                try:
+                    self.__on_track_started(track_id, float(duration))
+                except Exception:
+                    pass
+
+            threading.Thread(target=_notify_started, daemon=True).start()
 
         file_size = self.__spotty_streamer.get_track_length()
         range_begin = 0
@@ -155,7 +167,6 @@ class HTTPSpottyAudioStreamer:
 
         is_seek = not is_new_track and range_begin > 0
         streamer = self.__spotty_streamer
-        prebuffer_mgr = self.__prebuffer_manager
 
         def generate():
             if is_seek:
@@ -165,16 +176,11 @@ class HTTPSpottyAudioStreamer:
             r_begin = range_begin
             r_end = range_end
             r_len = r_end - r_begin
-            prebuf, has_prebuf = (
-                (prebuffer_mgr.get_and_clear_prebuffer(track_id))
-                if prebuffer_mgr
-                else (None, False)
-            )
-            if has_prebuf and prebuf:
-                prebuffer_len = len(prebuf)
+            if has_prebuf_data and prebuf_data:
+                prebuffer_len = len(prebuf_data)
                 if r_begin < prebuffer_len:
                     end_from_buf = min(r_end, prebuffer_len)
-                    yield prebuf[r_begin:end_from_buf]
+                    yield prebuf_data[r_begin:end_from_buf]
                 if r_end > prebuffer_len:
                     rest_begin = max(r_begin, prebuffer_len)
                     rest_len = r_end - rest_begin

@@ -11,40 +11,72 @@ import xbmcaddon
 import xbmcgui
 
 import bottle_manager
+import spotipy
 import spotty
 import utils
 from http_spotty_audio_streamer import HTTPSpottyAudioStreamer
-from http_video_player_setter import HttpVideoPlayerSetter
 from prebuffer import PrebufferManager, _clamp_prebuffer_seconds
 from save_recently_played import SaveRecentlyPlayed
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
-from string_ids import HTTP_VIDEO_RULE_ADDED_STR_ID, WELCOME_AUTHENTICATED_STR_ID
+from string_ids import WELCOME_AUTHENTICATED_STR_ID
 from playlist_next import get_next_playlist_item, parse_track_url
 from nexttrack_broadcast import broadcast_to_nexttrack
-from utils import ADDON_ID, PROXY_PORT, log_msg, log_exception
+from utils import ADDON_ID, ADDON_WINDOW_ID, PROXY_PORT, get_cached_auth_token, log_msg, log_exception
 
 SAVE_TO_RECENTLY_PLAYED_FILE = True
 SPOTIFY_ADDON = xbmcaddon.Addon(id=ADDON_ID)
 
+# Artist fanart for Music OSD (single largest image URL; no rotation – Spotify only provides same image in multiple sizes)
+_artist_fanart_urls = []  # type: list
+_artist_fanart_index = 0
 
 _monitor = xbmc.Monitor()
+
+
+def _clear_artist_fanart_rotation() -> None:
+    global _artist_fanart_urls, _artist_fanart_index
+    _artist_fanart_urls = []
+    _artist_fanart_index = 0
+    win = xbmcgui.Window(ADDON_WINDOW_ID)
+    win.clearProperty("Spotify.ArtistFanartCurrent")
 
 
 def abort_app(timeout_in_secs: int) -> bool:
     return _monitor.waitForAbort(timeout_in_secs)
 
 
-def add_http_video_rule() -> None:
-    video_player_setter = HttpVideoPlayerSetter()
+class _SpotifyOSDPlayerMonitor(xbmc.Player):
+    """Clears Spotify OSD window properties when Kodi playback actually stops.
 
-    if not video_player_setter.set_http_rule():
-        return
+    We deliberately do NOT clear them from the HTTP stream callbacks because those
+    fire whenever Kodi's internal buffer fills (mid-song), not only at true end-of-track.
+    """
 
-    msg = SPOTIFY_ADDON.getLocalizedString(HTTP_VIDEO_RULE_ADDED_STR_ID)
-    dialog = xbmcgui.Dialog()
-    header = SPOTIFY_ADDON.getAddonInfo("name")
-    dialog.ok(header, msg)
+    def _clear(self) -> None:
+        _clear_artist_fanart_rotation()
+        win = xbmcgui.Window(ADDON_WINDOW_ID)
+        win.clearProperty("Spotify.CurrentTrackId")
+        win.clearProperty("Spotify.CurrentTrackLiked")
+
+    def onPlayBackStopped(self) -> None:
+        self._clear()
+
+    def onPlayBackEnded(self) -> None:
+        self._clear()
+
+    def onPlayBackError(self) -> None:
+        self._clear()
+
+    def onPlayBackStarted(self) -> None:
+        # If a non-Spotify item starts playing, clear the Spotify OSD state.
+        # Give Kodi a moment to populate MusicPlayer properties.
+        def _check():
+            xbmc.sleep(500)
+            track_id = xbmc.getInfoLabel("MusicPlayer.Property(spotifytrackid)")
+            if not track_id:
+                self._clear()
+        threading.Thread(target=_check, daemon=True).start()
 
 
 class MainService:
@@ -57,11 +89,7 @@ class MainService:
         self.__spotty_auth: SpottyAuth = SpottyAuth(self.__spotty)
         self.__auth_token_expires_at = ""
         self.__welcome_msg = True
-
-        # Workaround to make Kodi use it's VideoPlayer to play http audio streams.
-        # If we don't do this, then Kodi uses PAPlayer which does not stream.
-        add_http_video_rule()
-
+        
         gap_between_tracks = int(SPOTIFY_ADDON.getSetting("gap_between_playlist_tracks") or 0)
         use_spotify_normalization = SPOTIFY_ADDON.getSetting("use_spotify_normalization").lower() != "false"
         try:
@@ -70,7 +98,7 @@ class MainService:
             stream_volume = 50
         prebuffer_seconds = self._get_prebuffer_seconds_setting()
         self.__prebuffer_enabled = (
-            SPOTIFY_ADDON.getSetting("upnext_prebuffer_enabled").lower() == "true"
+            SPOTIFY_ADDON.getSetting("prebuffer_enabled").lower() == "true"
         )
         self.__prebuffer_manager: PrebufferManager = PrebufferManager(
             self.__spotty,
@@ -89,10 +117,65 @@ class MainService:
         self.__save_recently_played: SaveRecentlyPlayed = SaveRecentlyPlayed()
         self.__http_spotty_streamer.set_notify_track_finished(self.__on_track_finished)
 
+        # Keep a strong reference so Kodi doesn't GC the player monitor.
+        self.__osd_player_monitor = _SpotifyOSDPlayerMonitor()
+
         bottle_manager.route_all(self.__http_spotty_streamer)
 
     def __on_track_started(self, track_id: str, duration_sec: float) -> None:
-        """Pre-buffer the next track if available; broadcast to service.nexttrack."""
+        """Set OSD properties for Spotify track; pre-buffer next; broadcast to service.nexttrack."""
+        global _artist_fanart_urls, _artist_fanart_index
+        win = xbmcgui.Window(ADDON_WINDOW_ID)
+        win.setProperty("Spotify.CurrentTrackId", track_id or "")
+        win.setProperty("Spotify.CurrentTrackLiked", "")
+
+        def _fetch_artist_fanart_urls():
+            global _artist_fanart_urls, _artist_fanart_index
+            try:
+                token = get_cached_auth_token()
+                if not token:
+                    return
+                sp = spotipy.Spotify(auth=token)
+                track = sp.track(track_id)
+                artists = (track or {}).get("artists") or []
+                if not artists:
+                    return
+                artist_id = artists[0].get("id")
+                if not artist_id:
+                    return
+                artist = sp.artist(artist_id)
+                images = (artist or {}).get("images") or []
+                # Spotify returns same image in multiple sizes (640, 300, 64); use only largest
+                if not images:
+                    return
+                largest_url = images[0].get("url") or ""
+                if not largest_url:
+                    return
+                _artist_fanart_urls.clear()
+                _artist_fanart_urls.append(largest_url)
+                _artist_fanart_index = 0
+                w = xbmcgui.Window(ADDON_WINDOW_ID)
+                w.setProperty("Spotify.ArtistFanartCurrent", largest_url)
+            except Exception:
+                _artist_fanart_urls.clear()
+                _artist_fanart_index = 0
+
+        threading.Thread(target=_fetch_artist_fanart_urls, daemon=True).start()
+
+        def _set_liked_state():
+            try:
+                token = get_cached_auth_token()
+                if not token:
+                    return
+                sp = spotipy.Spotify(auth=token)
+                result = sp.current_user_saved_tracks_contains([track_id])
+                liked = "true" if (result and result[0]) else "false"
+                win.setProperty("Spotify.CurrentTrackLiked", liked)
+            except Exception:
+                pass
+
+        threading.Thread(target=_set_liked_state, daemon=True).start()
+
         try:
             current_item, next_item = get_next_playlist_item()
             if not next_item:
@@ -103,7 +186,7 @@ class MainService:
                 return
 
             prebuffer_enabled = (
-                SPOTIFY_ADDON.getSetting("upnext_prebuffer_enabled").lower() == "true"
+                SPOTIFY_ADDON.getSetting("prebuffer_enabled").lower() == "true"
             )
             if prebuffer_enabled:
                 self.__prebuffer_manager.start_prebuffer(next_track_id, next_duration)
@@ -143,7 +226,12 @@ class MainService:
             self.__save_recently_played.save_track(track_id)
 
     def __on_track_finished(self, track_id: str) -> None:
-        """Save to recently played and mark HTTP streamer as ended so next track can start."""
+        """Save to recently played and mark HTTP streamer as ended.
+
+        OSD properties are NOT cleared here because this callback fires whenever
+        Kodi's internal buffer fills (mid-song), not only at true end-of-track.
+        The _SpotifyOSDPlayerMonitor clears them on real playback stop/end events.
+        """
         self.__save_track_to_recently_played(track_id)
         self.__http_spotty_streamer.set_stream_ended()
 
@@ -164,7 +252,7 @@ class MainService:
 
             self.__prebuffer_manager.set_prebuffer_seconds(self._get_prebuffer_seconds_setting())
             prebuffer_enabled_now = (
-                SPOTIFY_ADDON.getSetting("upnext_prebuffer_enabled").lower() == "true"
+                SPOTIFY_ADDON.getSetting("prebuffer_enabled").lower() == "true"
             )
             if self.__prebuffer_enabled and not prebuffer_enabled_now:
                 self.__prebuffer_manager.cancel_prebuffer()
@@ -200,11 +288,10 @@ class MainService:
 
     def _get_prebuffer_seconds_setting(self) -> int:
         """
-        Prebuffer duration (seconds) derived from the user-configured
-        preview duration setting. Clamped to 5–30 for memory safety.
+        Prebuffer duration (seconds). Clamped to 5–30 for memory safety.
         """
         try:
-            v = int(SPOTIFY_ADDON.getSetting("upnext_preview_seconds") or 15)
+            v = int(SPOTIFY_ADDON.getSetting("prebuffer_seconds") or 15)
             return _clamp_prebuffer_seconds(v)
         except (TypeError, ValueError):
             return _clamp_prebuffer_seconds(15)

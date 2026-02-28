@@ -107,11 +107,15 @@ From **GET /artists/{id}**.
 | `genres`        | array of strings | **(Deprecated)** e.g. `["Prog rock","Grunge"]` |
 | `href`          | string | Web API endpoint |
 | `id`            | string | Spotify ID |
-| `images`        | array of ImageObject | Artist images, various sizes |
+| `images`        | array of ImageObject | **One** artist image in various sizes (widest first; same as album art). Not multiple different photos. |
 | `name`          | string | Artist name |
 | `popularity`    | integer | **(Deprecated)** 0–100 |
 | `type`          | string | `"artist"` |
 | `uri`           | string | Spotify URI |
+
+**API note:** Per [Get Artist](https://developer.spotify.com/documentation/web-api/reference/get-an-artist), `images` is “Images of the artist **in various sizes, widest first**”—i.e. the same image at different resolutions (e.g. 640×640, 300×300, 64×64), not multiple distinct photos.
+
+**Addon usage:** The plugin uses the **largest** (first) image everywhere: track list items get `artist.fanart`; artist list items get `thumb`/`poster`/`fanart`/`icon`; Music OSD and list backgrounds use that art. GET /artists/ (batch) when preparing tracks; artist browse uses full artist objects from the API (which include `images`).
 
 ### SimplifiedArtistObject
 Subset used inside Track, Album, etc.: `external_urls`, `href`, `id`, `name`, `type`, `uri` (no `followers`, `genres`, `images`, `popularity`).

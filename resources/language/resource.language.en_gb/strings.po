@@ -257,23 +257,23 @@ msgid "Extra librespot options"
 msgstr "Optional: e.g. --bitrate 160"
 
 msgctxt "#11099"
-msgid "Enable Up Next"
-msgstr "Enable Up Next"
+msgid "Enable built-in Next Track overlay"
+msgstr "Enable built-in Next Track overlay"
 
 msgctxt "#11100"
 msgid "Show the built-in Next Track overlay near the end of the current track."
 msgstr ""
 
 msgctxt "#11106"
-msgid "Up Next"
-msgstr "Up Next"
+msgid "Next Track"
+msgstr "Next Track"
 
 msgctxt "#11101"
 msgid "Preview duration (seconds)"
 msgstr "Preview duration (seconds)"
 
 msgctxt "#11102"
-msgid "How many seconds before the track ends to show the next track overlay (5–45). This value also drives the prebuffer duration (clamped to 5–30)."
+msgid "How many seconds before the track ends to show the next track overlay (5–45)."
 msgstr ""
 
 msgctxt "#11103"
@@ -307,4 +307,20 @@ msgstr "When enabled, sends next-track data to the Next Track service addon so i
 msgctxt "#11122"
 msgid "Welcome"
 msgstr ""
+
+msgctxt "#11123"
+msgid "Go to radio"
+msgstr "Go to radio"
+
+msgctxt "#11124"
+msgid "Radio"
+msgstr "Radio"
+
+msgctxt "#11125"
+msgid "Add to liked songs"
+msgstr "Add to liked songs"
+
+msgctxt "#11126"
+msgid "Remove from liked songs"
+msgstr "Remove from liked songs"
 
