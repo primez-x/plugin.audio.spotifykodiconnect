@@ -1,11 +1,13 @@
 <?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <settings>
     <category label="11054">
-        <setting id="my_recently_played_playlist_name" type="text" default="My Recently Played"
-                 label="11069" help="Disable by setting string to NONE"/>
-        <setting id="gap_between_playlist_tracks" type="number" default="0" label="11070"
-	         help="Gap between tracks when playing a playlist (secs)"/>
         <setting id="use_spotify_normalization" type="bool" default="true" label="11075">
+          <control type="toggle"/>
+        </setting>
+        <setting id="spotify_autoplay" type="bool" default="false" label="11130" help="11131">
+          <control type="toggle"/>
+        </setting>
+        <setting id="spotify_passthrough" type="bool" default="false" label="11132" help="11133">
           <control type="toggle"/>
         </setting>
         <setting id="spotify_stream_volume" type="slider" default="35" label="11095" help="11096" range="1,1,100" option="int"/>

@@ -124,20 +124,6 @@ msgctxt "#11055"
 msgid "Views"
 msgstr ""
 
-msgctxt "#11069"
-msgid "My recently played playlist"
-msgstr ""
-
-msgctxt "#11070"
-msgid "Gap between tracks when playing a playlist (secs)"
-msgstr ""
-
-msgctxt "#11071"
-msgid ""
-"To give better audio streaming from Spotify, a video http rule was just added to 'userdata/playercorefactory.xml'.\n"
-"Please restart Kodi for this to take affect."
-msgstr ""
-
 msgctxt "#11072"
 msgid "Clear the plugin cache"
 msgstr ""
@@ -323,4 +309,20 @@ msgstr "Add to liked songs"
 msgctxt "#11126"
 msgid "Remove from liked songs"
 msgstr "Remove from liked songs"
+
+msgctxt "#11130"
+msgid "Autoplay similar songs"
+msgstr ""
+
+msgctxt "#11131"
+msgid "When enabled, spotty will automatically play similar songs when your music ends (Spotify autoplay)."
+msgstr ""
+
+msgctxt "#11132"
+msgid "Passthrough (raw stream)"
+msgstr ""
+
+msgctxt "#11133"
+msgid "Stream raw Ogg Vorbis from Spotify (no WAV wrap). Uses less CPU; leave off if playback fails."
+msgstr ""
 

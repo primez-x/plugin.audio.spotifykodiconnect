@@ -124,22 +124,6 @@ msgctxt "#11055"
 msgid "Views"
 msgstr ""
 
-msgctxt "#11069"
-msgid "My recently played playlist"
-msgstr "My recently played playlist"
-
-msgctxt "#11070"
-msgid "Gap between tracks when playing a playlist (secs)"
-msgstr "Gap between tracks when playing a playlist (secs)"
-
-msgctxt "#11071"
-msgid ""
-"To give better audio streaming from Spotify, a video http rule was just added to 'userdata/playercorefactory.xml'.\n"
-"Please restart Kodi for this to take affect."
-msgstr ""
-"To give better audio streaming from Spotify, a video http rule was just added to 'userdata/playercorefactory.xml'.\n"
-"Please restart Kodi for this to take affect."
-
 msgctxt "#11072"
 msgid "Clear the plugin cache"
 msgstr "Clear the plugin cache"

@@ -30,14 +30,14 @@ class HTTPSpottyAudioStreamer:
     def __init__(
         self,
         spotty: Spotty,
-        gap_between_tracks: int = 0,
         use_normalization: bool = True,
         stream_volume: int = 35,
         prebuffer_manager=None,
         on_track_started_callback: Optional[Callable[[str, float], None]] = None,
+        use_autoplay: bool = False,
+        use_passthrough: bool = False,
     ):
         self.__spotty: Spotty = spotty
-        self.__gap_between_tracks: int = gap_between_tracks
         self.__prebuffer_manager = prebuffer_manager
         self.__on_track_started = on_track_started_callback or (lambda _id, _dur: None)
 
@@ -45,6 +45,8 @@ class HTTPSpottyAudioStreamer:
             self.__spotty, initial_volume=_clamp_stream_volume(stream_volume)
         )
         self.__spotty_streamer.use_normalization = use_normalization
+        self.__spotty_streamer.use_autoplay = use_autoplay
+        self.__spotty_streamer.use_passthrough = use_passthrough
 
         self.__is_streaming = False
         self.__stream_lock = threading.Lock()
@@ -95,7 +97,8 @@ class HTTPSpottyAudioStreamer:
         )
 
         prebuf_data, has_prebuf_data = None, False
-        if is_new_track and self.__prebuffer_manager:
+        use_passthrough = self.__spotty_streamer.use_passthrough
+        if is_new_track and self.__prebuffer_manager and not use_passthrough:
             prebuf_data, has_prebuf_data = self.__prebuffer_manager.get_and_clear_prebuffer(track_id)
             if has_prebuf_data:
                 log_msg(
@@ -109,10 +112,6 @@ class HTTPSpottyAudioStreamer:
                     self.__terminate_streaming()
                 self.__is_streaming = True
                 self.__current_track_id = track_id
-
-            if self.__gap_between_tracks:
-                log_msg(f"Delay {self.__gap_between_tracks}s before starting track.")
-                time.sleep(self.__gap_between_tracks)
 
             self.__spotty_streamer.set_track(track_id, float(duration))
 

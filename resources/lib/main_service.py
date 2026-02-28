@@ -16,7 +16,6 @@ import spotty
 import utils
 from http_spotty_audio_streamer import HTTPSpottyAudioStreamer
 from prebuffer import PrebufferManager, _clamp_prebuffer_seconds
-from save_recently_played import SaveRecentlyPlayed
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import WELCOME_AUTHENTICATED_STR_ID
@@ -24,7 +23,6 @@ from playlist_next import get_next_playlist_item, parse_track_url
 from nexttrack_broadcast import broadcast_to_nexttrack
 from utils import ADDON_ID, ADDON_WINDOW_ID, PROXY_PORT, get_cached_auth_token, log_msg, log_exception
 
-SAVE_TO_RECENTLY_PLAYED_FILE = True
 SPOTIFY_ADDON = xbmcaddon.Addon(id=ADDON_ID)
 
 # Artist fanart for Music OSD (single largest image URL; no rotation – Spotify only provides same image in multiple sizes)
@@ -90,8 +88,9 @@ class MainService:
         self.__auth_token_expires_at = ""
         self.__welcome_msg = True
         
-        gap_between_tracks = int(SPOTIFY_ADDON.getSetting("gap_between_playlist_tracks") or 0)
         use_spotify_normalization = SPOTIFY_ADDON.getSetting("use_spotify_normalization").lower() != "false"
+        use_autoplay = SPOTIFY_ADDON.getSetting("spotify_autoplay").lower() == "true"
+        use_passthrough = SPOTIFY_ADDON.getSetting("spotify_passthrough").lower() == "true"
         try:
             stream_volume = int(SPOTIFY_ADDON.getSetting("spotify_stream_volume") or 50)
         except (TypeError, ValueError):
@@ -108,13 +107,13 @@ class MainService:
         )
         self.__http_spotty_streamer: HTTPSpottyAudioStreamer = HTTPSpottyAudioStreamer(
             self.__spotty,
-            gap_between_tracks,
             use_spotify_normalization,
             stream_volume,
             prebuffer_manager=self.__prebuffer_manager,
             on_track_started_callback=self.__on_track_started,
+            use_autoplay=use_autoplay,
+            use_passthrough=use_passthrough,
         )
-        self.__save_recently_played: SaveRecentlyPlayed = SaveRecentlyPlayed()
         self.__http_spotty_streamer.set_notify_track_finished(self.__on_track_finished)
 
         # Keep a strong reference so Kodi doesn't GC the player monitor.
@@ -188,7 +187,10 @@ class MainService:
             prebuffer_enabled = (
                 SPOTIFY_ADDON.getSetting("prebuffer_enabled").lower() == "true"
             )
-            if prebuffer_enabled:
+            use_passthrough = (
+                SPOTIFY_ADDON.getSetting("spotify_passthrough").lower() == "true"
+            )
+            if prebuffer_enabled and not use_passthrough:
                 self.__prebuffer_manager.start_prebuffer(next_track_id, next_duration)
 
             broadcast_enabled = (
@@ -221,18 +223,13 @@ class MainService:
         except Exception:
             pass
 
-    def __save_track_to_recently_played(self, track_id: str) -> None:
-        if SAVE_TO_RECENTLY_PLAYED_FILE:
-            self.__save_recently_played.save_track(track_id)
-
     def __on_track_finished(self, track_id: str) -> None:
-        """Save to recently played and mark HTTP streamer as ended.
+        """Mark HTTP streamer as ended.
 
         OSD properties are NOT cleared here because this callback fires whenever
         Kodi's internal buffer fills (mid-song), not only at true end-of-track.
         The _SpotifyOSDPlayerMonitor clears them on real playback stop/end events.
         """
-        self.__save_track_to_recently_played(track_id)
         self.__http_spotty_streamer.set_stream_ended()
 
     def run(self) -> None:
