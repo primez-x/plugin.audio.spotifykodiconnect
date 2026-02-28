@@ -121,13 +121,8 @@ class HTTPSpottyAudioStreamer:
                 f" track length {self.__spotty_streamer.get_track_length()}."
             )
 
-            def _notify_started():
-                try:
-                    self.__on_track_started(track_id, float(duration))
-                except Exception:
-                    pass
-
-            threading.Thread(target=_notify_started, daemon=True).start()
+            # Fire and forget notification
+            threading.Thread(target=self.__on_track_started, args=(track_id, float(duration)), daemon=True).start()
 
         file_size = self.__spotty_streamer.get_track_length()
         range_begin = 0
@@ -184,15 +179,10 @@ class HTTPSpottyAudioStreamer:
                 if r_end > prebuffer_len:
                     rest_begin = max(r_begin, prebuffer_len)
                     rest_len = r_end - rest_begin
-                    for chunk in streamer.send_part_audio_stream(
-                        rest_len, rest_begin
-                    ):
-                        yield chunk
+                    # Yield directly from generator without extra loop overhead if possible
+                    yield from streamer.send_part_audio_stream(rest_len, rest_begin)
             else:
-                for chunk in streamer.send_part_audio_stream(
-                    r_len, r_begin
-                ):
-                    yield chunk
+                yield from streamer.send_part_audio_stream(r_len, r_begin)
 
         # Only what Kodi needs: status, size, range support. No Cache-Control so
         # Kodi's cache settings (buffer size, read factor) take full precedence.

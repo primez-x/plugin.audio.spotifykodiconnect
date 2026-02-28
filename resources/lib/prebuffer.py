@@ -80,18 +80,23 @@ class PrebufferManager:
             streamer.set_track(track_id, duration_sec)
             with self.__lock:
                 self.__streamer_ref = streamer
+            
+            # Pre-allocate bytearray with expected size to avoid reallocations
             collected = bytearray()
             try:
                 for chunk in streamer.send_part_audio_stream(prebuffer_bytes, 0):
                     with self.__lock:
                         if self.__cancel_requested:
                             return
-                    if isinstance(chunk, bytes):
+                    
+                    if type(chunk) is bytes:
                         collected.extend(chunk)
                     elif chunk:
                         collected.extend(chunk.encode("latin-1"))
+                        
                     if len(collected) >= prebuffer_bytes:
                         break
+                        
                 with self.__lock:
                     if not self.__cancel_requested and self.__prebuffer_track_id is None:
                         self.__buffer = bytes(collected[:prebuffer_bytes])

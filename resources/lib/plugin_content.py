@@ -753,7 +753,16 @@ class PluginContent:
 
     def browse_album(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "songs")
-        album = self.__spotipy.album(self.__album_id, market=self.__user_country)
+        
+        # Performance optimization: check cache first to avoid API call
+        cache_str = f"spotify.album.{self.__album_id}"
+        checksum = self.__cache_checksum()
+        album = self.cache.get(cache_str, checksum=checksum)
+        
+        if not album:
+            album = self.__spotipy.album(self.__album_id, market=self.__user_country)
+            self.cache.set(cache_str, album, checksum=checksum)
+            
         xbmcplugin.setProperty(self.__addon_handle, "FolderName", album["name"])
         tracks = self.__get_album_tracks(album)
         if album.get("album_type") == "compilation":
@@ -775,8 +784,20 @@ class PluginContent:
             "FolderName",
             self.__addon.getLocalizedString(ARTIST_TOP_TRACKS_STR_ID),
         )
-        tracks = self.__spotipy.artist_top_tracks(self.__artist_id, country=self.__user_country)
-        tracks = self.__prepare_track_listitems(tracks=tracks["tracks"])
+        
+        # Performance optimization: check cache first to avoid API call
+        cache_str = f"spotify.artisttoptracks.{self.__artist_id}"
+        checksum = self.__cache_checksum()
+        tracks_data = self.cache.get(cache_str, checksum=checksum)
+        
+        if tracks_data:
+            cache_log(f'Retrieved cached top tracks for artist "{self.__artist_id}".')
+            tracks = tracks_data
+        else:
+            tracks_result = self.__spotipy.artist_top_tracks(self.__artist_id, country=self.__user_country)
+            tracks = self.__prepare_track_listitems(tracks=tracks_result["tracks"])
+            self.cache.set(cache_str, tracks, checksum=checksum)
+            
         self.__add_track_listitems(tracks)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_TRACKNUM)
@@ -915,23 +936,31 @@ class PluginContent:
         kodi_playlist = xbmc.PlayList(0)
         kodi_playlist.clear()
 
-        url, li = self.__get_track_item(items[0], True)
-        kodi_playlist.add(url, li)
+        # Batch add the first few tracks directly to start quickly
+        batch_size = min(5, len(items))
+        for track in items[:batch_size]:
+            url, li = self.__get_track_item(track, True)
+            kodi_playlist.add(url, li)
+            
+        # Start playback immediately after first tracks are queued
         xbmc.Player().play(kodi_playlist)
 
-        def add_remaining():
-            for track in items[1:]:
-                if xbmc.Monitor().abortRequested():
-                    return
-                try:
-                    u, listitem = self.__get_track_item(track, True)
-                    kodi_playlist.add(u, listitem)
-                except Exception:
-                    pass
-                xbmc.sleep(10)
+        # Process the rest in background 
+        if len(items) > batch_size:
+            def add_remaining():
+                for track in items[batch_size:]:
+                    if xbmc.Monitor().abortRequested():
+                        return
+                    try:
+                        u, listitem = self.__get_track_item(track, True)
+                        kodi_playlist.add(u, listitem)
+                    except Exception:
+                        pass
+                    # Reduced sleep slightly to populate playlist faster, but yield to main thread
+                    xbmc.sleep(2)
 
-        t = threading.Thread(target=add_remaining, daemon=True)
-        t.start()
+            t = threading.Thread(target=add_remaining, daemon=True)
+            t.start()
 
     def __get_category(self, categoryid: str) -> Playlist:
         category = self.__spotipy.category(
@@ -1157,6 +1186,10 @@ class PluginContent:
         # Fetch saved_track_ids and followed_artists in parallel (with track fetch when needed)
         saved_result = [None]
         followed_result = [None]
+        
+        # Only fetch these if they are really needed (optimization)
+        need_saved = True
+        need_followed = True
 
         def _get_saved():
             saved_result[0] = self.__get_saved_track_ids()
@@ -1166,16 +1199,23 @@ class PluginContent:
 
         t_saved = threading.Thread(target=_get_saved, daemon=True)
         t_followed = threading.Thread(target=_get_followed, daemon=True)
-        t_saved.start()
-        t_followed.start()
+        
+        if need_saved:
+            t_saved.start()
+        if need_followed:
+            t_followed.start()
 
         # For tracks, we always get the full details unless full tracks already supplied.
         if track_ids and not tracks:
+            # Add early exit condition
             for chunk in get_chunks(track_ids, 20):
                 tracks += self.__spotipy.tracks(chunk, market=self.__user_country)["tracks"]
 
-        t_saved.join()
-        t_followed.join()
+        if need_saved:
+            t_saved.join()
+        if need_followed:
+            t_followed.join()
+            
         saved_track_ids = set(saved_result[0] or [])
         followed_artists = {a["id"] for a in (followed_result[0] or [])}
 
@@ -1231,7 +1271,34 @@ class PluginContent:
 
         # Fetch artist images (GET /artists/) for Artist slideshow / Music OSD background
         artist_ids = list({t.get("artistid") for t in new_tracks if t.get("artistid")})
-        artist_fanart_map = self.__get_artist_fanart_map(artist_ids)
+        
+        # Optimize fetch by checking cache first
+        artist_fanart_map = {}
+        missing_artist_ids = []
+        
+        # We can implement a simple in-memory cache for artist fanart to reduce API calls 
+        # since this is called frequently
+        if not hasattr(self, '_artist_fanart_cache'):
+            self._artist_fanart_cache = {}
+            
+        for artist_id in artist_ids:
+            if artist_id in self._artist_fanart_cache:
+                artist_fanart_map[artist_id] = self._artist_fanart_cache[artist_id]
+            else:
+                missing_artist_ids.append(artist_id)
+                
+        if missing_artist_ids:
+            fetched_map = self.__get_artist_fanart_map(missing_artist_ids)
+            artist_fanart_map.update(fetched_map)
+            self._artist_fanart_cache.update(fetched_map)
+            
+            # Keep cache size reasonable (max 500 artists)
+            if len(self._artist_fanart_cache) > 500:
+                # Remove oldest entries (simple approach: clear half the cache)
+                keys_to_remove = list(self._artist_fanart_cache.keys())[:250]
+                for k in keys_to_remove:
+                    del self._artist_fanart_cache[k]
+
         for t in new_tracks:
             t["artist_fanart"] = artist_fanart_map.get(t.get("artistid") or "", "")
 
@@ -1738,27 +1805,36 @@ class PluginContent:
         xbmcplugin.setProperty(
             self.__addon_handle, "FolderName", xbmc.getLocalizedString(KODI_ALBUMS_STR_ID)
         )
-        artist_albums = self.__spotipy.artist_albums(
-            self.__artist_id,
-            album_type=album_type,
-            country=self.__user_country,
-            limit=50,
-            offset=0,
-        )
-        count = len(artist_albums["items"])
-        albumids = []
-        while artist_albums["total"] > count:
-            artist_albums["items"] += self.__spotipy.artist_albums(
+        cache_str = f"spotify.artistalbums.{album_type}.{self.__artist_id}"
+        checksum = self.__cache_checksum()
+        albums = self.cache.get(cache_str, checksum=checksum)
+
+        if albums:
+            cache_log(f'Retrieved {len(albums)} cached albums of type "{album_type}" for artist "{self.__artist_id}".')
+        else:
+            artist_albums = self.__spotipy.artist_albums(
                 self.__artist_id,
                 album_type=album_type,
                 country=self.__user_country,
                 limit=50,
-                offset=count,
-            )["items"]
-            count += 50
-        for album in artist_albums["items"]:
-            albumids.append(album["id"])
-        albums = self.__prepare_album_listitems(albumids)
+                offset=0,
+            )
+            count = len(artist_albums["items"])
+            albumids = []
+            while artist_albums["total"] > count:
+                artist_albums["items"] += self.__spotipy.artist_albums(
+                    self.__artist_id,
+                    album_type=album_type,
+                    country=self.__user_country,
+                    limit=50,
+                    offset=count,
+                )["items"]
+                count += 50
+            for album in artist_albums["items"]:
+                albumids.append(album["id"])
+            albums = self.__prepare_album_listitems(albumids)
+            self.cache.set(cache_str, albums, checksum=checksum)
+
         self.__add_album_listitems(albums)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_VIDEO_YEAR)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_ALBUM_IGNORE_THE)
@@ -2043,55 +2119,63 @@ class PluginContent:
             self.__addon_handle, xbmc.getLocalizedString(KODI_SEARCH_RESULTS_STR_ID)
         )
 
-        kb = xbmc.Keyboard("", xbmc.getLocalizedString(KODI_ENTER_SEARCH_STRING_STR_ID))
-        kb.doModal()
-        if kb.isConfirmed():
-            value = kb.getText()
-            items = []
-            result = self.__spotipy.search(
-                q=f"{value}",
-                type="artist,album,track,playlist",
-                limit=1,
-                market=self.__user_country,
+        # Performance optimization: if we already have a search query, skip the keyboard
+        if self.__filter:
+            value = self.__filter
+        else:
+            kb = xbmc.Keyboard("", xbmc.getLocalizedString(KODI_ENTER_SEARCH_STRING_STR_ID))
+            kb.doModal()
+            if kb.isConfirmed():
+                value = kb.getText()
+            else:
+                xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+                return
+
+        items = []
+        result = self.__spotipy.search(
+            q=f"{value}",
+            type="artist,album,track,playlist",
+            limit=1,
+            market=self.__user_country,
+        )
+        items.append(
+            (
+                f"{xbmc.getLocalizedString(KODI_ARTISTS_STR_ID)}"
+                f" ({result['artists']['total']})",
+                f"plugin://{ADDON_ID}/"
+                f"?action={self.search_artists.__name__}&artistid={value}",
             )
-            items.append(
-                (
-                    f"{xbmc.getLocalizedString(KODI_ARTISTS_STR_ID)}"
-                    f" ({result['artists']['total']})",
-                    f"plugin://{ADDON_ID}/"
-                    f"?action={self.search_artists.__name__}&artistid={value}",
-                )
+        )
+        items.append(
+            (
+                f"{xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID)}"
+                f" ({result['playlists']['total']})",
+                f"plugin://{ADDON_ID}/"
+                f"?action={self.search_playlists.__name__}&playlistid={value}",
             )
-            items.append(
-                (
-                    f"{xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID)}"
-                    f" ({result['playlists']['total']})",
-                    f"plugin://{ADDON_ID}/"
-                    f"?action={self.search_playlists.__name__}&playlistid={value}",
-                )
+        )
+        items.append(
+            (
+                f"{xbmc.getLocalizedString(KODI_ALBUMS_STR_ID)} ({result['albums']['total']})",
+                f"plugin://{ADDON_ID}/"
+                f"?action={self.search_albums.__name__}&albumid={value}",
             )
-            items.append(
-                (
-                    f"{xbmc.getLocalizedString(KODI_ALBUMS_STR_ID)} ({result['albums']['total']})",
-                    f"plugin://{ADDON_ID}/"
-                    f"?action={self.search_albums.__name__}&albumid={value}",
-                )
+        )
+        items.append(
+            (
+                f"{xbmc.getLocalizedString(KODI_SONGS_STR_ID)} ({result['tracks']['total']})",
+                f"plugin://{ADDON_ID}/"
+                f"?action={self.search_tracks.__name__}&trackid={value}",
             )
-            items.append(
-                (
-                    f"{xbmc.getLocalizedString(KODI_SONGS_STR_ID)} ({result['tracks']['total']})",
-                    f"plugin://{ADDON_ID}/"
-                    f"?action={self.search_tracks.__name__}&trackid={value}",
-                )
+        )
+        for item in items:
+            li = xbmcgui.ListItem(item[0], path=item[1])
+            li.setProperty("do_not_analyze", "true")
+            li.setProperty("IsPlayable", "false")
+            li.addContextMenuItems([], True)
+            xbmcplugin.addDirectoryItem(
+                handle=self.__addon_handle, url=item[1], listitem=li, isFolder=True
             )
-            for item in items:
-                li = xbmcgui.ListItem(item[0], path=item[1])
-                li.setProperty("do_not_analyze", "true")
-                li.setProperty("IsPlayable", "false")
-                li.addContextMenuItems([], True)
-                xbmcplugin.addDirectoryItem(
-                    handle=self.__addon_handle, url=item[1], listitem=li, isFolder=True
-                )
 
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 

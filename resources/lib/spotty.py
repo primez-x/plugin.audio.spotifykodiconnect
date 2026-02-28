@@ -76,12 +76,14 @@ class Spotty:
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
+            # Use a larger buffer size for the pipe to improve reading performance (1MB vs default ~4KB)
             return subprocess.Popen(
                 args,
                 startupinfo=startupinfo,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 env=self.__spotty_rust_env,
+                bufsize=1048576,  # 1MB buffer for stdout
             )
         except Exception as ex:
             raise Exception(f"Run spotty error: {ex}")

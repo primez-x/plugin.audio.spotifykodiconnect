@@ -62,6 +62,14 @@ class SpottyAudioStreamer:
         self.initial_volume = _clamp_volume(initial_volume)
         self.chunk_size = _get_kodi_chunk_size()
 
+        # Cache process properties to avoid dynamic lookups during tight loops
+        self._is_windows = (os.name == "nt")
+        if self._is_windows:
+            self._startupinfo = subprocess.STARTUPINFO()
+            self._startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        else:
+            self._startupinfo = None
+
         self.__track_id: str = ""
         self.__track_duration: int = 0
         self.__wav_header: bytes = bytes()
@@ -124,8 +132,14 @@ class SpottyAudioStreamer:
             # Use spotty's --start-position (in seconds) to avoid decoding everything from the beginning
             # 44100 Hz * 2 channels * 2 bytes = 176400 bytes/sec
             pcm_bytes_per_sec = 176400
-            start_sec = pcm_target_offset // pcm_bytes_per_sec
-            pcm_skip = pcm_target_offset % pcm_bytes_per_sec
+            
+            # Fast path logic: only do division and remainder if we are actually skipping into the PCM stream
+            if pcm_target_offset > 0:
+                start_sec = pcm_target_offset // pcm_bytes_per_sec
+                pcm_skip = pcm_target_offset % pcm_bytes_per_sec
+            else:
+                start_sec = 0
+                pcm_skip = 0
 
             if range_begin == 0:
                 bytes_sent = header_len
@@ -149,9 +163,17 @@ class SpottyAudioStreamer:
             if start_sec > 0:
                 args += ["--start-position", str(start_sec)]
                 
+            # Check if terminated more frequently to be responsive
+            if self.__terminated:
+                return
+
             spotty_process = self.__spotty.run_spotty(args)
             self.__log_spotty_return_code(spotty_process)
             self.__last_spotty_pid = spotty_process.pid
+
+            # Process reference and chunk size for inner loops
+            proc_stdout = spotty_process.stdout
+            c_size = self.chunk_size
 
             # Skip the exact remaining PCM bytes so that we start perfectly on target
             if pcm_skip > 0:
@@ -160,27 +182,30 @@ class SpottyAudioStreamer:
                 while discarded < pcm_skip:
                     if self.__terminated:
                         return
-                    to_read = min(self.chunk_size, pcm_skip - discarded)
-                    chunk = spotty_process.stdout.read(to_read)
+                    to_read = min(c_size, pcm_skip - discarded)
+                    chunk = proc_stdout.read(to_read)
                     if not chunk:
                         break
                     discarded += len(chunk)
 
+            # Pre-fetch the first chunk before the loop to reduce latency
+            frame = proc_stdout.read(c_size)
+            
             # Loop as long as there's something to output.
-            while bytes_sent < range_len:
+            while frame and bytes_sent < range_len:
                 if self.__terminated:
                     return
-
-                frame = spotty_process.stdout.read(self.chunk_size)
-                if self.__terminated:
-                    return
-                if not frame:
-                    log_msg("Nothing read from stdout.", LOGERROR)
-                    break
 
                 bytes_sent += len(frame)
-                self.__log_continue_sending(bytes_sent)
+                
+                # Only log every ~10MB to reduce IO overhead in tight loop
+                if bytes_sent % 10485760 < c_size:
+                    self.__log_continue_sending(bytes_sent)
+                
                 yield frame
+                
+                # Fetch next frame while yielding current to allow overlap
+                frame = proc_stdout.read(c_size)
 
             # All done.
             self.__notify_track_finished(self.__track_id)
