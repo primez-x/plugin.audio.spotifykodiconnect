@@ -4,7 +4,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from typing import Any, Dict, List, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import xbmc
 import xbmcaddon
@@ -390,10 +390,12 @@ class PluginContent:
     def __get_track_list(
         self, tracks, append_artist_to_label: bool = False
     ) -> List[Tuple[str, xbmcgui.ListItem, bool]]:
-        return [
-            self.__get_track_item(track, append_artist_to_label) + (False,)
-            for track in tracks
-        ]
+        result = []
+        for track in tracks:
+            item = self.__get_track_item(track, append_artist_to_label)
+            if item is not None:
+                result.append(item + (False,))
+        return result
 
     def _track_album_description(self, track: Dict[str, Any], album: Dict[str, Any]) -> str:
         """Build album description from Spotify data (release date, genre). Label/copyright only in full album API."""
@@ -440,7 +442,19 @@ class PluginContent:
 
     def __get_track_item(
         self, track: Dict[str, Any], append_artist_to_label: bool = False
-    ) -> Tuple[str, xbmcgui.ListItem]:
+    ) -> Optional[Tuple[str, xbmcgui.ListItem]]:
+        # Unwrap Spotify playlist item format: { "track": { "id", "duration_ms", ... } }
+        # Only unwrap when "track" is a dict (nested track object); avoid setting track to None or non-dict
+        inner = track.get("track")
+        if isinstance(inner, dict):
+            track = inner
+        # Skip items that are not valid track dicts (e.g. playlist item with track=null)
+        if not isinstance(track, dict) or not track.get("id"):
+            return None
+        # Raw API track has "artists" list; ensure "artist" string exists for label/tag
+        if not track.get("artist") and track.get("artists"):
+            track = dict(track)
+            track["artist"] = " / ".join(a.get("name", "") for a in track["artists"] if a.get("name"))
         duration_sec = int((track.get("duration_ms") or 0) / 1000)
         label = self.__get_track_name(track, append_artist_to_label)
         title = label if self.append_artist_to_title else track["name"]
@@ -939,21 +953,25 @@ class PluginContent:
         # Batch add the first few tracks directly to start quickly
         batch_size = min(5, len(items))
         for track in items[:batch_size]:
-            url, li = self.__get_track_item(track, True)
-            kodi_playlist.add(url, li)
-            
+            item = self.__get_track_item(track, True)
+            if item is not None:
+                url, li = item
+                kodi_playlist.add(url, li)
+
         # Start playback immediately after first tracks are queued
         xbmc.Player().play(kodi_playlist)
 
-        # Process the rest in background 
+        # Process the rest in background
         if len(items) > batch_size:
             def add_remaining():
                 for track in items[batch_size:]:
                     if xbmc.Monitor().abortRequested():
                         return
                     try:
-                        u, listitem = self.__get_track_item(track, True)
-                        kodi_playlist.add(u, listitem)
+                        item = self.__get_track_item(track, True)
+                        if item is not None:
+                            u, listitem = item
+                            kodi_playlist.add(u, listitem)
                     except Exception:
                         pass
                     # Reduced sleep slightly to populate playlist faster, but yield to main thread
