@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<addon id="plugin.audio.spotify" version="1.3.14" name="Spotify" provider-name="glk1001">
+<addon id="plugin.audio.spotifykodiconnect" version="1.0.0" name="SpotifyKodiConnect" provider-name="SpotifyKodiConnect">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
         <import addon="xbmc.addon" version="18.9.701" />
@@ -15,15 +15,16 @@
     <extension library="service.py" point="xbmc.service" />
     <extension point="xbmc.addon.metadata">
         <platform>all</platform>
-        <summary lang="en_GB">Unofficial Spotify music plugin for Kodi</summary>
-        <description lang="en_GB">Allows you to use your Spotify premium account to connect and play Spotify through Kodi.</description>
+        <summary lang="en_GB">Spotify for Kodi with consistent art, metadata, and background loading (Kodi Connect style)</summary>
+        <description lang="en_GB">Unofficial Spotify music plugin for Kodi. Improves on the original Spotify addon with consistent album/artist art in all views (including playlists), correct metadata tags, and background loading so navigation and playback feel smooth. Requires Spotify Premium.</description>
         <disclaimer lang="en_GB">This product uses the SPOTIFY WEB API but is not endorsed, certified or otherwise approved in any way by Spotify. Spotify is the registered trademark of Spotify AB.</disclaimer>
-        <source>https://github.com/glk1001/plugin.audio.spotify</source>
-        <website>https://github.com/glk1001/glk1001.github.io</website>
-        <news>v1.3.14 (2025-02-10)
-Upgraded python 'bottle' module to version '0.14-dev'. Now works with python 3.13.
-1.3.13: Changed default album retrieval for 'artists' to just albums and singles instead of everything. And added more logging to figure how many cached/non-cached things the plugin is retrieving.
-1.3.12: Added a workaround setting "problem_with_terminate_streaming" to not terminate streaming early. Added for Raspberry Pi devices.
+        <source>https://github.com/</source>
+        <news>v1.0.0
+- Fork of plugin.audio.spotify with Kodi Connect–style improvements.
+- Consistent art: thumb, poster, fanart, and icon set for albums, artists, playlists, and tracks so every list view shows art.
+- Correct metadata: proper Kodi music info types (year, duration, tracknumber, albumartist, etc.) for reliable tagging.
+- Background precache: library precache runs in a thread so the main menu appears immediately.
+- Smoother playlist play: first track starts quickly; remaining tracks are queued in the background.
         </news>
         <assets>
             <icon>resources/icon.png</icon>

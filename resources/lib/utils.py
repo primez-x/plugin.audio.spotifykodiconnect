@@ -5,7 +5,7 @@ import signal
 import sys
 import time
 import unicodedata
-from traceback import format_exception
+import traceback
 from typing import Any, Dict, List, Tuple, Union
 
 import xbmc
@@ -15,14 +15,15 @@ import xbmcvfs
 from xbmc import LOGDEBUG, LOGINFO, LOGERROR
 
 DEBUG = True
-PROXY_PORT = 52308
 
-ADDON_ID = "plugin.audio.spotify"
+ADDON_ID = "plugin.audio.spotifykodiconnect"
 ADDON_DATA_PATH = xbmcvfs.translatePath(f"special://profile/addon_data/{ADDON_ID}")
 ADDON_WINDOW_ID = 10000
+# Different port so this addon can run alongside plugin.audio.spotify if needed
+PROXY_PORT = 52309
 
-KODI_PROPERTY_SPOTIFY_AUTH_TOKEN = "spotify-auth-token"
-KODI_PROPERTY_AUTH_TOKEN_EXPIRES_AT = "spotify-auth-token-expires-at"
+KODI_PROPERTY_SPOTIFY_AUTH_TOKEN = "spotifykodiconnect-auth-token"
+KODI_PROPERTY_AUTH_TOKEN_EXPIRES_AT = "spotifykodiconnect-auth-token-expires-at"
 
 
 def log_msg(msg: str, loglevel: int = LOGDEBUG, caller_name: str = "") -> None:
@@ -36,7 +37,7 @@ def log_msg(msg: str, loglevel: int = LOGDEBUG, caller_name: str = "") -> None:
 
 def log_exception(exc: Exception, exception_details: str) -> None:
     the_caller_name = get_formatted_caller_name(inspect.stack()[1][1], inspect.stack()[1][3])
-    log_msg(" ".join(format_exception(exc)), loglevel=LOGERROR, caller_name=the_caller_name)
+    log_msg(" ".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), loglevel=LOGERROR, caller_name=the_caller_name)
     log_msg(f"Exception --> {exception_details}.", loglevel=LOGERROR, caller_name=the_caller_name)
 
 
@@ -49,11 +50,15 @@ def get_time_str(raw_time: int) -> str:
 
 
 def get_username() -> str:
+    """
+    Best-effort Spotify username for display/logging.
+
+    Older versions stored a dedicated "username" setting; newer flows may not.
+    Treat a missing value as empty instead of raising so callers can still
+    show generic messages without failing.
+    """
     addon = xbmcaddon.Addon(id=ADDON_ID)
-    spotify_username = addon.getSetting("username")
-    if not spotify_username:
-        raise Exception("Could not get spotify username.")
-    return spotify_username
+    return addon.getSetting("username") or ""
 
 
 def kill_this_plugin() -> None:
@@ -62,9 +67,11 @@ def kill_this_plugin() -> None:
 
 def kill_process_by_pid(pid: int) -> None:
     try:
-        if platform.system() != "Windows":
+        if platform.system() == "Windows":
+            os.kill(pid, signal.SIGTERM)
+        else:
             os.kill(pid, signal.SIGKILL)
-    except OSError:
+    except (OSError, ProcessLookupError):
         pass
 
 
@@ -130,17 +137,13 @@ def cache_value_in_kodi(kodi_property_id: str, value: Any):
     win.setProperty(kodi_property_id, value)
 
 
-def get_cached_value_from_kodi(kodi_property_id: str, wait_ms: int = 500) -> Any:
+def get_cached_value_from_kodi(kodi_property_id: str, wait_ms: int = 100) -> Any:
     win = xbmcgui.Window(ADDON_WINDOW_ID)
-
-    count = 10
-    while count > 0:
+    for _ in range(50):
         value = win.getProperty(kodi_property_id)
         if value:
             return value
         xbmc.sleep(wait_ms)
-        count -= 1
-
     return None
 
 

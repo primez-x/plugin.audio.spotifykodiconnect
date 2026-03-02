@@ -1,26 +1,20 @@
 <?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <settings>
     <category label="11054">
-        <setting id="user_client_id" type="text" default="2eb96f9b37494be1824999d58028a305"
-                 label="11087" help="User's developer 'client_id'"/>
-        <setting id="my_recently_played_playlist_name" type="text" default="My Recently Played"
-                 label="11069" help="Disable by setting string to NONE"/>
-        <setting id="gap_between_playlist_tracks" type="number" default="0" label="11070"
-	         help="Gap between tracks when playing a playlist (secs)"/>
-        <setting id="use_spotify_normalization" type="bool" default="true" label="11075">
+        <setting id="spotify_passthrough" type="bool" default="false" label="Passthrough (OGG)" help="Use native Spotify OGG codec for faster playback (experimental). Disables when false uses PCM/WAV which is slower but more stable.">
           <control type="toggle"/>
         </setting>
-        <setting id="problem_with_terminate_streaming" type="bool" default="false" label="11086">
+        <setting id="spotify_normalization" type="labelenum" label="11075" help="11143" default="auto" lvalues="11134|11135|11136|11137" values="off|auto|track|album"/>
+        <setting id="spotify_autoplay" type="bool" default="false" label="11130" help="11131">
           <control type="toggle"/>
         </setting>
-    </category>
-
-    <category label="11055">
-        <setting id="categoryDefaultView" type="text" default="" label="11020"/>
-        <setting id="playlistDefaultView" type="text" default="" label="11031"/>
-        <setting id="artistDefaultView" type="text" default="" label="11032"/>
-        <setting id="albumDefaultView" type="text" default="" label="11033"/>
-        <setting id="songDefaultView" type="text" default="" label="11034"/>
-        <setting id="appendArtistToTitle" type="bool" default="false" label="11030"/>
+        <setting id="spotify_bitrate" type="labelenum" label="11138" help="11139" default="320" lvalues="11140|11141|11142" values="96|160|320"/>
+        <setting id="prebuffer_enabled" type="bool" default="true" label="11107">
+          <control type="toggle"/>
+        </setting>
+        <setting id="prebuffer_seconds" type="slider" default="15" label="11097" help="11098" range="5,1,30" option="int"/>
+        <setting id="broadcast_to_service_nexttrack" type="bool" default="true" label="11111" help="11112">
+          <control type="toggle"/>
+        </setting>
     </category>
 </settings>

@@ -124,22 +124,6 @@ msgctxt "#11055"
 msgid "Views"
 msgstr "Vistas"
 
-msgctxt "#11069"
-msgid "My recently played playlist"
-msgstr "Mi Playlist reproducida Recientemente"
-
-msgctxt "#11070"
-msgid "Gap between tracks when playing a playlist (secs)"
-msgstr "Espacio entre canciones cuando se reproduce una playlist (Segundos)"
-
-msgctxt "#11071"
-msgid ""
-"To give better audio streaming from Spotify, a video http rule was just added to 'userdata/playercorefactory.xml'.\n"
-"Please restart Kodi for this to take affect."
-msgstr ""
-"To give better audio streaming from Spotify, a video http rule was just added to 'userdata/playercorefactory.xml'.\n"
-"Please restart Kodi for this to take affect."
-
 msgctxt "#11072"
 msgid "Clear the plugin cache"
 msgstr "Limpiar cache del plugin"
@@ -155,8 +139,24 @@ msgid ""
 msgstr "Cache de base de datos del plugin exitosamente limpiada"
 
 msgctxt "#11075"
-msgid "Use Spotify normalization when playing tracks"
-msgstr "Usar Normalizacion de Spotify cuando reproduzca canciones"
+msgid "Spotify normalization"
+msgstr "Normalización de Spotify"
+
+msgctxt "#11134"
+msgid "Off"
+msgstr ""
+
+msgctxt "#11135"
+msgid "Auto"
+msgstr ""
+
+msgctxt "#11136"
+msgid "Track"
+msgstr ""
+
+msgctxt "#11137"
+msgid "Album"
+msgstr ""
 
 msgctxt "#11076"
 msgid "Authenticate the plugin"
@@ -228,6 +228,111 @@ msgctxt "#11086"
 msgid "Set to 'True', if there is a problem with early stream termination"
 msgstr "Set to 'True', if there is a problem with early stream termination"
 
-msgctxt "#11087"
-msgid "User's developer 'client_id'"
+msgctxt "#11097"
+msgid "Pre-buffer next track (seconds)"
 msgstr ""
+
+msgctxt "#11098"
+msgid "How many seconds of the next track to load in the background (5–30). Higher values reduce gap between tracks but use more memory."
+msgstr ""
+
+msgctxt "#11099"
+msgid "Enable Up Next"
+msgstr ""
+
+msgctxt "#11100"
+msgid "Show the built-in Next Track overlay near the end of the current track."
+msgstr ""
+
+msgctxt "#11106"
+msgid "Up Next"
+msgstr ""
+
+msgctxt "#11101"
+msgid "Preview duration (seconds)"
+msgstr ""
+
+msgctxt "#11102"
+msgid "How many seconds before the track ends to show the next track overlay (5–45). This value also drives the prebuffer duration (clamped to 5–30)."
+msgstr ""
+
+msgctxt "#11103"
+msgid "Next track"
+msgstr ""
+
+msgctxt "#11104"
+msgid "Play next"
+msgstr ""
+
+msgctxt "#11105"
+msgid "Close"
+msgstr ""
+
+msgctxt "#11107"
+msgid "Pre-buffer next track"
+msgstr ""
+
+msgctxt "#11108"
+msgid "When enabled, the prebuffer duration is derived from the Up Next preview duration (clamped to 5–30 seconds)."
+msgstr ""
+
+msgctxt "#11111"
+msgid "Broadcast to Next Track service"
+msgstr ""
+
+msgctxt "#11112"
+msgid "When enabled, sends next-track data to the Next Track service addon so it can show the next-track overlay. Disable if you use only the built-in overlay or another addon."
+msgstr ""
+
+msgctxt "#11122"
+msgid "Welcome"
+msgstr ""
+
+msgctxt "#11123"
+msgid "Go to radio"
+msgstr ""
+
+msgctxt "#11124"
+msgid "Radio"
+msgstr ""
+
+msgctxt "#11125"
+msgid "Add to liked songs"
+msgstr ""
+
+msgctxt "#11126"
+msgid "Remove from liked songs"
+msgstr ""
+
+msgctxt "#11130"
+msgid "Autoplay similar songs"
+msgstr ""
+
+msgctxt "#11131"
+msgid "When enabled, spotty will automatically play similar songs when your music ends (Spotify autoplay)."
+msgstr ""
+
+msgctxt "#11138"
+msgid "Streaming quality (bitrate)"
+msgstr ""
+
+msgctxt "#11139"
+msgid "Audio quality for all streams. Higher bitrate sounds better but uses more data. 320 kbps is Spotify Premium quality."
+msgstr ""
+
+msgctxt "#11140"
+msgid "96 kbps (low)"
+msgstr ""
+
+msgctxt "#11141"
+msgid "160 kbps (medium)"
+msgstr ""
+
+msgctxt "#11142"
+msgid "320 kbps (high)"
+msgstr ""
+
+msgctxt "#11143"
+msgid "Controls which Spotify normalization gain value is applied. Auto uses Spotify's default; Track and Album normalize to the respective gain value; Off disables normalization."
+msgstr ""
+

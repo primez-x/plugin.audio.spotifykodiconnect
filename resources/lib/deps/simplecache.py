@@ -92,10 +92,15 @@ class SimpleCache(object):
         cur_time = datetime.datetime.now()
         lastexecuted = self._win.getProperty("simplecache.clean.lastexecuted")
         if not lastexecuted:
-            self._win.setProperty("simplecache.clean.lastexecuted", repr(cur_time))
-        elif (eval(lastexecuted) + self._auto_clean_interval) < cur_time:
-            # cleanup needed...
-            self._do_cleanup()
+            self._win.setProperty("simplecache.clean.lastexecuted", cur_time.isoformat())
+        else:
+            try:
+                last_dt = datetime.datetime.fromisoformat(lastexecuted)
+            except (ValueError, TypeError):
+                last_dt = cur_time
+                self._win.setProperty("simplecache.clean.lastexecuted", cur_time.isoformat())
+            if (last_dt + self._auto_clean_interval) < cur_time:
+                self._do_cleanup()
 
     def _get_mem_cache(self, endpoint, checksum, cur_time, json_data):
         '''
@@ -106,10 +111,14 @@ class SimpleCache(object):
         cachedata = self._win.getProperty(endpoint)
 
         if cachedata:
-            if json_data or self.data_is_json:
+            try:
                 cachedata = json.loads(cachedata)
-            else:
-                cachedata = eval(cachedata)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                self._win.clearProperty(endpoint)
+                return None
+            if not isinstance(cachedata, (list, tuple)) or len(cachedata) < 3:
+                self._win.clearProperty(endpoint)
+                return None
             if cachedata[0] > cur_time:
                 if not checksum or checksum == cachedata[2]:
                     result = cachedata[1]
@@ -121,10 +130,7 @@ class SimpleCache(object):
             usefull for (stateless) plugins
         '''
         cachedata = (expires, data, checksum)
-        if json_data or self.data_is_json:
-            cachedata_str = json.dumps(cachedata)
-        else:
-            cachedata_str = repr(cachedata)
+        cachedata_str = json.dumps(cachedata)
         self._win.setProperty(endpoint, cachedata_str)
 
 
@@ -137,11 +143,13 @@ class SimpleCache(object):
             cache_data = cache_data.fetchone()
             if cache_data and cache_data[0] > cur_time:
                 if not checksum or cache_data[2] == checksum:
-                    if json_data or self.data_is_json:
+                    try:
                         result = json.loads(cache_data[1])
-                    else:
-                        result = eval(cache_data[1])
-                    # also set result in memory cache for further access
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        self._execute_sql(
+                            "DELETE FROM simplecache WHERE id = ?", (endpoint,)
+                        )
+                        return None
                     if self.enable_mem_cache:
                         self._set_mem_cache(endpoint, checksum, cache_data[0], result, json_data)
         return result
@@ -149,10 +157,7 @@ class SimpleCache(object):
     def _set_db_cache(self, endpoint, checksum, expires, data, json_data):
         ''' store cache data in _database '''
         query = "INSERT OR REPLACE INTO simplecache( id, expires, data, checksum) VALUES (?, ?, ?, ?)"
-        if json_data or self.data_is_json:
-            data = json.dumps(data)
-        else:
-            data = repr(data)
+        data = json.dumps(data)
         self._execute_sql(query, (endpoint, expires, data, checksum))
 
     def _do_cleanup(self):
@@ -189,7 +194,7 @@ class SimpleCache(object):
 
         # remove task from list
         self._busy_tasks.remove(__name__)
-        self._win.setProperty("simplecache.clean.lastexecuted", repr(cur_time))
+        self._win.setProperty("simplecache.clean.lastexecuted", cur_time.isoformat())
         self._win.clearProperty("simplecachecleanbusy")
         self._log_msg("Auto cleanup done")
 
@@ -240,7 +245,7 @@ class SimpleCache(object):
                         result = _database.execute(query)
                     return result
                 except sqlite3.OperationalError as error:
-                    if "_database is locked" in error:
+                    if "locked" in str(error):
                         self._log_msg("retrying DB commit...")
                         retries += 1
                         self._monitor.waitForAbort(0.5)

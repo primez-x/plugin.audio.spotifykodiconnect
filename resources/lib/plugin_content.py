@@ -1,26 +1,32 @@
 import math
 import os
 import sys
+import threading
 import time
 import urllib.parse
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
+import simplecache
+import spotipy
+import spotty
+import utils
 import xbmc
 import xbmcaddon
 import xbmcgui
 import xbmcplugin
 import xbmcvfs
-
-import main_service
-import simplecache
-import spotipy
-import spotty
-import utils
-from spotipy import SpotifyException
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import *
-from utils import ADDON_ID, PROXY_PORT, log_exception, log_msg, get_chunks
+from utils import (
+    ADDON_ID,
+    ADDON_WINDOW_ID,
+    LOGINFO,
+    PROXY_PORT,
+    get_chunks,
+    log_exception,
+    log_msg,
+)
 
 MUSIC_ARTISTS_ICON = "icon_music_artists.png"
 MUSIC_TOP_ARTISTS_ICON = "icon_music_top_artists.png"
@@ -32,6 +38,12 @@ MUSIC_LIBRARY_ICON = "icon_music_library.png"
 MUSIC_SEARCH_ICON = "icon_music_search.png"
 MUSIC_EXPLORE_ICON = "icon_music_explore.png"
 CLEAR_CACHE_ICON = "icon_clear_cache.png"
+
+# Bump this when the cached data structure changes (e.g. new fields pulled
+# from the Spotify API, different track/album/artist dict shapes, serialisation
+# format changes).  Any value different from what is already stored will
+# automatically invalidate every cached entry.
+CACHE_SCHEMA_VERSION = "2"
 
 Playlist = Dict[str, Union[str, Dict[str, List[Any]]]]
 
@@ -49,10 +61,53 @@ def _get_len(items) -> int:
     return len(items)
 
 
+def _art_for_item(thumb_url: str, fallback_icon_path: str = None) -> Dict[str, str]:
+    """Build full Kodi art dict (thumb, poster, fanart, icon) so every view shows art."""
+    url = thumb_url or ""
+    if not url and fallback_icon_path:
+        url = fallback_icon_path
+    if not url:
+        return {}
+    return {
+        "thumb": url,
+        "poster": url,
+        "fanart": url,
+        "icon": url,
+    }
+
+
+def _art_for_track(
+    track: Dict[str, Any], fallback_icon_path: str = None, artist_fanart: str = None
+) -> Dict[str, str]:
+    """Build Kodi art from Spotify album.images; use largest (640) for all art so every location stays sharp.
+    If artist_fanart is set, add artist.fanart for Artist slideshow / Music OSD background."""
+    album = track.get("album") or {}
+    images = (album.get("images") or []) if isinstance(album, dict) else []
+    if images:
+        # Spotify: images sorted by width descending; [0]=largest (typically 640x640)
+        largest = images[0].get("url") or ""
+        if largest:
+            art = {
+                "fanart": largest,
+                "poster": largest,
+                "thumb": largest,
+                "icon": largest,
+            }
+            if artist_fanart:
+                art["artist.fanart"] = artist_fanart
+            return art
+    base = _art_for_item(track.get("thumb") or "", fallback_icon_path)
+    if artist_fanart and base:
+        base["artist.fanart"] = artist_fanart
+    return base
+
+
 class PluginContent:
     __addon: xbmcaddon.Addon = xbmcaddon.Addon(id=ADDON_ID)
     __win: xbmcgui.Window = xbmcgui.Window(utils.ADDON_WINDOW_ID)
-    __addon_icon_path = os.path.join(__addon.getAddonInfo("path"), "resources")
+    __addon_icon_path = os.path.join(
+        xbmcvfs.translatePath(__addon.getAddonInfo("path")), "resources"
+    )
     __action = ""
     __spotty: spotty.Spotty = None
     __spotipy: spotipy.Spotify = None
@@ -81,15 +136,6 @@ class PluginContent:
 
             self.cache: simplecache.SimpleCache = simplecache.SimpleCache(ADDON_ID)
 
-            self.append_artist_to_title: bool = (
-                self.__addon.getSetting("appendArtistToTitle") == "true"
-            )
-            self.default_view_songs: str = self.__addon.getSetting("songDefaultView")
-            self.default_view_artists: str = self.__addon.getSetting("artistDefaultView")
-            self.default_view_playlists: str = self.__addon.getSetting("playlistDefaultView")
-            self.default_view_albums: str = self.__addon.getSetting("albumDefaultView")
-            self.default_view_category: str = self.__addon.getSetting("categoryDefaultView")
-
             self.__spotty: spotty.Spotty = spotty.get_spotty(SpottyHelper())
 
             self.check_auth_and_refresh_spotipy()
@@ -98,12 +144,19 @@ class PluginContent:
 
             if self.__action:
                 log_msg(f"Evaluating action '{self.__action}'.")
-                action = f"self.{self.__action}"
-                eval(action)()
+                handler = self._get_action_handler(self.__action)
+                if handler:
+                    handler()
+                else:
+                    log_msg(f"Unknown action '{self.__action}'.", LOGINFO)
+                    xbmcplugin.endOfDirectory(handle=self.__addon_handle)
             else:
-                log_msg("Browsing main and setting up precache library.")
+                log_msg("Browsing main and starting background precache.")
                 self.__browse_main()
-                self.__precache_library()
+                precache_thread = threading.Thread(
+                    target=self.__precache_library, daemon=True
+                )
+                precache_thread.start()
 
         except Exception as exc:
             log_exception(exc, "PluginContent init error")
@@ -112,20 +165,9 @@ class PluginContent:
     def check_auth_and_refresh_spotipy(self):
         auth_token: str = utils.get_cached_auth_token()
         if auth_token:
-            log_msg(f"Got cached auth_token '{auth_token}'.")
-            try_authenticate = False
-            try:
-                self.init_spotipy(auth_token)
-            except SpotifyException as exc:
-                log_exception(exc, f"HTTPError init_spotipy error: http_status = {exc.http_status}")
-                if exc.http_status == 401:
-                    try_authenticate = True
-            except Exception as exc:
-                log_exception(exc, "PluginContent init_spotipy error")
-            if not try_authenticate:
-                return
+            self.init_spotipy(auth_token)
+            return
 
-        log_msg(f"Cold not get valid cached auth_token. Attempting to authenticate.")
         self.authenticate_plugin_after_login_failure()
 
     def refresh_spotipy(self):
@@ -134,35 +176,38 @@ class PluginContent:
             xbmcplugin.endOfDirectory(handle=self.__addon_handle)
             return
 
-        log_msg(f"Got auth_token '{auth_token}'.")
+        log_msg("Got auth_token (refreshed).")
 
         self.init_spotipy(auth_token)
 
     def init_spotipy(self, auth_token: str) -> None:
         self.__spotipy: spotipy.Spotify = spotipy.Spotify(auth=auth_token)
-        self.__userid: str = self.__spotipy.me()["id"]
-        self.__username: str = self.__spotipy.me()["email"]
-        self.__user_country = self.__spotipy.me()["country"]
+        me = self.__spotipy.me()
+        self.__userid = me["id"]
+        self.__username = me.get("email") or me.get("id") or ""
+        self.__user_country = me.get("country") or ""
 
     def authenticate_plugin_after_login_failure(self) -> None:
         self.authenticate_plugin(
-            self.__addon.getLocalizedString(AUTHENTICATE_INSTRUCTIONS_AFTER_LOGIN_FAIL_STR_ID)
+            self.__addon.getLocalizedString(
+                AUTHENTICATE_INSTRUCTIONS_AFTER_LOGIN_FAIL_STR_ID
+            )
         )
 
     def authenticate_plugin_request(self) -> None:
-        self.authenticate_plugin(self.__addon.getLocalizedString(AUTHENTICATE_INSTRUCTIONS_STR_ID))
+        self.authenticate_plugin(
+            self.__addon.getLocalizedString(AUTHENTICATE_INSTRUCTIONS_STR_ID)
+        )
 
     def authenticate_plugin(self, instructions: str) -> None:
         dialog = xbmcgui.Dialog()
         dialog_title = self.__addon.getAddonInfo("name")
 
-        client_id = self.__addon.getSetting("user_client_id")
-        spotty_auth = SpottyAuth(self.__spotty, client_id)
+        spotty_auth = SpottyAuth(self.__spotty)
 
         zeroconf_auth = spotty_auth.start_zeroconf_authenticate()
         if zeroconf_auth is None:
             dialog.ok(dialog_title, self.get_zeroconf_program_failed_msg(spotty_auth))
-            main_service.abort_main_service = True
             utils.kill_this_plugin()
             return
 
@@ -171,8 +216,9 @@ class PluginContent:
         zeroconf_auth.terminate()
 
         if not spotty_auth.zeroconf_authenticated_ok():
-            dialog.ok(dialog_title, self.get_zeroconf_authentication_failed_msg(spotty_auth))
-            main_service.abort_main_service = True
+            dialog.ok(
+                dialog_title, self.get_zeroconf_authentication_failed_msg(spotty_auth)
+            )
             utils.kill_this_plugin()
             return
 
@@ -237,21 +283,79 @@ class PluginContent:
         if filt:
             self.__filter = filt[0]
 
+    _ALLOWED_ACTIONS = frozenset(
+        {
+            "browse_main_library",
+            "browse_main_explore",
+            "browse_album",
+            "browse_playlist",
+            "play_playlist",
+            "browse_category",
+            "browse_playlists",
+            "browse_new_releases",
+            "browse_saved_albums",
+            "browse_saved_tracks",
+            "browse_saved_artists",
+            "browse_followed_artists",
+            "browse_top_artists",
+            "browse_top_tracks",
+            "browse_artist_everything",
+            "browse_artist_just_albums",
+            "browse_artist_just_singles",
+            "browse_artist_just_albums_and_singles",
+            "browse_artist_just_compilations",
+            "browse_artist_just_appears_on",
+            "artist_top_tracks",
+            "related_artists",
+            "browse_radio",
+            "search",
+            "search_artists",
+            "search_tracks",
+            "search_albums",
+            "search_playlists",
+            "follow_playlist",
+            "unfollow_playlist",
+            "follow_artist",
+            "unfollow_artist",
+            "save_album",
+            "remove_album",
+            "save_track",
+            "remove_track",
+            "add_track_to_playlist",
+            "remove_track_from_playlist",
+            "delete_cache_db",
+            "refresh_listing",
+            "toggle_liked",
+            "authenticate_plugin_request",
+        }
+    )
+
+    def _get_action_handler(self, action: str):
+        """Return bound method for action name from explicit allowlist."""
+        if not action or action not in self._ALLOWED_ACTIONS:
+            return None
+        meth = getattr(self, action, None)
+        return meth if callable(meth) else None
+
     def __cache_checksum(self, opt_value: Any = None) -> str:
-        """simple cache checksum based on a few most important values"""
+        """Simple cache checksum based on library counts. Cached after first computation.
+
+        Includes CACHE_SCHEMA_VERSION so that any change to the data shape
+        (new API fields, serialisation format, etc.) automatically invalidates
+        every previously-cached entry without requiring a manual cache clear.
+        """
         result = self.__cached_checksum
         if not result:
-            # log_msg("__cached_checksum not found. Getting a new one.")
             saved_tracks = self.__get_saved_track_ids()
             saved_albums = self.__get_saved_album_ids()
             followed_artists = self.__get_followed_artists()
             generic_checksum = self.__addon.getSetting("cache_checksum")
             result = (
-                f"{len(saved_tracks)}-{len(saved_albums)}-{len(followed_artists)}"
+                f"v{CACHE_SCHEMA_VERSION}"
+                f"-{len(saved_tracks)}-{len(saved_albums)}-{len(followed_artists)}"
                 f"-{generic_checksum}"
             )
             self.__cached_checksum = result
-            # log_msg(f"New __cached_checksum = '{self.__cached_checksum}'.")
 
         if opt_value:
             result += f"-{opt_value}"
@@ -259,22 +363,23 @@ class PluginContent:
         return result
 
     def __build_url(self, query: Dict[str, str]) -> str:
-        query_encoded = {}
-        for key, value in list(query.items()):
-            if isinstance(key, str):
-                key = key.encode("utf-8")
-            if isinstance(value, str):
-                value = value.encode("utf-8")
-            query_encoded[key] = value
-
-        return self.__base_url + "?" + urllib.parse.urlencode(query_encoded)
+        return (
+            self.__base_url
+            + "?"
+            + urllib.parse.urlencode(
+                [(k, str(v)) for k, v in query.items() if v is not None]
+            )
+        )
 
     def delete_cache_db(self) -> None:
         log_msg("Deleting plugin cache...")
         simple_db_cache_addon = xbmcaddon.Addon(ADDON_ID)
         db_path = simple_db_cache_addon.getAddonInfo("profile")
         db_file = xbmcvfs.translatePath(f"{db_path}/simplecache.db")
-        os.remove(db_file)
+        try:
+            os.remove(db_file)
+        except OSError:
+            pass
         log_msg(f"Deleted simplecache database file {db_file}.")
 
         dialog = xbmcgui.Dialog()
@@ -283,13 +388,48 @@ class PluginContent:
         dialog.ok(header, msg)
 
     def refresh_listing(self) -> None:
-        self.__addon.setSetting("cache_checksum", time.strftime("%Y%m%d%H%M%S", time.gmtime()))
+        self.__addon.setSetting(
+            "cache_checksum", time.strftime("%Y%m%d%H%M%S", time.gmtime())
+        )
         log_msg(f"New cache_checksum = '{self.__addon.getSetting('cache_checksum')}'")
         xbmc.executebuiltin("Container.Refresh")
 
-    def __add_track_listitems(self, tracks, append_artist_to_label: bool = False) -> None:
+    def toggle_liked(self) -> None:
+        """Add or remove current track from liked songs (for OSD button). Uses trackid param or Window property."""
+        track_id = self.__track_id
+        if not track_id:
+            track_id = (
+                xbmcgui.Window(ADDON_WINDOW_ID).getProperty("Spotify.CurrentTrackId")
+                or ""
+            )
+        if not track_id:
+            xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+            return
+        self.__track_id = track_id
+        win = xbmcgui.Window(ADDON_WINDOW_ID)
+        try:
+            # Query Spotify directly for the authoritative liked state.
+            # The window property may be stale or empty (e.g. during a buffering
+            # reset), so relying on it would always toggle in the wrong direction.
+            result = self.__spotipy.current_user_saved_tracks_contains([track_id])
+            liked = bool(result and result[0])
+            if liked:
+                self.__spotipy.current_user_saved_tracks_delete([track_id])
+                win.setProperty("Spotify.CurrentTrackLiked", "false")
+            else:
+                self.__spotipy.current_user_saved_tracks_add([track_id])
+                win.setProperty("Spotify.CurrentTrackLiked", "true")
+        except Exception as exc:
+            log_exception(exc, "toggle_liked failed")
+        xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+
+    def __add_track_listitems(
+        self, tracks, append_artist_to_label: bool = False
+    ) -> None:
         list_items = self.__get_track_list(tracks, append_artist_to_label)
-        xbmcplugin.addDirectoryItems(self.__addon_handle, list_items, totalItems=len(list_items))
+        xbmcplugin.addDirectoryItems(
+            self.__addon_handle, list_items, totalItems=len(list_items)
+        )
 
     @staticmethod
     def __get_track_name(track, append_artist_to_label: bool) -> str:
@@ -307,43 +447,145 @@ class PluginContent:
     def __get_track_list(
         self, tracks, append_artist_to_label: bool = False
     ) -> List[Tuple[str, xbmcgui.ListItem, bool]]:
-        list_items = []
-        for count, track in enumerate(tracks):
-            list_items.append(self.__get_track_item(track, append_artist_to_label) + (False,))
+        result = []
+        for track in tracks:
+            item = self.__get_track_item(track, append_artist_to_label)
+            if item is not None:
+                result.append(item + (False,))
+        return result
 
-        return list_items
+    def _track_album_description(
+        self, track: Dict[str, Any], album: Dict[str, Any]
+    ) -> str:
+        """Build album description from Spotify data (release date, genre). Label/copyright only in full album API."""
+        parts = []
+        release_date = (album or {}).get("release_date") or ""
+        if release_date:
+            parts.append("Released %s." % release_date)
+        label = (album or {}).get("label")
+        if label:
+            parts.append("Label: %s." % label)
+        copyrights = (album or {}).get("copyrights")
+        if copyrights and isinstance(copyrights, list):
+            texts = [c.get("text") for c in copyrights if c.get("text")]
+            if texts:
+                parts.append(" ".join(texts))
+        genre = track.get("genre")
+        if genre:
+            g = genre if isinstance(genre, str) else " / ".join(genre) if genre else ""
+            if g:
+                parts.append("Genre: %s." % g)
+        return " ".join(parts).strip() if parts else ""
+
+    def _track_artist_description(self, track: Dict[str, Any]) -> str:
+        """Build artist description from Spotify data (genres, followers). No biography in API."""
+        parts = []
+        if track.get("artist_genres"):
+            genres = track["artist_genres"]
+            g = (
+                genres
+                if isinstance(genres, str)
+                else ", ".join(genres)
+                if genres
+                else ""
+            )
+            if g:
+                parts.append("Genres: %s." % g)
+        elif track.get("genre"):
+            g = (
+                track["genre"]
+                if isinstance(track["genre"], str)
+                else " / ".join(track["genre"])
+            )
+            if g:
+                parts.append("Genre: %s." % g)
+        followers = track.get("artist_followers")
+        if followers is not None and followers >= 0:
+            if followers >= 1_000_000:
+                parts.append("%.1fM followers." % (followers / 1_000_000))
+            elif followers >= 1_000:
+                parts.append("%.1fK followers." % (followers / 1_000))
+            else:
+                parts.append("%d followers." % followers)
+        return " ".join(parts).strip() if parts else ""
 
     def __get_track_item(
         self, track: Dict[str, Any], append_artist_to_label: bool = False
-    ) -> Tuple[str, xbmcgui.ListItem]:
-        duration = track["duration_ms"] / 1000
+    ) -> Optional[Tuple[str, xbmcgui.ListItem]]:
+        # Unwrap Spotify playlist item format: { "track": { "id", "duration_ms", ... } }
+        # Only unwrap when "track" is a dict (nested track object); avoid setting track to None or non-dict
+        inner = track.get("track")
+        if isinstance(inner, dict):
+            track = inner
+        # Skip items that are not valid track dicts (e.g. playlist item with track=null)
+        if not isinstance(track, dict) or not track.get("id"):
+            return None
+        # Raw API track has "artists" list; ensure "artist" string exists for label/tag
+        if not track.get("artist") and track.get("artists"):
+            track = dict(track)
+            track["artist"] = " / ".join(
+                a.get("name", "") for a in track["artists"] if a.get("name")
+            )
+        duration_sec = max(1, math.ceil((track.get("duration_ms") or 0) / 1000))
         label = self.__get_track_name(track, append_artist_to_label)
-        title = label if self.append_artist_to_title else track["name"]
+        title = track["name"]
+        album = track.get("album") or {}
+        album_name = (album.get("name") or "") if isinstance(album, dict) else ""
+        release_date = (
+            (album.get("release_date") or "") if isinstance(album, dict) else ""
+        )
+        year = int(track.get("year") or 0)
+        genre = track.get("genre")
+        genres_list = []
+        if genre is not None:
+            if isinstance(genre, str) and genre:
+                genres_list = [genre]
+            elif isinstance(genre, (list, tuple)) and genre:
+                genres_list = [str(g) for g in genre if g]
 
         # Local playback by using proxy on this machine.
-        url = f"http://localhost:{PROXY_PORT}/track/{track['id']}/{duration}"
+        url = f"http://localhost:{PROXY_PORT}/track/{track['id']}/{duration_sec}"
 
         li = xbmcgui.ListItem(label, offscreen=True)
         li.setProperty("isPlayable", "true")
-        li.setInfo(
-            "music",
-            {
-                "title": title,
-                "genre": track["genre"],
-                "year": track["year"],
-                "tracknumber": track["track_number"],
-                "album": track["album"]["name"],
-                "artist": track["artist"],
-                "rating": track["rating"],
-                "duration": duration,
-            },
+
+        # Kodi native music format via InfoTagMusic (avoids setInfo deprecation)
+        tag = li.getMusicInfoTag()
+        tag.setTitle(title)
+        tag.setAlbum(album_name)
+        tag.setArtist(track.get("artist") or "")
+        tag.setDuration(duration_sec)
+        tag.setYear(year)
+        tag.setTrack(int(track.get("track_number") or 0))
+        tag.setDisc(int(track.get("disc_number") or 1))
+        tag.setRating(int(track.get("rating") or 0))
+        tag.setMediaType("song")
+        tag.setURL(url)
+        if release_date:
+            tag.setReleaseDate(release_date)
+        if genres_list:
+            tag.setGenres(genres_list)
+        if isinstance(album, dict) and album.get("album_type") == "compilation":
+            tag.setAlbumArtist("Various Artists")
+
+        # Additional song info from Spotify only (OSD/skin)
+        album_desc = self._track_album_description(track, album)
+        artist_desc = self._track_artist_description(track)
+        if album_desc:
+            li.setProperty("Album_Description", album_desc)
+        if artist_desc:
+            li.setProperty("Artist_Description", artist_desc)
+
+        li.setArt(
+            _art_for_track(
+                track, "DefaultMusicSongs.png", track.get("artist_fanart") or ""
+            )
         )
-        li.setArt({"thumb": track["thumb"]})
         li.setProperty("spotifytrackid", track["id"])
         li.setContentLookup(False)
-        li.addContextMenuItems(track["contextitems"], True)
+        li.addContextMenuItems(track.get("contextitems") or [], True)
         li.setProperty("do_not_analyze", "true")
-        li.setMimeType("audio/wave")
+        li.setMimeType("audio/x-wav")
 
         return url, li
 
@@ -461,19 +703,20 @@ class PluginContent:
 
     def browse_top_artists(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "artists")
-        result = self.__spotipy.current_user_top_artists(limit=20, offset=0)
-
         cache_str = f"spotify.topartists.{self.__userid}"
-        checksum = self.__cache_checksum(result["total"])
+        checksum = self.__cache_checksum()
         artists = self.cache.get(cache_str, checksum=checksum)
         if artists:
-            cache_log(f'Retrieved {len(artists)} cached top artists for user "{self.__userid}".')
+            cache_log(
+                f'Retrieved {len(artists)} cached top artists for user "{self.__userid}".'
+            )
         else:
+            result = self.__spotipy.current_user_top_artists(limit=50, offset=0)
             count = len(result["items"])
             while result["total"] > count:
-                result["items"] += self.__spotipy.current_user_top_artists(limit=20, offset=count)[
-                    "items"
-                ]
+                result["items"] += self.__spotipy.current_user_top_artists(
+                    limit=50, offset=count
+                )["items"]
                 count += 50
             artists = self.__prepare_artist_listitems(result["items"])
             self.cache.set(cache_str, artists, checksum=checksum)
@@ -484,19 +727,18 @@ class PluginContent:
 
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_artists:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_artists})")
 
     def browse_top_tracks(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "songs")
-        results = self.__spotipy.current_user_top_tracks(limit=20, offset=0)
-
         cache_str = f"spotify.toptracks.{self.__userid}"
-        checksum = self.__cache_checksum(results["total"])
+        checksum = self.__cache_checksum()
         tracks = self.cache.get(cache_str, checksum=checksum)
         if tracks:
-            cache_log(f'Retrieved {len(tracks)} cached top tracks for user "{self.__userid}".')
+            cache_log(
+                f'Retrieved {len(tracks)} cached top tracks for user "{self.__userid}".'
+            )
         else:
+            results = self.__spotipy.current_user_top_tracks(limit=50, offset=0)
             tracks = results["items"]
             while results["next"]:
                 results = self.__spotipy.next(results)
@@ -510,8 +752,6 @@ class PluginContent:
 
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_songs:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
     def __get_explore_categories(self) -> List[Tuple[Any, str, Union[str, Any]]]:
         items = []
@@ -522,7 +762,10 @@ class PluginContent:
         count = len(categories["categories"]["items"])
         while categories["categories"]["total"] > count:
             categories["categories"]["items"] += self.__spotipy.categories(
-                country=self.__user_country, limit=50, offset=count, locale=self.__user_country
+                country=self.__user_country,
+                limit=50,
+                offset=count,
+                locale=self.__user_country,
             )["categories"]["items"]
             count += 50
 
@@ -546,7 +789,9 @@ class PluginContent:
         # Explore nodes.
         xbmcplugin.setContent(self.__addon_handle, "files")
         xbmcplugin.setProperty(
-            self.__addon_handle, "FolderName", self.__addon.getLocalizedString(EXPLORE_STR_ID)
+            self.__addon_handle,
+            "FolderName",
+            self.__addon.getLocalizedString(EXPLORE_STR_ID),
         )
         items = [
             (
@@ -596,7 +841,9 @@ class PluginContent:
                 for track in tracks:
                     track_ids.append(track["id"])
                 count += 50
-            album_tracks = self.__prepare_track_listitems(track_ids, album_details=album)
+            album_tracks = self.__prepare_track_listitems(
+                track_ids, album_details=album
+            )
             self.cache.set(cache_str, album_tracks, checksum=checksum)
             cache_log(
                 f'Retrieved {album["tracks"]["total"]} UNCACHED tracks for album "{album["name"]}".'
@@ -606,7 +853,16 @@ class PluginContent:
 
     def browse_album(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "songs")
-        album = self.__spotipy.album(self.__album_id, market=self.__user_country)
+
+        # Performance optimization: check cache first to avoid API call
+        cache_str = f"spotify.album.{self.__album_id}"
+        checksum = self.__cache_checksum()
+        album = self.cache.get(cache_str, checksum=checksum)
+
+        if not album:
+            album = self.__spotipy.album(self.__album_id, market=self.__user_country)
+            self.cache.set(cache_str, album, checksum=checksum)
+
         xbmcplugin.setProperty(self.__addon_handle, "FolderName", album["name"])
         tracks = self.__get_album_tracks(album)
         if album.get("album_type") == "compilation":
@@ -617,11 +873,11 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_TRACKNUM)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_TITLE)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_VIDEO_YEAR)
-        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_SONG_RATING)
+        xbmcplugin.addSortMethod(
+            self.__addon_handle, xbmcplugin.SORT_METHOD_SONG_RATING
+        )
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_ARTIST)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_songs:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
     def artist_top_tracks(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "songs")
@@ -630,17 +886,31 @@ class PluginContent:
             "FolderName",
             self.__addon.getLocalizedString(ARTIST_TOP_TRACKS_STR_ID),
         )
-        tracks = self.__spotipy.artist_top_tracks(self.__artist_id, country=self.__user_country)
-        tracks = self.__prepare_track_listitems(tracks=tracks["tracks"])
+
+        # Performance optimization: check cache first to avoid API call
+        cache_str = f"spotify.artisttoptracks.{self.__artist_id}"
+        checksum = self.__cache_checksum()
+        tracks_data = self.cache.get(cache_str, checksum=checksum)
+
+        if tracks_data:
+            cache_log(f'Retrieved cached top tracks for artist "{self.__artist_id}".')
+            tracks = tracks_data
+        else:
+            tracks_result = self.__spotipy.artist_top_tracks(
+                self.__artist_id, country=self.__user_country
+            )
+            tracks = self.__prepare_track_listitems(tracks=tracks_result["tracks"])
+            self.cache.set(cache_str, tracks, checksum=checksum)
+
         self.__add_track_listitems(tracks)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_TRACKNUM)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_TITLE)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_VIDEO_YEAR)
-        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_SONG_RATING)
+        xbmcplugin.addSortMethod(
+            self.__addon_handle, xbmcplugin.SORT_METHOD_SONG_RATING
+        )
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_songs:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
     def related_artists(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "artists")
@@ -653,7 +923,9 @@ class PluginContent:
         checksum = self.__cache_checksum()
         artists = self.cache.get(cache_str, checksum=checksum)
         if artists:
-            cache_log(f'Retrieved {len(artists)} cached related artists for "{self.__artist_id}".')
+            cache_log(
+                f'Retrieved {len(artists)} cached related artists for "{self.__artist_id}".'
+            )
         else:
             artists = self.__spotipy.artist_related_artists(self.__artist_id)
             artists = self.__prepare_artist_listitems(artists["artists"])
@@ -664,21 +936,75 @@ class PluginContent:
         self.__add_artist_listitems(artists)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_artists:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_artists})")
+
+    def browse_radio(self) -> None:
+        """Show recommended tracks (radio station) from artist and/or track seed."""
+        seed_artists = []
+        seed_tracks = []
+        if self.__artist_id:
+            seed_artists = [self.__artist_id]
+        if self.__track_id:
+            seed_tracks = [self.__track_id]
+        if not seed_artists and not seed_tracks:
+            xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+            return
+        try:
+            result = self.__spotipy.recommendations(
+                seed_artists=seed_artists if seed_artists else None,
+                seed_tracks=seed_tracks if seed_tracks else None,
+                limit=50,
+                country=self.__user_country,
+            )
+        except Exception as exc:
+            log_exception(exc, "browse_radio recommendations failed")
+            xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+            return
+        tracks = result.get("tracks") or []
+        if not tracks:
+            xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+            return
+        if self.__artist_name:
+            folder_name = (
+                f"{self.__artist_name} {self.__addon.getLocalizedString(RADIO_STR_ID)}"
+            )
+        else:
+            folder_name = self.__addon.getLocalizedString(RADIO_STR_ID)
+        xbmcplugin.setContent(self.__addon_handle, "songs")
+        xbmcplugin.setProperty(self.__addon_handle, "FolderName", folder_name)
+        prepared = self.__prepare_track_listitems(tracks=tracks)
+        self.__add_track_listitems(prepared, True)
+        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
+        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_TITLE)
+        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_ARTIST)
+        xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
     def __get_playlist_details(self, playlist_id: str) -> Playlist:
         playlist = self.__spotipy.playlist(
-            playlist_id, fields="tracks(total),name,owner(id),id", market=self.__user_country
+            playlist_id,
+            fields="tracks(total),name,owner(id),id,snapshot_id",
+            market=self.__user_country,
         )
-        # Get from cache first.
         cache_str = f"spotify.playlistdetails.{playlist['id']}"
-        checksum = self.__cache_checksum(playlist["tracks"]["total"])
-        # log_msg(f"Playlist cache_str = '{cache_str}', checksum = '{checksum}'.")
+        # For dynamic playlists like Daylist, use snapshot_id to detect content changes
+        # For static playlists, fall back to total track count
+        content_version = playlist.get("snapshot_id") or playlist["tracks"]["total"]
+        # Create a more robust checksum for playlists to detect content changes
+        playlist_checksum = f"{content_version}-{playlist.get('snapshot_id', '')}"
+        checksum = self.__cache_checksum(playlist_checksum)
         playlist_details = self.cache.get(cache_str, checksum=checksum)
-        if playlist_details:
+        expected_total = playlist["tracks"]["total"] or 0
+        cached_items = (
+            playlist_details.get("tracks", {}).get("items")
+            if isinstance(playlist_details, dict)
+            else None
+        )
+        if (
+            playlist_details
+            and isinstance(cached_items, list)
+            and (expected_total == 0 or len(cached_items) > 0)
+        ):
             cache_log(
-                f'Retrieved {playlist["tracks"]["total"]} cached playlist details'
+                f"Retrieved {len(cached_items)} cached playlist details"
                 f' for "{playlist["name"]}".'
             )
         else:
@@ -699,11 +1025,14 @@ class PluginContent:
                 tracks=playlist_details["tracks"]["items"], playlist_details=playlist
             )
             # log_msg(f"playlist_details = {playlist_details}")
-            checksum = self.__cache_checksum(playlist["tracks"]["total"])
+            # For dynamic playlists like Daylist, use snapshot_id to detect content changes
+            # For static playlists, fall back to total track count
+            playlist_checksum = f"{content_version}-{playlist.get('snapshot_id', '')}"
+            checksum = self.__cache_checksum(playlist_checksum)
             self.cache.set(cache_str, playlist_details, checksum=checksum)
             # log_msg(f"Got new playlist - checksum = '{checksum}'")
             cache_log(
-                f'Retrieved {playlist["tracks"]["total"]} UNCACHED playlist details'
+                f"Retrieved {playlist['tracks']['total']} UNCACHED playlist details"
                 f' for "{playlist["name"]}".'
             )
 
@@ -712,33 +1041,55 @@ class PluginContent:
     def browse_playlist(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "songs")
         playlist_details = self.__get_playlist_details(self.__playlist_id)
-        xbmcplugin.setProperty(self.__addon_handle, "FolderName", playlist_details["name"])
-        self.__add_track_listitems(playlist_details["tracks"]["items"], True)
+        xbmcplugin.setProperty(
+            self.__addon_handle, "FolderName", playlist_details["name"]
+        )
+        items = playlist_details["tracks"]["items"]
+        self.__add_track_listitems(items, True)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_songs:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
     def play_playlist(self) -> None:
-        """play entire playlist"""
+        """Play entire playlist: start first track immediately, queue rest in background."""
         playlist_details = self.__get_playlist_details(self.__playlist_id)
+        items = playlist_details["tracks"]["items"]
+        if not items:
+            return
         log_msg(f"Start playing playlist '{playlist_details['name']}'.")
 
         kodi_playlist = xbmc.PlayList(0)
         kodi_playlist.clear()
 
-        def add_to_playlist(trk) -> None:
-            url, li = self.__get_track_item(trk, True)
-            kodi_playlist.add(url, li)
+        # Batch add the first few tracks directly to start quickly
+        batch_size = min(5, len(items))
+        for track in items[:batch_size]:
+            item = self.__get_track_item(track, True)
+            if item is not None:
+                url, li = item
+                kodi_playlist.add(url, li)
 
-        # Add first track and start playing.
-        add_to_playlist(playlist_details["tracks"]["items"][0])
-        kodi_player = xbmc.Player()
-        kodi_player.play(kodi_playlist)
+        # Start playback immediately after first tracks are queued
+        xbmc.Player().play(kodi_playlist)
 
-        # Add remaining tracks to the playlist while already playing.
-        for track in playlist_details["tracks"]["items"][1:]:
-            add_to_playlist(track)
+        # Process the rest in background
+        if len(items) > batch_size:
+
+            def add_remaining():
+                for track in items[batch_size:]:
+                    if xbmc.Monitor().abortRequested():
+                        return
+                    try:
+                        item = self.__get_track_item(track, True)
+                        if item is not None:
+                            u, listitem = item
+                            kodi_playlist.add(u, listitem)
+                    except Exception:
+                        pass
+                    # Reduced sleep slightly to populate playlist faster, but yield to main thread
+                    xbmc.sleep(2)
+
+            t = threading.Thread(target=add_remaining, daemon=True)
+            t.start()
 
     def __get_category(self, categoryid: str) -> Playlist:
         category = self.__spotipy.category(
@@ -767,8 +1118,6 @@ class PluginContent:
         xbmcplugin.setProperty(self.__addon_handle, "FolderName", playlists["category"])
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_category:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_category})")
 
     def follow_playlist(self) -> None:
         self.__spotipy.current_user_follow_playlist(self.__playlist_id)
@@ -778,8 +1127,12 @@ class PluginContent:
     def add_track_to_playlist(self) -> None:
         xbmc.executebuiltin("ActivateWindow(busydialog)")
 
-        if not self.__track_id and xbmc.getInfoLabel("MusicPlayer.(1).Property(spotifytrackid)"):
-            self.__track_id = xbmc.getInfoLabel("MusicPlayer.(1).Property(spotifytrackid)")
+        if not self.__track_id and xbmc.getInfoLabel(
+            "MusicPlayer.(1).Property(spotifytrackid)"
+        ):
+            self.__track_id = xbmc.getInfoLabel(
+                "MusicPlayer.(1).Property(spotifytrackid)"
+            )
 
         own_playlists, own_playlist_names = utils.get_user_playlists(self.__spotipy, 50)
         own_playlist_names.append(xbmc.getLocalizedString(KODI_NEW_PLAYLIST_STR_ID))
@@ -792,12 +1145,16 @@ class PluginContent:
             KODI_NEW_PLAYLIST_STR_ID
         ):
             # create new playlist...
-            kb = xbmc.Keyboard("", xbmc.getLocalizedString(KODI_ENTER_NEW_PLAYLIST_STR_ID))
+            kb = xbmc.Keyboard(
+                "", xbmc.getLocalizedString(KODI_ENTER_NEW_PLAYLIST_STR_ID)
+            )
             kb.setHiddenInput(False)
             kb.doModal()
             if kb.isConfirmed():
                 name = kb.getText()
-                playlist = self.__spotipy.user_playlist_create(self.__userid, name, False)
+                playlist = self.__spotipy.user_playlist_create(
+                    self.__userid, name, False
+                )
                 self.__spotipy.playlist_add_items(playlist["id"], [self.__track_id])
         elif select != -1:
             playlist = own_playlists[select]
@@ -862,49 +1219,49 @@ class PluginContent:
         return playlists
 
     def __get_user_playlists(self, userid):
-        playlists = self.__spotipy.user_playlists(userid, limit=1, offset=0)
-        count = len(playlists["items"])
+        playlists = self.__spotipy.user_playlists(userid, limit=50, offset=0)
         total = playlists["total"]
         cache_str = f"spotify.userplaylists.{userid}"
         checksum = self.__cache_checksum(total)
 
         cached_playlists = self.cache.get(cache_str, checksum=checksum)
         if cached_playlists:
-            playlists = cached_playlists
-            cache_log(f'Retrieved {len(playlists)} cached playlists for user "{self.__userid}".')
-        else:
-            while total > count:
-                playlists["items"] += self.__spotipy.user_playlists(userid, limit=50, offset=count)[
-                    "items"
-                ]
-                count += 50
-            playlists = self.__prepare_playlist_listitems(playlists["items"])
-            self.cache.set(cache_str, playlists, checksum=checksum)
             cache_log(
-                f'Retrieved {_get_len(playlists)} UNCACHED playlists for user "{self.__userid}".'
+                f'Retrieved {len(cached_playlists)} cached playlists for user "{self.__userid}".'
             )
+            return cached_playlists
 
-        return playlists
+        count = len(playlists["items"])
+        while total > count:
+            playlists["items"] += self.__spotipy.user_playlists(
+                userid, limit=50, offset=count
+            )["items"]
+            count += 50
+        result = self.__prepare_playlist_listitems(playlists["items"])
+        self.cache.set(cache_str, result, checksum=checksum)
+        cache_log(
+            f'Retrieved {_get_len(result)} UNCACHED playlists for user "{self.__userid}".'
+        )
+
+        return result
 
     def __get_curuser_playlistids(self) -> List[str]:
-        playlists = self.__spotipy.current_user_playlists(limit=1, offset=0)
-        count = len(playlists["items"])
+        playlists = self.__spotipy.current_user_playlists(limit=50, offset=0)
         total = playlists["total"]
         cache_str = f"spotify.userplaylistids.{self.__userid}"
         playlist_ids = self.cache.get(cache_str, checksum=total)
         if playlist_ids:
-            log_msg(
+            cache_log(
                 f'Retrieved {len(playlist_ids)} cached playlist ids for user "{self.__userid}".'
             )
         else:
-            playlist_ids = []
+            count = len(playlists["items"])
             while total > count:
-                playlists["items"] += self.__spotipy.current_user_playlists(limit=50, offset=count)[
-                    "items"
-                ]
+                playlists["items"] += self.__spotipy.current_user_playlists(
+                    limit=50, offset=count
+                )["items"]
                 count += 50
-            for playlist in playlists["items"]:
-                playlist_ids.append(playlist["id"])
+            playlist_ids = [p["id"] for p in playlists["items"] if p and p.get("id")]
             self.cache.set(cache_str, playlist_ids, checksum=total)
             cache_log(
                 f'Retrieved {_get_len(playlist_ids)} UNCACHED playlist ids for user "{self.__userid}".'
@@ -915,22 +1272,26 @@ class PluginContent:
         xbmcplugin.setContent(self.__addon_handle, "files")
         if self.__filter == "featured":
             playlists = self.__get_featured_playlists()
-            xbmcplugin.setProperty(self.__addon_handle, "FolderName", playlists["message"])
+            xbmcplugin.setProperty(
+                self.__addon_handle, "FolderName", playlists["message"]
+            )
             playlists = playlists["playlists"]["items"]
         else:
             xbmcplugin.setProperty(
-                self.__addon_handle, "FolderName", xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID)
+                self.__addon_handle,
+                "FolderName",
+                xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID),
             )
             playlists = self.__get_user_playlists(self.__owner_id)
 
         self.__add_playlist_listitems(playlists)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_playlists:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_playlists})")
 
     def __get_new_releases(self):
-        albums = self.__spotipy.new_releases(country=self.__user_country, limit=50, offset=0)
+        albums = self.__spotipy.new_releases(
+            country=self.__user_country, limit=50, offset=0
+        )
         count = len(albums["albums"]["items"])
         while albums["albums"]["total"] > count:
             albums["albums"]["items"] += self.__spotipy.new_releases(
@@ -956,8 +1317,6 @@ class PluginContent:
         self.__add_album_listitems(albums)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_albums:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_albums})")
 
     def __prepare_track_listitems(
         self, track_ids=None, tracks=None, playlist_details=None, album_details=None
@@ -969,22 +1328,51 @@ class PluginContent:
 
         new_tracks: List[Dict[str, Any]] = []
 
+        # Fetch saved_track_ids and followed_artists in parallel (with track fetch when needed)
+        saved_result = [None]
+        followed_result = [None]
+
+        # Only fetch these if they are really needed (optimization)
+        need_saved = True
+        need_followed = True
+
+        def _get_saved():
+            saved_result[0] = self.__get_saved_track_ids()
+
+        def _get_followed():
+            followed_result[0] = self.__get_followed_artists()
+
+        t_saved = threading.Thread(target=_get_saved, daemon=True)
+        t_followed = threading.Thread(target=_get_followed, daemon=True)
+
+        if need_saved:
+            t_saved.start()
+        if need_followed:
+            t_followed.start()
+
         # For tracks, we always get the full details unless full tracks already supplied.
         if track_ids and not tracks:
+            # Add early exit condition
             for chunk in get_chunks(track_ids, 20):
-                tracks += self.__spotipy.tracks(chunk, market=self.__user_country)["tracks"]
+                tracks += self.__spotipy.tracks(chunk, market=self.__user_country)[
+                    "tracks"
+                ]
 
-        saved_track_ids = self.__get_saved_track_ids()
+        if need_saved:
+            t_saved.join()
+        if need_followed:
+            t_followed.join()
 
-        followed_artists = []
-        for artist in self.__get_followed_artists():
-            followed_artists.append(artist["id"])
+        saved_track_ids = set(saved_result[0] or [])
+        followed_artists = {a["id"] for a in (followed_result[0] or [])}
 
         for track in tracks:
             if track.get("track"):
                 track = track["track"]
             if album_details:
                 track["album"] = album_details
+            if not track.get("album"):
+                track["album"] = {"name": "", "images": [], "album_type": ""}
             if track.get("images"):
                 thumb = track["images"][0]["url"]
             elif track.get("album", {}).get("images"):
@@ -992,6 +1380,8 @@ class PluginContent:
             else:
                 thumb = "DefaultMusicSongs.png"
             track["thumb"] = thumb
+            track["track_number"] = track.get("track_number") or 0
+            track["disc_number"] = track.get("disc_number") or 1
 
             # Skip local tracks in playlists.
             if not track.get("id"):
@@ -1008,21 +1398,16 @@ class PluginContent:
 
             if "album" not in track:
                 track["genre"] = []
-                track["year"] = 1900
+                track["year"] = 0
             else:
                 track["genre"] = " / ".join(track["album"].get("genres", []))
+                release_date = track["album"].get("release_date") or ""
+                year_str = release_date.split("-")[0] if release_date else ""
+                track["year"] = int(year_str) if year_str.isdigit() else 0
 
-                # Allow for 'release_date' being empty.
-                release_date = (
-                    "0" if "album" not in track else track["album"].get("release_date", "0")
-                )
-                track["year"] = (
-                    1900
-                    if not release_date
-                    else int(track["album"].get("release_date", "0").split("-")[0])
-                )
-
-            track["rating"] = int(self.__get_track_rating(int(track.get("popularity", "0"))))
+            track["rating"] = int(
+                self.__get_track_rating(int(track.get("popularity", "0")))
+            )
 
             if playlist_details:
                 track["playlistid"] = playlist_details["id"]
@@ -1033,7 +1418,60 @@ class PluginContent:
 
             new_tracks.append(track)
 
+        # Fetch artist images (GET /artists/) for Artist slideshow / Music OSD background
+        artist_ids = list({t.get("artistid") for t in new_tracks if t.get("artistid")})
+
+        # Optimize fetch by checking cache first
+        artist_fanart_map = {}
+        missing_artist_ids = []
+
+        # We can implement a simple in-memory cache for artist fanart to reduce API calls
+        # since this is called frequently
+        if not hasattr(self, "_artist_fanart_cache"):
+            self._artist_fanart_cache = {}
+
+        for artist_id in artist_ids:
+            if artist_id in self._artist_fanart_cache:
+                artist_fanart_map[artist_id] = self._artist_fanart_cache[artist_id]
+            else:
+                missing_artist_ids.append(artist_id)
+
+        if missing_artist_ids:
+            fetched_map = self.__get_artist_fanart_map(missing_artist_ids)
+            artist_fanart_map.update(fetched_map)
+            self._artist_fanart_cache.update(fetched_map)
+
+            # Keep cache size reasonable (max 500 artists)
+            if len(self._artist_fanart_cache) > 500:
+                # Remove oldest entries (simple approach: clear half the cache)
+                keys_to_remove = list(self._artist_fanart_cache.keys())[:250]
+                for k in keys_to_remove:
+                    del self._artist_fanart_cache[k]
+
+        for t in new_tracks:
+            t["artist_fanart"] = artist_fanart_map.get(t.get("artistid") or "", "")
+
         return new_tracks
+
+    def __get_artist_fanart_map(self, artist_ids: List[str]) -> Dict[str, str]:
+        """Fetch full artist objects (GET /artists/) and return artist_id -> largest image URL.
+        Used for Artist slideshow / Music OSD background (artist.fanart)."""
+        result: Dict[str, str] = {}
+        if not artist_ids:
+            return result
+        try:
+            for chunk in get_chunks(artist_ids, 50):
+                artists = self.__spotipy.artists(chunk).get("artists") or []
+                for artist in artists:
+                    if not artist or not artist.get("id"):
+                        continue
+                    images = artist.get("images") or []
+                    if images:
+                        # Spotify: images sorted by width descending; [0]=largest
+                        result[artist["id"]] = images[0].get("url") or ""
+        except Exception as e:
+            log_exception("artist fanart fetch", e)
+        return result
 
     def __get_playlist_track_context_menu_items(
         self, track, saved_track_ids, playlist_details, followed_artists: List[str]
@@ -1046,17 +1484,12 @@ class PluginContent:
             real_track_id = track["id"]
             real_track_uri = track["uri"]
 
-        context_items = [
-            (
-                self.__addon.getLocalizedString(REFRESH_LISTING_STR_ID),
-                f"RunPlugin(plugin://{ADDON_ID}/" f"?action={self.refresh_listing.__name__})",
-            )
-        ]
+        context_items = []
 
         if track["id"] in saved_track_ids:
             context_items.append(
                 (
-                    self.__addon.getLocalizedString(REMOVE_TRACKS_FROM_MY_MUSIC_STR_ID),
+                    self.__addon.getLocalizedString(REMOVE_FROM_LIKED_SONGS_STR_ID),
                     f"RunPlugin(plugin://{ADDON_ID}/"
                     f"?action={self.remove_track.__name__}&trackid={real_track_id})",
                 )
@@ -1064,7 +1497,7 @@ class PluginContent:
         else:
             context_items.append(
                 (
-                    self.__addon.getLocalizedString(SAVE_TRACKS_TO_MY_MUSIC_STR_ID),
+                    self.__addon.getLocalizedString(ADD_TO_LIKED_SONGS_STR_ID),
                     f"RunPlugin(plugin://{ADDON_ID}/"
                     f"?action={self.save_track.__name__}&trackid={real_track_id})",
                 )
@@ -1155,7 +1588,21 @@ class PluginContent:
                     f"?action={self.related_artists.__name__}&artistid={track['artistid']})",
                 )
             )
+            context_items.append(
+                (
+                    self.__addon.getLocalizedString(GO_TO_RADIO_STR_ID),
+                    f"Container.Update(plugin://{ADDON_ID}/"
+                    f"?action={self.browse_radio.__name__}&trackid={real_track_id}"
+                    f"&artistid={track['artistid']}&artistname={urllib.parse.quote(track.get('artist', ''))})",
+                )
+            )
 
+        context_items.append(
+            (
+                self.__addon.getLocalizedString(REFRESH_LISTING_STR_ID),
+                f"RunPlugin(plugin://{ADDON_ID}/?action={self.refresh_listing.__name__})",
+            )
+        )
         return context_items
 
     def __prepare_album_listitems(
@@ -1168,7 +1615,9 @@ class PluginContent:
         if not albums and album_ids:
             # Get full info in chunks of 20.
             for chunk in get_chunks(album_ids, 20):
-                albums += self.__spotipy.albums(chunk, market=self.__user_country)["albums"]
+                albums += self.__spotipy.albums(chunk, market=self.__user_country)[
+                    "albums"
+                ]
 
         saved_albums = self.__get_saved_album_ids()
 
@@ -1184,15 +1633,20 @@ class PluginContent:
             )
 
             artists = []
-            for artist in track["artists"]:
-                artists.append(artist["name"])
-            track["artist"] = " / ".join(artists)
-            track["genre"] = " / ".join(track["genres"])
-            track["year"] = int(track["release_date"].split("-")[0])
-            track["rating"] = str(self.__get_track_rating(track["popularity"]))
-            track["artistid"] = track["artists"][0]["id"]
+            for artist in track.get("artists") or []:
+                artists.append(artist.get("name", ""))
+            track["artist"] = " / ".join(artists) or ""
+            track["genre"] = " / ".join(track.get("genres") or [])
+            release_date = (track.get("release_date") or "")[:4]
+            track["year"] = int(release_date) if release_date.isdigit() else 0
+            track["rating"] = str(
+                self.__get_track_rating(int(track.get("popularity", 0)))
+            )
+            track["artistid"] = (track.get("artists") or [{}])[0].get("id", "")
 
-            track["contextitems"] = self.__get_album_track_context_menu_items(track, saved_albums)
+            track["contextitems"] = self.__get_album_track_context_menu_items(
+                track, saved_albums
+            )
 
         return albums
 
@@ -1200,10 +1654,6 @@ class PluginContent:
         self, track, saved_albums: List[str]
     ) -> List[Tuple[str, str]]:
         context_items = [
-            (
-                self.__addon.getLocalizedString(REFRESH_LISTING_STR_ID),
-                f"RunPlugin(plugin://{ADDON_ID}/" f"?action={self.refresh_listing.__name__})",
-            ),
             (
                 xbmc.getLocalizedString(KODI_BROWSE_STR_ID),
                 f"Container.Update(plugin://{ADDON_ID}/"
@@ -1224,6 +1674,12 @@ class PluginContent:
                 f"Container.Update(plugin://{ADDON_ID}/"
                 f"?action={self.related_artists.__name__}&artistid={track['artistid']})",
             ),
+            (
+                self.__addon.getLocalizedString(GO_TO_RADIO_STR_ID),
+                f"Container.Update(plugin://{ADDON_ID}/"
+                f"?action={self.browse_radio.__name__}&trackid={track['id']}"
+                f"&artistid={track['artistid']}&artistname={urllib.parse.quote(track.get('artist', ''))})",
+            ),
         ]
 
         if track["id"] in saved_albums:
@@ -1243,29 +1699,35 @@ class PluginContent:
                 )
             )
 
+        context_items.append(
+            (
+                self.__addon.getLocalizedString(REFRESH_LISTING_STR_ID),
+                f"RunPlugin(plugin://{ADDON_ID}/?action={self.refresh_listing.__name__})",
+            )
+        )
         return context_items
 
     def __add_album_listitems(
         self, albums: List[Dict[str, Any]], append_artist_to_label: bool = False
     ) -> None:
-        # Process listing.
+        default_album_icon = os.path.join(self.__addon_icon_path, MUSIC_ALBUMS_ICON)
         for track in albums:
             label = self.__get_track_name(track, append_artist_to_label)
-
             li = xbmcgui.ListItem(label, path=track["url"], offscreen=True)
-            info_labels = {
-                "title": track["name"],
-                "genre": track["genre"],
-                "year": track["year"],
-                "album": track["name"],
-                "artist": track["artist"],
-                "rating": track["rating"],
-            }
-            li.setInfo(type="Music", infoLabels=info_labels)
-            li.setArt({"thumb": track["thumb"]})
+            tag = li.getMusicInfoTag()
+            tag.setTitle(track["name"])
+            tag.setAlbum(track["name"])
+            tag.setArtist(track.get("artist") or "")
+            tag.setYear(int(track.get("year") or 0))
+            tag.setRating(int(track.get("rating") or 0))
+            tag.setMediaType("album")
+            genre = track.get("genre") or ""
+            if genre:
+                tag.setGenres([genre] if isinstance(genre, str) else genre)
+            li.setArt(_art_for_item(track.get("thumb") or "", default_album_icon))
             li.setProperty("do_not_analyze", "true")
             li.setProperty("IsPlayable", "false")
-            li.addContextMenuItems(track["contextitems"], True)
+            li.addContextMenuItems(track.get("contextitems") or [], True)
             xbmcplugin.addDirectoryItem(
                 handle=self.__addon_handle, url=track["url"], listitem=li, isFolder=True
             )
@@ -1275,16 +1737,17 @@ class PluginContent:
     ) -> List[Dict[str, Any]]:
         followed_artists = []
         if not is_followed:
-            for artist in self.__get_followed_artists():
-                followed_artists.append(artist["id"])
+            followed_artists = [a["id"] for a in (self.__get_followed_artists() or [])]
 
+        artists = [a for a in artists if a]
         for artist in artists:
-            if not artist:
-                return []
             if artist.get("artist"):
                 artist = artist["artist"]
+            # Use largest (first) image only; API returns same image in various sizes, widest first
             if artist.get("images"):
-                artist["thumb"] = artist["images"][0]["url"]
+                artist["thumb"] = (
+                    artist["images"][0].get("url") or "DefaultMusicArtists.png"
+                )
             else:
                 artist["thumb"] = "DefaultMusicArtists.png"
 
@@ -1333,6 +1796,12 @@ class PluginContent:
                 f"Container.Update(plugin://{ADDON_ID}/"
                 f"?action={self.artist_top_tracks.__name__}&artistid={artist['id']})",
             ),
+            (
+                self.__addon.getLocalizedString(GO_TO_RADIO_STR_ID),
+                f"Container.Update(plugin://{ADDON_ID}/"
+                f"?action={self.browse_radio.__name__}&artistid={artist['id']}"
+                f"&artistname={urllib.parse.quote(artist.get('name', ''))})",
+            ),
         ]
 
         if is_followed or artist["id"] in followed_artists:
@@ -1363,20 +1832,22 @@ class PluginContent:
         return context_items
 
     def __add_artist_listitems(self, artists: List[Dict[str, Any]]) -> None:
+        default_artist_icon = os.path.join(self.__addon_icon_path, MUSIC_ARTISTS_ICON)
         for item in artists:
             li = xbmcgui.ListItem(item["name"], path=item["url"], offscreen=True)
-            info_labels = {
-                "title": item["name"],
-                "genre": item["genre"],
-                "artist": item["name"],
-                "rating": item["rating"],
-            }
-            li.setInfo(type="Music", infoLabels=info_labels)
-            li.setArt({"thumb": item["thumb"]})
+            tag = li.getMusicInfoTag()
+            tag.setTitle(item["name"])
+            tag.setArtist(item["name"])
+            tag.setRating(int(item.get("rating") or 0))
+            tag.setMediaType("artist")
+            genre = item.get("genre") or ""
+            if genre:
+                tag.setGenres([genre] if isinstance(genre, str) else genre)
+            li.setArt(_art_for_item(item.get("thumb") or "", default_artist_icon))
             li.setProperty("do_not_analyze", "true")
             li.setProperty("IsPlayable", "false")
-            li.setLabel2(item["followerslabel"])
-            li.addContextMenuItems(item["contextitems"], True)
+            li.setLabel2(item.get("followerslabel") or "")
+            li.addContextMenuItems(item.get("contextitems") or [], True)
             xbmcplugin.addDirectoryItem(
                 handle=self.__addon_handle,
                 url=item["url"],
@@ -1385,7 +1856,9 @@ class PluginContent:
                 totalItems=len(artists),
             )
 
-    def __prepare_playlist_listitems(self, playlists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def __prepare_playlist_listitems(
+        self, playlists: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
         playlists2 = []
         followed_playlists = self.__get_curuser_playlistids()
 
@@ -1424,13 +1897,12 @@ class PluginContent:
                 f"?action={self.play_playlist.__name__}&playlistid={playlist['id']}"
                 f"&ownerid={playlist['owner']['id']})",
             ),
-            (
-                self.__addon.getLocalizedString(REFRESH_LISTING_STR_ID),
-                f"RunPlugin(plugin://{ADDON_ID}/" f"?action={self.refresh_listing.__name__})",
-            ),
         ]
 
-        if playlist["owner"]["id"] != self.__userid and playlist["id"] in followed_playlists:
+        if (
+            playlist["owner"]["id"] != self.__userid
+            and playlist["id"] in followed_playlists
+        ):
             contextitems.append(
                 (
                     self.__addon.getLocalizedString(UNFOLLOW_PLAYLIST_STR_ID),
@@ -1449,21 +1921,27 @@ class PluginContent:
                 )
             )
 
+        contextitems.append(
+            (
+                self.__addon.getLocalizedString(REFRESH_LISTING_STR_ID),
+                f"RunPlugin(plugin://{ADDON_ID}/?action={self.refresh_listing.__name__})",
+            )
+        )
         return contextitems
 
     def __add_playlist_listitems(self, playlists: List[Dict[str, Any]]) -> None:
+        default_playlist_icon = os.path.join(
+            self.__addon_icon_path, MUSIC_PLAYLISTS_ICON
+        )
+        addon_fanart = os.path.join(self.__addon_icon_path, "fanart.jpg")
         for item in playlists:
             li = xbmcgui.ListItem(item["name"], path=item["url"], offscreen=True)
             li.setProperty("do_not_analyze", "true")
             li.setProperty("IsPlayable", "false")
-
-            li.addContextMenuItems(item["contextitems"], True)
-            li.setArt(
-                {
-                    "fanart": os.path.join(self.__addon_icon_path, "fanart.jpg"),
-                    "thumb": item["thumb"],
-                }
-            )
+            li.addContextMenuItems(item.get("contextitems") or [], True)
+            art = _art_for_item(item.get("thumb") or "", default_playlist_icon)
+            art["fanart"] = art.get("fanart") or addon_fanart
+            li.setArt(art)
             xbmcplugin.addDirectoryItem(
                 handle=self.__addon_handle, url=item["url"], listitem=li, isFolder=True
             )
@@ -1489,55 +1967,71 @@ class PluginContent:
     def browse_artist_albums(self, album_type: str) -> None:
         xbmcplugin.setContent(self.__addon_handle, "albums")
         xbmcplugin.setProperty(
-            self.__addon_handle, "FolderName", xbmc.getLocalizedString(KODI_ALBUMS_STR_ID)
+            self.__addon_handle,
+            "FolderName",
+            xbmc.getLocalizedString(KODI_ALBUMS_STR_ID),
         )
-        artist_albums = self.__spotipy.artist_albums(
-            self.__artist_id,
-            album_type=album_type,
-            country=self.__user_country,
-            limit=50,
-            offset=0,
-        )
-        count = len(artist_albums["items"])
-        albumids = []
-        while artist_albums["total"] > count:
-            artist_albums["items"] += self.__spotipy.artist_albums(
+        cache_str = f"spotify.artistalbums.{album_type}.{self.__artist_id}"
+        checksum = self.__cache_checksum()
+        albums = self.cache.get(cache_str, checksum=checksum)
+
+        if albums:
+            cache_log(
+                f'Retrieved {len(albums)} cached albums of type "{album_type}" for artist "{self.__artist_id}".'
+            )
+        else:
+            artist_albums = self.__spotipy.artist_albums(
                 self.__artist_id,
                 album_type=album_type,
                 country=self.__user_country,
                 limit=50,
-                offset=count,
-            )["items"]
-            count += 50
-        for album in artist_albums["items"]:
-            albumids.append(album["id"])
-        albums = self.__prepare_album_listitems(albumids)
+                offset=0,
+            )
+            count = len(artist_albums["items"])
+            albumids = []
+            while artist_albums["total"] > count:
+                artist_albums["items"] += self.__spotipy.artist_albums(
+                    self.__artist_id,
+                    album_type=album_type,
+                    country=self.__user_country,
+                    limit=50,
+                    offset=count,
+                )["items"]
+                count += 50
+            for album in artist_albums["items"]:
+                albumids.append(album["id"])
+            albums = self.__prepare_album_listitems(albumids)
+            self.cache.set(cache_str, albums, checksum=checksum)
+
         self.__add_album_listitems(albums)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_VIDEO_YEAR)
-        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_ALBUM_IGNORE_THE)
-        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_SONG_RATING)
+        xbmcplugin.addSortMethod(
+            self.__addon_handle, xbmcplugin.SORT_METHOD_ALBUM_IGNORE_THE
+        )
+        xbmcplugin.addSortMethod(
+            self.__addon_handle, xbmcplugin.SORT_METHOD_SONG_RATING
+        )
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_albums:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_albums})")
 
     def __get_saved_album_ids(self) -> List[str]:
-        albums = self.__spotipy.current_user_saved_albums(limit=1, offset=0)
+        albums = self.__spotipy.current_user_saved_albums(limit=50, offset=0)
         cache_str = f"spotify-savedalbumids.{self.__userid}"
         checksum = albums["total"]
         album_ids = self.cache.get(cache_str, checksum=checksum)
         if album_ids:
-            cache_log(f'Retrieved {len(album_ids)} cached album ids for user "{self.__userid}".')
+            cache_log(
+                f'Retrieved {len(album_ids)} cached album ids for user "{self.__userid}".'
+            )
             return album_ids
 
         album_ids = []
         if albums and albums.get("items"):
             count = len(albums["items"])
-            album_ids = []
             while albums["total"] > count:
-                albums["items"] += self.__spotipy.current_user_saved_albums(limit=50, offset=count)[
-                    "items"
-                ]
+                albums["items"] += self.__spotipy.current_user_saved_albums(
+                    limit=50, offset=count
+                )["items"]
                 count += 50
             for album in albums["items"]:
                 album_ids.append(album["album"]["id"])
@@ -1553,33 +2047,40 @@ class PluginContent:
         cache_str = f"spotify.savedalbums.{self.__userid}"
         checksum = self.__cache_checksum(len(album_ids))
         albums = self.cache.get(cache_str, checksum=checksum)
-        if albums:
-            cache_log(f'Retrieved {len(albums)} cached albums for user "{self.__userid}".')
+        if isinstance(albums, list) and (len(albums) > 0 or len(album_ids) == 0):
+            cache_log(
+                f'Retrieved {len(albums)} cached albums for user "{self.__userid}".'
+            )
         else:
             albums = self.__prepare_album_listitems(album_ids)
             self.cache.set(cache_str, albums, checksum=checksum)
-            cache_log(f'Retrieved {_get_len(albums)} UNCACHED albums for user "{self.__userid}".')
+            cache_log(
+                f'Retrieved {_get_len(albums)} UNCACHED albums for user "{self.__userid}".'
+            )
         return albums
 
     def browse_saved_albums(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "albums")
         xbmcplugin.setProperty(
-            self.__addon_handle, "FolderName", xbmc.getLocalizedString(KODI_ALBUMS_STR_ID)
+            self.__addon_handle,
+            "FolderName",
+            xbmc.getLocalizedString(KODI_ALBUMS_STR_ID),
         )
         albums = self.__get_saved_albums()
         self.__add_album_listitems(albums, True)
-        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_ALBUM_IGNORE_THE)
+        xbmcplugin.addSortMethod(
+            self.__addon_handle, xbmcplugin.SORT_METHOD_ALBUM_IGNORE_THE
+        )
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_VIDEO_YEAR)
-        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_SONG_RATING)
+        xbmcplugin.addSortMethod(
+            self.__addon_handle, xbmcplugin.SORT_METHOD_SONG_RATING
+        )
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        xbmcplugin.setContent(self.__addon_handle, "albums")
-        if self.default_view_albums:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_albums})")
 
     def __get_saved_track_ids(self) -> List[str]:
         saved_tracks = self.__spotipy.current_user_saved_tracks(
-            limit=1, offset=self.__offset, market=self.__user_country
+            limit=50, offset=0, market=self.__user_country
         )
         total = saved_tracks["total"]
         cache_str = f"spotify.savedtracksids.{self.__userid}"
@@ -1590,7 +2091,6 @@ class PluginContent:
             )
             return track_ids
 
-        # Get from api.
         track_ids = []
         count = len(saved_tracks["items"])
         while total > count:
@@ -1599,7 +2099,8 @@ class PluginContent:
             )["items"]
             count += 50
         for track in saved_tracks["items"]:
-            track_ids.append(track["track"]["id"])
+            if track.get("track") and track["track"].get("id"):
+                track_ids.append(track["track"]["id"])
         self.cache.set(cache_str, track_ids, checksum=total)
         cache_log(
             f'Retrieved {_get_len(track_ids)} UNCACHED saved track ids for user "{self.__userid}".'
@@ -1608,17 +2109,18 @@ class PluginContent:
         return track_ids
 
     def __get_saved_tracks(self):
-        # Get from cache first.
         track_ids = self.__get_saved_track_ids()
         cache_str = f"spotify.savedtracks.{self.__userid}"
+        checksum = self.__cache_checksum(len(track_ids))
 
-        tracks = self.cache.get(cache_str, checksum=len(track_ids))
-        if tracks:
-            cache_log(f'Retrieved {len(tracks)} cached saved tracks for user "{self.__userid}".')
+        tracks = self.cache.get(cache_str, checksum=checksum)
+        if isinstance(tracks, list) and (len(tracks) > 0 or len(track_ids) == 0):
+            cache_log(
+                f'Retrieved {len(tracks)} cached saved tracks for user "{self.__userid}".'
+            )
         else:
-            # Get from api.
             tracks = self.__prepare_track_listitems(track_ids)
-            self.cache.set(cache_str, tracks, checksum=len(track_ids))
+            self.cache.set(cache_str, tracks, checksum=checksum)
             cache_log(
                 f'Retrieved {_get_len(tracks)} UNCACHED saved tracks for user "{self.__userid}".'
             )
@@ -1628,34 +2130,36 @@ class PluginContent:
     def browse_saved_tracks(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "songs")
         xbmcplugin.setProperty(
-            self.__addon_handle, "FolderName", xbmc.getLocalizedString(KODI_SONGS_STR_ID)
+            self.__addon_handle,
+            "FolderName",
+            xbmc.getLocalizedString(KODI_SONGS_STR_ID),
         )
         tracks = self.__get_saved_tracks()
         self.__add_track_listitems(tracks, True)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_songs:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
 
     def __get_saved_artists(self) -> List[Dict[str, Any]]:
         saved_albums = self.__get_saved_albums()
         followed_artists = self.__get_followed_artists()
         cache_str = f"spotify.savedartists.{self.__userid}"
-        checksum = len(saved_albums) + len(followed_artists)
+        checksum = self.__cache_checksum(len(saved_albums) + len(followed_artists))
         artists = self.cache.get(cache_str, checksum=checksum)
         if artists:
-            cache_log(f'Retrieved {len(artists)} cached saved artists for user "{self.__userid}".')
+            cache_log(
+                f'Retrieved {len(artists)} cached saved artists for user "{self.__userid}".'
+            )
         else:
             all_artist_ids = []
             artists = []
-            # extract the artists from all saved albums
             for item in saved_albums:
                 for artist in item["artists"]:
                     if artist["id"] not in all_artist_ids:
                         all_artist_ids.append(artist["id"])
             for chunk in get_chunks(all_artist_ids, 50):
-                artists += self.__prepare_artist_listitems(self.__spotipy.artists(chunk)["artists"])
-            # append artists that are followed
+                artists += self.__prepare_artist_listitems(
+                    self.__spotipy.artists(chunk)["artists"]
+                )
             for artist in followed_artists:
                 if not artist["id"] in all_artist_ids:
                     artists.append(artist)
@@ -1669,18 +2173,18 @@ class PluginContent:
     def browse_saved_artists(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "artists")
         xbmcplugin.setProperty(
-            self.__addon_handle, "FolderName", xbmc.getLocalizedString(KODI_ARTISTS_STR_ID)
+            self.__addon_handle,
+            "FolderName",
+            xbmc.getLocalizedString(KODI_ARTISTS_STR_ID),
         )
         artists = self.__get_saved_artists()
         self.__add_artist_listitems(artists)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_TITLE)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_artists:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_artists})")
 
     def __get_followed_artists(self) -> List[Dict[str, Any]]:
         artists = self.__spotipy.current_user_followed_artists(limit=50)
-        cache_str = f"spotify.followedartists.{self.__userid}"
+        cache_str = f"spotify.followedartists.v{CACHE_SCHEMA_VERSION}.{self.__userid}"
         checksum = artists["artists"]["total"]
 
         cached_artists = self.cache.get(cache_str, checksum=checksum)
@@ -1693,11 +2197,15 @@ class PluginContent:
             count = len(artists["artists"]["items"])
             after = artists["artists"]["cursors"]["after"]
             while artists["artists"]["total"] > count:
-                result = self.__spotipy.current_user_followed_artists(limit=50, after=after)
+                result = self.__spotipy.current_user_followed_artists(
+                    limit=50, after=after
+                )
                 artists["artists"]["items"] += result["artists"]["items"]
                 after = result["artists"]["cursors"]["after"]
                 count += 50
-            artists = self.__prepare_artist_listitems(artists["artists"]["items"], is_followed=True)
+            artists = self.__prepare_artist_listitems(
+                artists["artists"]["items"], is_followed=True
+            )
             self.cache.set(cache_str, artists, checksum=checksum)
             cache_log(
                 f'Retrieved {_get_len(artists)} UNCACHED followed artists for user "{self.__userid}".'
@@ -1708,19 +2216,21 @@ class PluginContent:
     def browse_followed_artists(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "artists")
         xbmcplugin.setProperty(
-            self.__addon_handle, "FolderName", xbmc.getLocalizedString(KODI_ARTISTS_STR_ID)
+            self.__addon_handle,
+            "FolderName",
+            xbmc.getLocalizedString(KODI_ARTISTS_STR_ID),
         )
         artists = self.__get_followed_artists()
         self.__add_artist_listitems(artists)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_TITLE)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        if self.default_view_artists:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_artists})")
 
     def search_artists(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "artists")
         xbmcplugin.setProperty(
-            self.__addon_handle, "FolderName", xbmc.getLocalizedString(KODI_ARTISTS_STR_ID)
+            self.__addon_handle,
+            "FolderName",
+            xbmc.getLocalizedString(KODI_ARTISTS_STR_ID),
         )
 
         result = self.__spotipy.search(
@@ -1738,13 +2248,12 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
-        if self.default_view_artists:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_artists})")
-
     def search_tracks(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "songs")
         xbmcplugin.setProperty(
-            self.__addon_handle, "FolderName", xbmc.getLocalizedString(KODI_SONGS_STR_ID)
+            self.__addon_handle,
+            "FolderName",
+            xbmc.getLocalizedString(KODI_SONGS_STR_ID),
         )
 
         result = self.__spotipy.search(
@@ -1762,13 +2271,12 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
-        if self.default_view_songs:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_songs})")
-
     def search_albums(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "albums")
         xbmcplugin.setProperty(
-            self.__addon_handle, "FolderName", xbmc.getLocalizedString(KODI_ALBUMS_STR_ID)
+            self.__addon_handle,
+            "FolderName",
+            xbmc.getLocalizedString(KODI_ALBUMS_STR_ID),
         )
 
         result = self.__spotipy.search(
@@ -1789,9 +2297,6 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
-        if self.default_view_albums:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_albums})")
-
     def search_playlists(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "files")
 
@@ -1803,17 +2308,15 @@ class PluginContent:
             market=self.__user_country,
         )
 
-        log_msg(result)
         xbmcplugin.setProperty(
-            self.__addon_handle, "FolderName", xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID)
+            self.__addon_handle,
+            "FolderName",
+            xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID),
         )
         playlists = self.__prepare_playlist_listitems(result["playlists"]["items"])
         self.__add_playlist_listitems(playlists)
         self.__add_next_button(result["playlists"]["total"])
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-
-        if self.default_view_playlists:
-            xbmc.executebuiltin(f"Container.SetViewMode({self.default_view_playlists})")
 
     def search(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "files")
@@ -1821,80 +2324,87 @@ class PluginContent:
             self.__addon_handle, xbmc.getLocalizedString(KODI_SEARCH_RESULTS_STR_ID)
         )
 
-        kb = xbmc.Keyboard("", xbmc.getLocalizedString(KODI_ENTER_SEARCH_STRING_STR_ID))
-        kb.doModal()
-        if kb.isConfirmed():
-            value = kb.getText()
-            items = []
-            result = self.__spotipy.search(
-                q=f"{value}",
-                type="artist,album,track,playlist",
-                limit=1,
-                market=self.__user_country,
+        # Performance optimization: if we already have a search query, skip the keyboard
+        if self.__filter:
+            value = self.__filter
+        else:
+            kb = xbmc.Keyboard(
+                "", xbmc.getLocalizedString(KODI_ENTER_SEARCH_STRING_STR_ID)
             )
-            items.append(
-                (
-                    f"{xbmc.getLocalizedString(KODI_ARTISTS_STR_ID)}"
-                    f" ({result['artists']['total']})",
-                    f"plugin://{ADDON_ID}/"
-                    f"?action={self.search_artists.__name__}&artistid={value}",
-                )
+            kb.doModal()
+            if kb.isConfirmed():
+                value = kb.getText()
+            else:
+                xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+                return
+
+        items = []
+        result = self.__spotipy.search(
+            q=f"{value}",
+            type="artist,album,track,playlist",
+            limit=1,
+            market=self.__user_country,
+        )
+        items.append(
+            (
+                f"{xbmc.getLocalizedString(KODI_ARTISTS_STR_ID)}"
+                f" ({result['artists']['total']})",
+                f"plugin://{ADDON_ID}/"
+                f"?action={self.search_artists.__name__}&artistid={value}",
             )
-            items.append(
-                (
-                    f"{xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID)}"
-                    f" ({result['playlists']['total']})",
-                    f"plugin://{ADDON_ID}/"
-                    f"?action={self.search_playlists.__name__}&playlistid={value}",
-                )
+        )
+        items.append(
+            (
+                f"{xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID)}"
+                f" ({result['playlists']['total']})",
+                f"plugin://{ADDON_ID}/"
+                f"?action={self.search_playlists.__name__}&playlistid={value}",
             )
-            items.append(
-                (
-                    f"{xbmc.getLocalizedString(KODI_ALBUMS_STR_ID)} ({result['albums']['total']})",
-                    f"plugin://{ADDON_ID}/"
-                    f"?action={self.search_albums.__name__}&albumid={value}",
-                )
+        )
+        items.append(
+            (
+                f"{xbmc.getLocalizedString(KODI_ALBUMS_STR_ID)} ({result['albums']['total']})",
+                f"plugin://{ADDON_ID}/"
+                f"?action={self.search_albums.__name__}&albumid={value}",
             )
-            items.append(
-                (
-                    f"{xbmc.getLocalizedString(KODI_SONGS_STR_ID)} ({result['tracks']['total']})",
-                    f"plugin://{ADDON_ID}/"
-                    f"?action={self.search_tracks.__name__}&trackid={value}",
-                )
+        )
+        items.append(
+            (
+                f"{xbmc.getLocalizedString(KODI_SONGS_STR_ID)} ({result['tracks']['total']})",
+                f"plugin://{ADDON_ID}/"
+                f"?action={self.search_tracks.__name__}&trackid={value}",
             )
-            for item in items:
-                li = xbmcgui.ListItem(item[0], path=item[1])
-                li.setProperty("do_not_analyze", "true")
-                li.setProperty("IsPlayable", "false")
-                li.addContextMenuItems([], True)
-                xbmcplugin.addDirectoryItem(
-                    handle=self.__addon_handle, url=item[1], listitem=li, isFolder=True
-                )
+        )
+        for item in items:
+            li = xbmcgui.ListItem(item[0], path=item[1])
+            li.setProperty("do_not_analyze", "true")
+            li.setProperty("IsPlayable", "false")
+            li.addContextMenuItems([], True)
+            xbmcplugin.addDirectoryItem(
+                handle=self.__addon_handle, url=item[1], listitem=li, isFolder=True
+            )
 
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
     def __add_next_button(self, list_total: int) -> None:
-        # Adds a next button if needed.
-        params = self.__params
-        if list_total > self.__offset + self.__limit:
-            params["offset"] = [str(self.__offset + self.__limit)]
-            url = f"plugin://{ADDON_ID}/"
-
-            for key, value in list(params.items()):
-                if key == "action":
-                    url += f"?{key}={value[0]}"
-                elif key == "offset":
-                    url += f"&{key}={value}"
-                else:
-                    url += f"&{key}={value[0]}"
-
-            li = xbmcgui.ListItem(xbmc.getLocalizedString(KODI_NEXT_PAGE_STR_ID), path=url)
-            li.setProperty("do_not_analyze", "true")
-            li.setProperty("IsPlayable", "false")
-
-            xbmcplugin.addDirectoryItem(
-                handle=self.__addon_handle, url=url, listitem=li, isFolder=True
+        if list_total <= self.__offset + self.__limit:
+            return
+        params = dict(self.__params)
+        params["offset"] = [str(self.__offset + self.__limit)]
+        flat = {}
+        for key, value in params.items():
+            flat[key] = (
+                value[0] if isinstance(value, (list, tuple)) and value else value
             )
+        url = self.__build_url(flat)
+
+        li = xbmcgui.ListItem(xbmc.getLocalizedString(KODI_NEXT_PAGE_STR_ID), path=url)
+        li.setProperty("do_not_analyze", "true")
+        li.setProperty("IsPlayable", "false")
+
+        xbmcplugin.addDirectoryItem(
+            handle=self.__addon_handle, url=url, listitem=li, isFolder=True
+        )
 
     def __precache_library(self) -> None:
         if not self.__win.getProperty("Spotify.PreCachedItems"):
