@@ -1,9 +1,6 @@
 """
-HTTP server for Spotify audio streams. Policy: let Kodi drive.
-
-WAV (PCM) path: standard HTTP range semantics (Content-Length, Accept-Ranges,
-Content-Range, 206 Partial Content) so Kodi's own cache/buffer settings take
-full effect.
+HTTP server for Spotify audio streams. WAV (PCM) path only.
+We serve standard HTTP range semantics so Kodi's cache/buffer settings take effect.
 """
 
 import threading
@@ -20,9 +17,7 @@ from spotty_audio_streamer import SpottyAudioStreamer
 from utils import ADDON_ID, LOGDEBUG, get_cached_auth_token, log_msg
 
 
-# Settings cache to avoid expensive xbmcaddon.Addon() creation on every request
 _settings_cache = {
-    "use_passthrough": False,
     "bitrate": "320",
     "normalization": "auto",
     "last_update_time": 0.0,
@@ -34,45 +29,29 @@ _SETTINGS_CACHE_TTL = 1.0  # Cache for 1 second
 def _get_current_stream_settings():
     """Read addon settings with caching to avoid expensive xbmcaddon.Addon() creation.
 
-    Settings are cached for 1 second to avoid repeated file I/O on each request,
-    while still allowing runtime toggling without restart.
+    Returns (bitrate, normalization)
     """
     global _settings_cache, _settings_cache_lock
 
     current_time = time.time()
     with _settings_cache_lock:
-        # Check if cache is still valid
         if current_time - _settings_cache["last_update_time"] < _SETTINGS_CACHE_TTL:
-            return (
-                _settings_cache["use_passthrough"],
-                _settings_cache["bitrate"],
-                _settings_cache["normalization"],
-            )
+            return _settings_cache["bitrate"], _settings_cache["normalization"]
 
-        # Cache expired, read from addon (expensive)
         try:
             addon = xbmcaddon.Addon(id=ADDON_ID)
-            use_passthrough = addon.getSetting("spotify_passthrough").lower() == "true"
             bitrate_raw = (addon.getSetting("spotify_bitrate") or "320").strip()
             bitrate = bitrate_raw if bitrate_raw in ("96", "160", "320") else "320"
             norm = (addon.getSetting("spotify_normalization") or "auto").strip().lower()
             if norm not in ("off", "auto", "track", "album"):
                 norm = "auto"
 
-            # Update cache
-            _settings_cache["use_passthrough"] = use_passthrough
             _settings_cache["bitrate"] = bitrate
             _settings_cache["normalization"] = norm
             _settings_cache["last_update_time"] = current_time
-
-            return use_passthrough, bitrate, norm
+            return bitrate, norm
         except Exception:
-            # Fallback to cached values if read fails
-            return (
-                _settings_cache["use_passthrough"],
-                _settings_cache["bitrate"],
-                _settings_cache["normalization"],
-            )
+            return _settings_cache["bitrate"], _settings_cache["normalization"]
 
 
 # No debounce: serve every range request immediately so Kodi's seek bar and
@@ -87,127 +66,7 @@ OGG_BPS_BY_BITRATE = {"96": 12000, "160": 20000, "320": 40000}
 OGG_BYTES_PER_SEC = OGG_BPS_BY_BITRATE["320"]  # Default (320 kbps)
 
 
-class _OggStreamBuffer:
-    """Buffers OGG data from a spotty process in a background thread.
-
-    Survives HTTP request lifecycle so Kodi retries read from the same buffer
-    without respawning spotty (which takes ~1.5s to connect to Spotify).
-    The background fill thread owns the spotty process; HTTP generators just
-    read from the accumulated buffer.
-    """
-
-    def __init__(self, spotty: Spotty):
-        self._lock = threading.Lock()
-        self._data = bytearray()
-        self._data_event = threading.Event()  # signalled when new data arrives or finished
-        self._finished = False
-        self._track_id: str = ""
-        self._start_sec: int = 0
-        self._streamer: Optional[SpottyAudioStreamer] = None
-        self._spotty = spotty
-        self._thread: Optional[threading.Thread] = None
-
-    def start(
-        self,
-        track_id: str,
-        duration_sec: float,
-        fake_file_size: int,
-        start_sec: int,
-        bitrate: str,
-        normalization: str,
-        is_passthrough: bool,
-        defer_kill: bool,
-    ) -> None:
-        """Spawn spotty in a background thread and buffer its OGG output."""
-        self._track_id = track_id
-        self._start_sec = start_sec
-
-        # Each buffer gets its own SpottyAudioStreamer to avoid shared-state
-        # races with the main streamer or other buffers.
-        streamer = SpottyAudioStreamer(self._spotty)
-        streamer.bitrate = bitrate
-        streamer.normalization_gain_type = normalization
-        streamer.use_passthrough = True
-        streamer.set_track(track_id, duration_sec, is_passthrough=True)
-        self._streamer = streamer
-
-        def _fill():
-            try:
-                for chunk in streamer.send_part_audio_stream(
-                    range_len=fake_file_size,
-                    range_begin=0,
-                    start_sec=start_sec,
-                    is_passthrough=True,
-                    defer_kill_previous=defer_kill,
-                ):
-                    if chunk:
-                        with self._lock:
-                            if isinstance(chunk, bytes):
-                                self._data.extend(chunk)
-                            else:
-                                self._data.extend(chunk.encode("latin-1"))
-                        self._data_event.set()
-            except (GeneratorExit, BrokenPipeError, ConnectionResetError, OSError):
-                pass
-            except Exception as exc:
-                log_msg(f"OGG buffer fill error: {exc}", LOGDEBUG)
-            finally:
-                with self._lock:
-                    self._finished = True
-                self._data_event.set()
-
-        self._thread = threading.Thread(target=_fill, daemon=True)
-        self._thread.start()
-        log_msg(
-            f"OGG buffer started for track {track_id} "
-            f"(start_sec={start_sec}, fake_size={fake_file_size}).",
-            LOGDEBUG,
-        )
-
-    def read_from(self, offset: int = 0, timeout: float = 10.0):
-        """Generator: yield data from *offset* onwards, blocking for new data.
-
-        The timeout resets every time progress is made (new data yielded).
-        """
-        pos = offset
-        deadline = time.time() + timeout
-        while True:
-            with self._lock:
-                available = len(self._data)
-                if pos < available:
-                    chunk = bytes(self._data[pos:available])
-                    pos = available
-                    yield chunk
-                    deadline = time.time() + timeout
-                    continue
-                if self._finished:
-                    return
-
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                log_msg(
-                    f"OGG buffer read timed out at offset {pos} "
-                    f"(available={available}).",
-                    LOGDEBUG,
-                )
-                return
-            self._data_event.wait(timeout=min(0.5, remaining))
-            self._data_event.clear()
-
-    def stop(self) -> None:
-        """Terminate the background fill thread and its spotty process."""
-        if self._streamer:
-            self._streamer.terminate_stream()
-            self._streamer = None
-        log_msg(f"OGG buffer stopped for track {self._track_id}.", LOGDEBUG)
-
-    @property
-    def track_id(self) -> str:
-        return self._track_id
-
-    @property
-    def start_sec(self) -> int:
-        return self._start_sec
+# OGG passthrough support removed. Only WAV (PCM) streaming is supported.
 
 
 class HTTPSpottyAudioStreamer:
@@ -231,15 +90,12 @@ class HTTPSpottyAudioStreamer:
         ).strip().lower() or "auto"
         self.__spotty_streamer.use_autoplay = use_autoplay
         self.__spotty_streamer.bitrate = bitrate
-
         self.__is_streaming = False
         self.__stream_lock = threading.Lock()
         self.__current_track_id: Optional[str] = None
         self.__current_request_id: str = ""  # Track current request to ignore stale generators
         self.__last_seek_terminate_time = 0.0
         self.__seek_throttle_lock = threading.Lock()
-        self.__ogg_main_buffer: Optional[_OggStreamBuffer] = None  # Primary playback buffer (bytes=0-)
-        self.__ogg_seek_buffer: Optional[_OggStreamBuffer] = None  # Seek/probe buffer (non-zero ranges)
 
     def set_normalization_gain_type(self, value: str) -> None:
         self.__spotty_streamer.normalization_gain_type = (
@@ -252,12 +108,7 @@ class HTTPSpottyAudioStreamer:
 
     def set_stream_ended(self) -> None:
         """Mark that the current stream has finished so the next request starts fresh."""
-        if self.__ogg_main_buffer:
-            self.__ogg_main_buffer.stop()
-            self.__ogg_main_buffer = None
-        if self.__ogg_seek_buffer:
-            self.__ogg_seek_buffer.stop()
-            self.__ogg_seek_buffer = None
+        # Nothing special for OGG — just clear streaming state.
         with self.__stream_lock:
             self.__is_streaming = False
             self.__current_track_id = None
@@ -303,8 +154,8 @@ class HTTPSpottyAudioStreamer:
         # Generate unique request ID to prevent stale generators from executing
         request_id = str(uuid.uuid4())
 
-        # Read settings FIRST — needed to decide from_start behavior per mode.
-        use_passthrough, bitrate, norm = _get_current_stream_settings()
+        # Read settings FIRST.
+        bitrate, norm = _get_current_stream_settings()
 
         request_range = bottle.request.headers.get("Range", "")
         is_new_track = not self.__is_streaming or self.__current_track_id != track_id
@@ -317,18 +168,8 @@ class HTTPSpottyAudioStreamer:
         )
 
         if from_start:
-            if use_passthrough:
-                # OGG passthrough: only re-init if track actually changed.
-                # Spotty takes ~1.5s to connect to Spotify. Kodi's demuxer probe
-                # times out in ~0.5s, causing retries. If we restart spotty on
-                # every retry (bytes=0-), we loop forever — spotty never produces
-                # data fast enough.  Let the existing stream continue for same-track.
-                if self.__current_track_id != track_id:
-                    is_new_track = True
-            else:
-                # WAV mode: always re-init from start (WAV header sent immediately,
-                # so no probe timeout issue). Needed for state recovery after FF storms.
-                is_new_track = True
+            # Always re-init from start for WAV mode (header sent immediately).
+            is_new_track = True
 
         # Fetch prebuffer result (WAV bytes if prebuffer was used).
         prebuf_result = None
@@ -347,15 +188,14 @@ class HTTPSpottyAudioStreamer:
             # prebuffer from the *previous* track selection may still be running
             # (the 5-second deferred start in main_service only delays the *next*
             # prebuffer, it doesn't cancel an already-running one).
-            if self.__prebuffer_manager and use_passthrough:
+            if self.__prebuffer_manager:
                 self.__prebuffer_manager.cancel_prebuffer()
 
             # Set up new track with proper locking to prevent concurrent overwrites
             with self.__stream_lock:
                 self.__spotty_streamer.bitrate = bitrate
                 self.__spotty_streamer.normalization_gain_type = norm
-                self.__spotty_streamer.use_passthrough = use_passthrough
-                self.__spotty_streamer.set_track(track_id, float(duration), is_passthrough=use_passthrough)
+                self.__spotty_streamer.set_track(track_id, float(duration))
                 self.__is_streaming = True
                 self.__current_track_id = track_id
                 self.__current_request_id = request_id
@@ -374,24 +214,15 @@ class HTTPSpottyAudioStreamer:
 
         log_msg(f"Request header range: '{request_range}'.", LOGDEBUG)
 
-        if use_passthrough:
-            return self._handle_ogg_request(
-                is_new_track,
-                request_range,
-                track_id=track_id,
-                duration_str=duration,
-                request_id=request_id,
-            )
-        else:
-            return self._handle_wav_request(
-                is_new_track,
-                request_range,
-                prebuf_result,
-                has_prebuf,
-                track_id=track_id,
-                duration_str=duration,
-                request_id=request_id,
-            )
+        return self._handle_wav_request(
+            is_new_track,
+            request_range,
+            prebuf_result,
+            has_prebuf,
+            track_id=track_id,
+            duration_str=duration,
+            request_id=request_id,
+        )
 
     spotty_stream_audio_track.route = SPOTTY_AUDIO_TRACK_ROUTE
 

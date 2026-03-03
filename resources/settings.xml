@@ -1,9 +1,6 @@
 <?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <settings>
     <category label="11054">
-        <setting id="spotify_passthrough" type="bool" default="false" label="Passthrough (OGG)" help="Use native Spotify OGG codec for faster playback (experimental). Disables when false uses PCM/WAV which is slower but more stable.">
-          <control type="toggle"/>
-        </setting>
         <setting id="spotify_normalization" type="labelenum" label="11075" help="11143" default="auto" lvalues="11134|11135|11136|11137" values="off|auto|track|album"/>
         <setting id="spotify_autoplay" type="bool" default="false" label="11130" help="11131">
           <control type="toggle"/>

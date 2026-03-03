@@ -48,13 +48,11 @@ class PrebufferManager:
         normalization_gain_type: str = "auto",
         prebuffer_seconds: int = PREBUFFER_SECONDS_DEFAULT,
         bitrate: str = "320",
-        use_passthrough: bool = False,
     ):
         self.__spotty = spotty
         self.__normalization_gain_type = (normalization_gain_type or "auto").strip().lower()
         self.__prebuffer_seconds = _clamp_prebuffer_seconds(prebuffer_seconds)
         self.__bitrate: str = bitrate
-        self.__use_passthrough: bool = use_passthrough
         self.__lock = threading.Lock()
         self.__buffer: Optional[bytes] = None
         self.__prebuffer_track_id: Optional[str] = None
@@ -78,19 +76,17 @@ class PrebufferManager:
         duration_sec: float,
         bitrate: Optional[str] = None,
         normalization_gain_type: Optional[str] = None,
-        use_passthrough: Optional[bool] = None,
     ) -> None:
         """Start filling the pre-buffer for the given track in a background thread.
 
-        Optional bitrate, normalization_gain_type override instance defaults so the
+        Optional bitrate and normalization_gain_type override instance defaults so the
         prebuffer uses current addon settings (no restart required).
-        use_passthrough overrides the instance default for this prebuffer operation.
         """
         br = bitrate if bitrate is not None else self.__bitrate
         norm = (normalization_gain_type or self.__normalization_gain_type).strip().lower() or "auto"
         if norm not in ("off", "auto", "track", "album"):
             norm = "auto"
-        use_pt = use_passthrough if use_passthrough is not None else self.__use_passthrough
+        
 
         prebuffer_bytes = self._get_prebuffer_bytes()
         with self.__lock:
@@ -116,13 +112,13 @@ class PrebufferManager:
             streamer = SpottyAudioStreamer(self.__spotty)
             streamer.normalization_gain_type = norm
             streamer.bitrate = br
-            streamer.set_track(track_id, duration_sec, is_passthrough=use_pt)
+            streamer.set_track(track_id, duration_sec)
             with self.__lock:
                 self.__streamer_ref = streamer
 
             collected = bytearray()
             try:
-                for chunk in streamer.send_part_audio_stream(prebuffer_bytes, 0, is_passthrough=use_pt):
+                for chunk in streamer.send_part_audio_stream(prebuffer_bytes, 0):
                     with self.__lock:
                         if self.__cancel_requested or self.__generation != my_gen:
                             return

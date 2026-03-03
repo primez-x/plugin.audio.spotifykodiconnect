@@ -88,9 +88,7 @@ class SpottyAudioStreamer:
         self.__processes_to_cleanup = []  # List of (pid, process) tuples to clean up
         self.__cleanup_lock = None  # Lazy init to avoid import issues
         self.__terminated = False
-
         self.use_normalization = True
-        self.use_passthrough = False  # OGG passthrough mode (no WAV header)
 
     def set_initial_volume(self, value: int) -> None:
         """Set volume (1–100) for the next spotty run."""
@@ -104,8 +102,8 @@ class SpottyAudioStreamer:
         """Track duration in seconds used for the WAV header."""
         return self.__track_duration
 
-    def set_track(self, track_id: str, track_duration: float, is_passthrough: bool = False) -> None:
-        """Set the track to stream; builds WAV header for PCM mode, or skips for OGG passthrough."""
+    def set_track(self, track_id: str, track_duration: float) -> None:
+        """Set the track to stream; builds WAV header for PCM/WAV streaming."""
         self.__track_id = track_id
         try:
             if track_duration <= 0:
@@ -117,13 +115,8 @@ class SpottyAudioStreamer:
             log_msg(f"Warning: Could not parse track duration {track_duration} for track {track_id}. Using 1s fallback.", LOGWARNING)
             self.__track_duration = 1
 
-        # OGG passthrough: no WAV header needed (stream raw OGG)
-        if is_passthrough or self.use_passthrough:
-            self.__wav_header = b""
-            self.__track_length = 0  # Unknown for OGG passthrough
-            log_msg(f"Set track {track_id} for OGG passthrough (duration={self.__track_duration}s).", LOGDEBUG)
-        else:
-            self.__wav_header, self.__track_length = self.__create_wav_header()
+        # Always create WAV header for PCM streaming.
+        self.__wav_header, self.__track_length = self.__create_wav_header()
 
 
     def set_notify_track_finished(self, func: Callable[[str], None]) -> None:
@@ -144,60 +137,42 @@ class SpottyAudioStreamer:
         range_begin: int,
         defer_kill_previous: bool = False,
         start_sec: int = 0,
-        is_passthrough: bool = False,
     ):
-        """
-        Generator: stream WAV or OGG bytes for the given range from the spotty binary.
-        For passthrough OGG, range_begin is ignored and start_sec is used for seeking.
-        """
+        """Generator: stream WAV (PCM) bytes for the given range from the spotty binary."""
         self.__terminated = False
         spotty_process = None
         bytes_sent = 0
         old_pid_to_kill = -1
         try:
-            # For OGG passthrough, use start_sec; for WAV, calculate from range_begin
-            is_ogg = is_passthrough or self.use_passthrough
-            if is_ogg:
-                seek_start_sec = start_sec
-                actual_range_begin = 0
-            else:
-                seek_start_sec = 0
-                actual_range_begin = range_begin
+            # WAV: calculate start position from range_begin
+            seek_start_sec = 0
+            actual_range_begin = range_begin
 
             # Properly handle old process cleanup
             old_pid_to_kill = self.__prepare_stream(defer_kill_previous, actual_range_begin)
-            self._log_transfer("start", range_begin=actual_range_begin, extra_msg=f"passthrough={is_ogg}, start_sec={seek_start_sec}")
+            self._log_transfer("start", range_begin=actual_range_begin, extra_msg=f"start_sec={seek_start_sec}")
 
-            # For WAV: handle header offset and PCM skipping
-            if not is_ogg:
-                header_len = len(self.__wav_header)
-                pcm_target_offset = max(0, actual_range_begin - header_len)
-                pcm_bytes_per_sec = 176400  # 44100 Hz * 2 channels * 2 bytes
-                start_sec_wav = (pcm_target_offset // pcm_bytes_per_sec) if pcm_target_offset > 0 else 0
-                pcm_skip = (pcm_target_offset % pcm_bytes_per_sec) if pcm_target_offset > 0 else 0
+            # WAV: handle header offset and PCM skipping
+            header_len = len(self.__wav_header)
+            pcm_target_offset = max(0, actual_range_begin - header_len)
+            pcm_bytes_per_sec = 176400  # 44100 Hz * 2 channels * 2 bytes
+            start_sec_wav = (pcm_target_offset // pcm_bytes_per_sec) if pcm_target_offset > 0 else 0
+            pcm_skip = (pcm_target_offset % pcm_bytes_per_sec) if pcm_target_offset > 0 else 0
 
-                # Initial chunk: full header, or partial header if range starts inside it.
-                chunk, bytes_sent = self._yield_initial_chunk(actual_range_begin, range_len)
-                if chunk:
-                    yield chunk
-                if self.__terminated or bytes_sent >= range_len:
-                    return
-            else:
-                start_sec_wav = 0
-                pcm_skip = 0
+            # Initial chunk: full header, or partial header if range starts inside it.
+            chunk, bytes_sent = self._yield_initial_chunk(actual_range_begin, range_len)
+            if chunk:
+                yield chunk
+            if self.__terminated or bytes_sent >= range_len:
+                return
 
             if not self.__track_id:
                 self._log_transfer("error", msg="No track ID provided. Aborting stream.")
                 return
 
             track_id_uri = SPOTIFY_TRACK_PREFIX + self.__track_id
-            # Use seek_start_sec for OGG, start_sec_wav for WAV
-            # Pass is_passthrough to ensure spotty args match the requested stream type
-            args = self._build_spotty_args(
-                track_id_uri,
-                seek_start_sec if is_ogg else start_sec_wav,
-                is_passthrough=is_ogg
-            )
+            # Build spotty args: use calculated WAV start second
+            args = self._build_spotty_args(track_id_uri, start_sec_wav)
             if self.__terminated:
                 return
 
@@ -212,7 +187,7 @@ class SpottyAudioStreamer:
                 self._log_transfer("error", msg=f"Spotty process exited immediately with code {spotty_process.returncode}")
                 return
 
-            # Skip initial PCM bytes if needed
+            # Skip initial PCM bytes if needed (for seek)
             if pcm_skip > 0:
                 self._discard_pcm_bytes(proc_stdout, pcm_skip, c_size)
             if self.__terminated:
@@ -364,16 +339,12 @@ class SpottyAudioStreamer:
             return tail[:to_send], to_send
         return b"", 0
 
-    def _build_spotty_args(self, track_id_uri: str, start_sec: int, is_passthrough: bool = False) -> list:
-        """Build the argument list for the spotty subprocess."""
+    def _build_spotty_args(self, track_id_uri: str, start_sec: int) -> list:
+        """Build the argument list for the spotty subprocess (PCM/WAV mode)."""
         args = SPOTTY_STREAMING_BASE_ARGS.copy()
         args += ["--initial-volume", str(self.initial_volume)]
         if self.use_normalization:
             args += SPOTTY_STREAMING_NORMALIZATION_ARGS
-        # OGG passthrough: stream raw Ogg Vorbis instead of PCM
-        # Use is_passthrough parameter (from current request) or fall back to instance setting
-        if is_passthrough or self.use_passthrough:
-            args += ["--passthrough"]
         args += ["--single-track", track_id_uri]
         if start_sec > 0:
             args += ["--start-position", str(start_sec)]

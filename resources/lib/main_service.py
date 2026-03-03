@@ -160,9 +160,6 @@ class MainService:
         use_autoplay = SPOTIFY_ADDON.getSetting("spotify_autoplay").lower() == "true"
         bitrate = self._get_bitrate_setting()
         prebuffer_seconds = self._get_prebuffer_seconds_setting()
-        use_passthrough = (
-            SPOTIFY_ADDON.getSetting("spotify_passthrough").lower() == "true"
-        )
         self.__prebuffer_enabled = (
             SPOTIFY_ADDON.getSetting("prebuffer_enabled").lower() == "true"
         )
@@ -171,7 +168,6 @@ class MainService:
             normalization_gain_type=normalization_setting,
             prebuffer_seconds=prebuffer_seconds,
             bitrate=bitrate,
-            use_passthrough=use_passthrough,
         )
         self.__http_spotty_streamer: HTTPSpottyAudioStreamer = HTTPSpottyAudioStreamer(
             self.__spotty,
@@ -286,15 +282,11 @@ class MainService:
                     )
                     if norm not in ("off", "auto", "track", "album"):
                         norm = "auto"
-                    use_passthrough = (
-                        SPOTIFY_ADDON.getSetting("spotify_passthrough").lower() == "true"
-                    )
                     self.__prebuffer_manager.start_prebuffer(
                         next_track_id,
                         next_duration,
                         bitrate=bitrate,
                         normalization_gain_type=norm,
-                        use_passthrough=use_passthrough,
                     )
                 threading.Thread(target=_deferred_prebuffer, daemon=True).start()
 
