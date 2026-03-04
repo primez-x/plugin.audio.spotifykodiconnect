@@ -61,13 +61,6 @@ def _get_current_stream_settings():
 # flooding us with seeks and freezing the UI.
 SEEK_THROTTLE_SEC = 0.4
 
-# OGG Vorbis byte rates by bitrate (kbps → bytes/sec = kbps * 1000 / 8)
-OGG_BPS_BY_BITRATE = {"96": 12000, "160": 20000, "320": 40000}
-OGG_BYTES_PER_SEC = OGG_BPS_BY_BITRATE["320"]  # Default (320 kbps)
-
-
-# OGG passthrough support removed. Only WAV (PCM) streaming is supported.
-
 
 class HTTPSpottyAudioStreamer:
     def __init__(
@@ -96,6 +89,11 @@ class HTTPSpottyAudioStreamer:
         self.__current_request_id: str = ""  # Track current request to ignore stale generators
         self.__last_seek_terminate_time = 0.0
         self.__seek_throttle_lock = threading.Lock()
+        # Init coordination: when a new-track GET is being initialized, set this
+        # so other concurrent GETs can wait and then reuse the same request id.
+        self.__init_in_progress = False
+        self.__init_event = threading.Event()
+        self.__init_event.set()
 
     def set_normalization_gain_type(self, value: str) -> None:
         self.__spotty_streamer.normalization_gain_type = (
@@ -108,7 +106,6 @@ class HTTPSpottyAudioStreamer:
 
     def set_stream_ended(self) -> None:
         """Mark that the current stream has finished so the next request starts fresh."""
-        # Nothing special for OGG — just clear streaming state.
         with self.__stream_lock:
             self.__is_streaming = False
             self.__current_track_id = None
@@ -121,12 +118,6 @@ class HTTPSpottyAudioStreamer:
 
     def stop(self) -> None:
         log_msg("Stopping spotty audio streaming.", LOGDEBUG)
-        if self.__ogg_main_buffer:
-            self.__ogg_main_buffer.stop()
-            self.__ogg_main_buffer = None
-        if self.__ogg_seek_buffer:
-            self.__ogg_seek_buffer.stop()
-            self.__ogg_seek_buffer = None
         if self.__is_streaming:
             self.__terminate_streaming()
         else:
@@ -171,6 +162,39 @@ class HTTPSpottyAudioStreamer:
             # Always re-init from start for WAV mode (header sent immediately).
             is_new_track = True
 
+        # If this is a new track, coordinate initialization so multiple concurrent
+        # GET handlers don't all start spotty processes in parallel.
+        if is_new_track:
+            with self.__stream_lock:
+                # If another init is already in progress for same track, wait briefly.
+                if self.__init_in_progress and self.__current_track_id == track_id:
+                    log_msg(f"Init already in progress for {track_id}, waiting.", LOGDEBUG)
+                    # Wait up to 1s for init to complete
+                    self.__init_event.wait(1.0)
+                    # After wait, if streamer was initialized, treat as non-new
+                    if self.__is_streaming and self.__current_track_id == track_id:
+                        is_new_track = False
+                        request_id = self.__current_request_id
+                elif self.__is_streaming and self.__current_track_id == track_id:
+                    # Already streaming same track — reuse request id.
+                    is_new_track = False
+                    request_id = self.__current_request_id
+                else:
+                    # We are the initializer for this new track. Reserve slot.
+                    self.__init_in_progress = True
+                    self.__init_event.clear()
+                    self.__is_streaming = True
+                    self.__current_track_id = track_id
+                    self.__current_request_id = request_id
+                    # release lock and continue initialization below
+                    # (will clear init_in_progress after set_track)
+                    pass
+        else:
+            # Not a new track — reuse request id if already streaming this track.
+            with self.__stream_lock:
+                if self.__is_streaming and self.__current_track_id == track_id:
+                    request_id = self.__current_request_id
+
         # Fetch prebuffer result (WAV bytes if prebuffer was used).
         prebuf_result = None
         has_prebuf = False
@@ -199,7 +223,14 @@ class HTTPSpottyAudioStreamer:
                 self.__is_streaming = True
                 self.__current_track_id = track_id
                 self.__current_request_id = request_id
-
+            # Initialization complete — clear init flag and notify waiters.
+            with self.__stream_lock:
+                if self.__init_in_progress:
+                    self.__init_in_progress = False
+                    try:
+                        self.__init_event.set()
+                    except Exception:
+                        pass
             log_msg(
                 f"Start streaming spotify track '{track_id}',"
                 f" track length {self.__spotty_streamer.get_track_length()}."
@@ -228,243 +259,25 @@ class HTTPSpottyAudioStreamer:
 
     def _handle_head_only(self, track_id: str, duration: str):
         """Return headers for HEAD requests without touching any streaming state."""
-        use_passthrough, bitrate, _ = _get_current_stream_settings()
+        bitrate, _ = _get_current_stream_settings()
         try:
             dur = max(1.0, float(duration))
         except (ValueError, TypeError):
             dur = 1.0
 
-        if use_passthrough:
-            ogg_bps = OGG_BPS_BY_BITRATE.get(bitrate, OGG_BYTES_PER_SEC)
-            fake_size = int(dur * ogg_bps)
-            bottle.response.status = 200
-            bottle.response.content_type = "application/ogg"
-            bottle.response.content_length = fake_size
-            bottle.response.headers["Accept-Ranges"] = "bytes"
-        else:
-            # WAV: use streamer's track length if available, else estimate
-            file_size = self.__spotty_streamer.get_track_length()
-            if file_size <= 0:
-                pcm_bps = 44100 * 2 * 2  # 176400 bytes/sec
-                file_size = int(dur * pcm_bps) + 44  # + WAV header
-            bottle.response.status = 200
-            bottle.response.content_type = "audio/x-wav"
-            bottle.response.content_length = file_size
-            bottle.response.headers["Accept-Ranges"] = "bytes"
+        file_size = self.__spotty_streamer.get_track_length()
+        if file_size <= 0:
+            pcm_bps = 44100 * 2 * 2  # 176400 bytes/sec
+            file_size = int(dur * pcm_bps) + 44  # + WAV header
+        bottle.response.status = 200
+        bottle.response.content_type = "audio/x-wav"
+        bottle.response.content_length = file_size
+        bottle.response.headers["Accept-Ranges"] = "bytes"
 
         log_msg(
             f"HEAD response: track={track_id}, content_length={bottle.response.content_length}",
             LOGDEBUG,
         )
-        return ""
-
-    # ------------------------------------------------------------------
-    #  OGG (Passthrough) path — synthetic range mapping
-    # ------------------------------------------------------------------
-
-    def _handle_ogg_request(
-        self,
-        is_new_track,
-        request_range,
-        track_id=None,
-        duration_str=None,
-        request_id=None,
-    ):
-        """Handle OGG passthrough with synthetic range mapping for seeking.
-
-        Uses an _OggStreamBuffer to decouple spotty's lifecycle from the HTTP
-        request.  Spotty takes ~1.5s to connect; Kodi's demuxer probe times out
-        in ~2s.  Without the buffer, every retry kills spotty and restarts it,
-        creating an infinite timeout loop.  The buffer keeps spotty alive in a
-        background thread so retries read from already-buffered data instantly.
-        """
-        # Parse duration from URL parameter
-        _duration_sec = 1.0
-        if track_id and duration_str:
-            try:
-                _duration_sec = max(1.0, float(duration_str))
-                log_msg(
-                    f"OGG: parsed duration_str={duration_str} -> {_duration_sec}s",
-                    LOGDEBUG,
-                )
-            except (ValueError, TypeError):
-                log_msg(
-                    f"OGG: failed to parse duration_str={duration_str}, defaulting to 1.0s",
-                    LOGDEBUG,
-                )
-        else:
-            log_msg(
-                f"OGG: no duration_str provided (track_id={track_id}, duration_str={duration_str}), defaulting to 1.0s",
-                LOGDEBUG,
-            )
-
-        # Synthetic file size for range mapping: duration * actual OGG bitrate
-        bitrate_str = self.__spotty_streamer.bitrate if hasattr(self.__spotty_streamer, 'bitrate') else "320"
-        ogg_bps = OGG_BPS_BY_BITRATE.get(bitrate_str, OGG_BYTES_PER_SEC)
-        fake_file_size = int(_duration_sec * ogg_bps)
-        range_begin = 0
-        start_sec = 0
-        is_seek = False
-
-        # Parse range request and convert to seek position
-        if request_range and "bytes=" in request_range:
-            try:
-                range_part = request_range.split("bytes=", 1)[1].split("-")[0]
-                if range_part:
-                    range_begin = int(range_part)
-                    start_sec = int(range_begin / ogg_bps)
-                    is_seek = not is_new_track and range_begin > 0
-            except (ValueError, IndexError):
-                pass
-
-        # Build HTTP response headers for range requests
-        status = 200
-        content_range = ""
-        if request_range and "bytes=" in request_range:
-            status = "206 Partial Content"
-            range_end = fake_file_size
-            content_range = f"bytes {range_begin}-{range_end - 1}/{fake_file_size}"
-
-        log_msg(
-            f"OGG Passthrough request: track={track_id}, range={request_range}, "
-            f"range_begin={range_begin}, start_sec={start_sec}, is_seek={is_seek}, "
-            f"fake_file_size={fake_file_size}",
-            LOGDEBUG,
-        )
-
-        # Read current settings for the buffer's streamer
-        _use_pt, _bitrate, _norm = _get_current_stream_settings()
-
-        # --- Dual buffer management ---
-        # Main buffer: serves bytes=0- and small-offset reconnections (start_sec==0).
-        # Seek buffer: serves cache probes and seeks (start_sec>0) WITHOUT
-        # destroying the main buffer that is actively streaming playback.
-        is_main_stream = (start_sec == 0)
-
-        # Update request_id for main stream requests only; seek/probe requests
-        # must not invalidate the main stream's generator.
-        if is_main_stream and not is_new_track:
-            with self.__stream_lock:
-                self.__current_request_id = request_id
-
-        # Stale pre-check (main stream only — seek requests bypass this)
-        if is_main_stream and request_id and request_id != self.__current_request_id:
-            log_msg(f"OGG request {request_id} is stale (current: {self.__current_request_id}), returning empty.", LOGDEBUG)
-            bottle.response.status = 204
-            return ""
-
-        if is_new_track:
-            # New track: stop both buffers, create fresh main buffer
-            if self.__ogg_main_buffer:
-                self.__ogg_main_buffer.stop()
-                self.__ogg_main_buffer = None
-            if self.__ogg_seek_buffer:
-                self.__ogg_seek_buffer.stop()
-                self.__ogg_seek_buffer = None
-            log_msg("OGG new track: starting buffer.", LOGDEBUG)
-
-            buf = _OggStreamBuffer(self.__spotty)
-            buf.start(
-                track_id=track_id,
-                duration_sec=_duration_sec,
-                fake_file_size=fake_file_size - range_begin,
-                start_sec=start_sec,
-                bitrate=_bitrate,
-                normalization=_norm,
-                is_passthrough=True,
-                defer_kill=(range_begin == 0),
-            )
-            self.__ogg_main_buffer = buf
-            buffer_to_use = buf
-            read_offset = 0
-
-        elif is_main_stream:
-            # Main stream continuation/retry (start_sec==0).
-            # Reuse main buffer only if it exists and was started at position 0.
-            if (self.__ogg_main_buffer
-                    and self.__ogg_main_buffer.track_id == track_id
-                    and self.__ogg_main_buffer.start_sec == 0):
-                log_msg(
-                    f"OGG retry: reusing main buffer for track {track_id} "
-                    f"(read from offset {range_begin}).",
-                    LOGDEBUG,
-                )
-                buffer_to_use = self.__ogg_main_buffer
-                read_offset = range_begin
-            else:
-                if self.__ogg_main_buffer:
-                    self.__ogg_main_buffer.stop()
-                log_msg("OGG: main buffer missing or wrong position, creating new one.", LOGDEBUG)
-                buf = _OggStreamBuffer(self.__spotty)
-                buf.start(
-                    track_id=track_id,
-                    duration_sec=_duration_sec,
-                    fake_file_size=fake_file_size,
-                    start_sec=0,
-                    bitrate=_bitrate,
-                    normalization=_norm,
-                    is_passthrough=True,
-                    defer_kill=False,
-                )
-                self.__ogg_main_buffer = buf
-                buffer_to_use = buf
-                read_offset = 0
-
-        else:
-            # Seek / cache probe (start_sec > 0).
-            # Use a separate seek buffer — do NOT touch the main playback buffer.
-            if self.__ogg_seek_buffer:
-                self.__ogg_seek_buffer.stop()
-                self.__ogg_seek_buffer = None
-                log_msg("OGG: stopped previous seek buffer.", LOGDEBUG)
-
-            with self.__seek_throttle_lock:
-                now = time.time()
-                elapsed = now - self.__last_seek_terminate_time
-                if elapsed < SEEK_THROTTLE_SEC and self.__last_seek_terminate_time > 0:
-                    time.sleep(SEEK_THROTTLE_SEC - elapsed)
-                self.__last_seek_terminate_time = time.time()
-            log_msg(f"OGG seek/probe to {start_sec}s via seek buffer.", LOGDEBUG)
-
-            buf = _OggStreamBuffer(self.__spotty)
-            buf.start(
-                track_id=track_id,
-                duration_sec=_duration_sec,
-                fake_file_size=fake_file_size - range_begin,
-                start_sec=start_sec,
-                bitrate=_bitrate,
-                normalization=_norm,
-                is_passthrough=True,
-                defer_kill=False,
-            )
-            self.__ogg_seek_buffer = buf
-            buffer_to_use = buf
-            read_offset = 0
-
-        def generate():
-            if is_main_stream:
-                with self.__stream_lock:
-                    if request_id and request_id != self.__current_request_id:
-                        log_msg(f"OGG generator for request {request_id} is stale, aborting.", LOGDEBUG)
-                        return
-
-            try:
-                yield from buffer_to_use.read_from(offset=read_offset, timeout=10.0)
-            except GeneratorExit:
-                raise
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                log_msg("OGG stream read/write error, not clearing state.", LOGDEBUG)
-                raise
-
-        bottle.response.status = status
-        bottle.response.headers["Accept-Ranges"] = "bytes"
-        bottle.response.content_type = "application/ogg"
-        bottle.response.content_length = fake_file_size - range_begin
-        if content_range:
-            bottle.response.headers["Content-Range"] = content_range
-
-        if bottle.request.method.upper() == "GET":
-            return generate()
         return ""
 
     # ------------------------------------------------------------------
@@ -499,13 +312,30 @@ class HTTPSpottyAudioStreamer:
         # For new tracks, set_track() was already called in spotty_stream_audio_track() inside the lock.
         # This is just a safety net for recovery if file_size is invalid.
         if (file_size <= 0 or file_size < 50000) and track_id:
-            streamer.set_track(track_id, _duration_sec)
-            file_size = streamer.get_track_length()
-            range_end = file_size
-            log_msg(
-                f"Recovered track length from URL (duration={_duration_sec}s), file_size={file_size}.",
-                LOGDEBUG,
-            )
+            # Compute WAV header length without mutating shared streamer state to
+            # ensure HEAD/early requests can return accurate Content-Length.
+            try:
+                from spotty_audio_streamer import create_wav_header_for_duration
+
+                _, total_length = create_wav_header_for_duration(_duration_sec)
+                file_size = total_length
+                range_end = file_size
+                log_msg(
+                    f"Computed WAV header length from duration={_duration_sec}s -> file_size={file_size}.",
+                    LOGDEBUG,
+                )
+            except Exception:
+                # Fallback to previous behavior (mutating streamer) if static header generation fails.
+                try:
+                    streamer.set_track(track_id, _duration_sec)
+                    file_size = streamer.get_track_length()
+                    range_end = file_size
+                    log_msg(
+                        f"Recovered track length from URL (duration={_duration_sec}s), file_size={file_size}.",
+                        LOGDEBUG,
+                    )
+                except Exception:
+                    pass
 
         prebuf_data = prebuf_result.data if (has_prebuf and prebuf_result) else None
 
@@ -538,7 +368,8 @@ class HTTPSpottyAudioStreamer:
             except (ValueError, IndexError, KeyError):
                 range_begin = 0
                 range_end = file_size
-            content_range = f"bytes {range_begin}-{range_end}/{file_size}"
+            # Content-Range end is inclusive — use range_end - 1
+            content_range = f"bytes {range_begin}-{range_end - 1}/{file_size}"
             if not is_new_track and range_begin > 0:
                 is_seek = True
             # User selected a different track (e.g. from playlist while one was playing).
@@ -547,7 +378,7 @@ class HTTPSpottyAudioStreamer:
             # rest using its cache.chunksize for everything after.
             if is_new_track and range_begin > 0:
                 range_begin = 0
-                range_end = min(file_size, 256)
+                range_end = min(file_size, 65536)
                 content_range = f"bytes 0-{range_end - 1}/{file_size}"
                 status = "206 Partial Content"
                 log_msg(

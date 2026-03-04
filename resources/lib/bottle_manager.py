@@ -12,7 +12,7 @@ STREAMING_TIMEOUT_IN_SECS = 600
 
 
 def __bottle_stderr(*args):
-    log_msg(f"{args}")
+    log_msg(f"{args}", LOGDEBUG)
 
 
 bottle._stderr = __bottle_stderr

@@ -15,18 +15,15 @@ from utils import bytes_to_megabytes, kill_process_by_pid, log_msg, log_exceptio
 SPOTIFY_TRACK_PREFIX = "spotify:track:"
 
 SPOTIFY_BITRATE = "320"
-SPOTTY_GAIN_TYPE = "track"
-SPOTTY_STREAMING_BASE_ARGS = [
-    "--disable-audio-cache",
-    "--disable-discovery",
-    "--bitrate",
-    SPOTIFY_BITRATE,
-]
-SPOTTY_STREAMING_NORMALIZATION_ARGS = [
-    "--enable-volume-normalisation",
-    "--normalisation-gain-type",
-    SPOTTY_GAIN_TYPE,
-]
+_VALID_BITRATES = ("96", "160", "320")
+_VALID_GAIN_TYPES = ("auto", "track", "album")
+_DEFAULT_GAIN_TYPE = "track"
+
+# Maximum bytes of PCM silence to pad at the end of a stream when spotty exits
+# cleanly but short of the WAV-declared length. 10 seconds @ 176400 B/s = 1,764,000.
+# Duration mismatches between the declared track length and spotty's actual output
+# are typically < 10 s; larger gaps indicate a real error and should not be masked.
+_SILENCE_PADDING_MAX_BYTES = 176400 * 10
 
 
 def _clamp_volume(value: int) -> int:
@@ -86,9 +83,13 @@ class SpottyAudioStreamer:
         self.__notify_track_finished: Callable[[str], None] = lambda x: None
         self.__current_spotty_pid = -1  # Currently active process
         self.__processes_to_cleanup = []  # List of (pid, process) tuples to clean up
-        self.__cleanup_lock = None  # Lazy init to avoid import issues
+        self.__cleanup_lock = threading.Lock()
         self.__terminated = False
-        self.use_normalization = True
+
+        # Streaming settings — updated by the HTTP layer before each track.
+        self.normalization_gain_type: str = _DEFAULT_GAIN_TYPE
+        self.bitrate: str = SPOTIFY_BITRATE
+        self.use_autoplay: bool = False
 
     def set_initial_volume(self, value: int) -> None:
         """Set volume (1–100) for the next spotty run."""
@@ -184,7 +185,13 @@ class SpottyAudioStreamer:
 
             # Handle the case where spotty process immediately exits
             if spotty_process.poll() is not None:
-                self._log_transfer("error", msg=f"Spotty process exited immediately with code {spotty_process.returncode}")
+                # Attempt to capture stderr for diagnostics
+                try:
+                    out, err = spotty_process.communicate(timeout=0.1)
+                    extra = f" stdout_len={len(out) if out else 0} stderr_len={len(err) if err else 0}"
+                except Exception:
+                    extra = ""
+                self._log_transfer("error", msg=f"Spotty process exited immediately with code {spotty_process.returncode}.{extra}")
                 return
 
             # Skip initial PCM bytes if needed (for seek)
@@ -194,15 +201,27 @@ class SpottyAudioStreamer:
                 return
 
             frame = proc_stdout.read(c_size)
-            
-            # Handle case where no data is read
+
+            # Handle case where no data is read: give spotty a moment to start producing data
             if not frame:
-                # Give spotty a moment to start producing data
-                for _ in range(10):  # Reduced from 50 to avoid hanging
+                for _ in range(20):  # a bit more tolerant on slow starts
                     if self.__terminated:
                         return
                     if spotty_process.poll() is not None:
-                        self._log_transfer("error", msg="Spotty process exited during startup")
+                        remaining = range_len - bytes_sent
+                        if spotty_process.returncode == 0 and 0 < remaining <= _SILENCE_PADDING_MAX_BYTES:
+                            # Spotty exited cleanly but short of the WAV-declared length
+                            # (common when seeking near the end of a track). Pad with silence
+                            # so Kodi sees a complete stream and doesn't retry-loop forever.
+                            log_msg(
+                                f"Track '{self.__track_id}': padding {remaining} bytes of silence "
+                                f"(spotty exited during startup at byte {range_begin}, {remaining} bytes short).",
+                                LOGDEBUG,
+                            )
+                            yield bytes(remaining)
+                            bytes_sent += remaining
+                        else:
+                            self._log_transfer("error", msg="Spotty process exited during startup")
                         return
                     time.sleep(0.1)
                     frame = proc_stdout.read(c_size)
@@ -215,7 +234,9 @@ class SpottyAudioStreamer:
 
             # Seek-to-start handling: send first chunk, then queue old process for cleanup
             if old_pid_to_kill != -1 and frame and bytes_sent < range_len:
-                first_pcm = min(212, len(frame), range_len - bytes_sent)
+                # Send an immediate PCM slice to help Kodi demuxer probe quickly.
+                # Use 64KB to avoid being too small for probing.
+                first_pcm = min(65536, len(frame), range_len - bytes_sent)
                 if first_pcm > 0:
                     yield frame[:first_pcm]
                     bytes_sent += first_pcm
@@ -229,7 +250,8 @@ class SpottyAudioStreamer:
                 if self.__terminated:
                     return
                 if spotty_process.poll() is not None:
-                    self._log_transfer("error", msg="Spotty process exited unexpectedly")
+                    rc = spotty_process.returncode
+                    self._log_transfer("error", msg=f"Spotty process exited unexpectedly with code {rc}")
                     break
                 bytes_sent += len(frame)
                 if bytes_sent % 10485760 < c_size:
@@ -237,11 +259,23 @@ class SpottyAudioStreamer:
                 yield frame
                 frame = proc_stdout.read(c_size)
 
+            # Pad with PCM silence if spotty exited cleanly but slightly short of the
+            # WAV-declared length. This prevents Kodi from retrying the range request
+            # in an infinite loop when the track duration was rounded up by a few seconds.
+            if not self.__terminated and bytes_sent < range_len and spotty_process:
+                remaining = range_len - bytes_sent
+                rc = spotty_process.returncode
+                if rc == 0 and 0 < remaining <= _SILENCE_PADDING_MAX_BYTES:
+                    log_msg(
+                        f"Track '{self.__track_id}': padding {remaining} bytes of silence "
+                        f"(spotty exited {remaining} bytes short of WAV declared length).",
+                        LOGDEBUG,
+                    )
+                    yield bytes(remaining)
+                    bytes_sent += remaining
+
             end_of_range = range_begin + bytes_sent
             # WAV mode: track_length is known, fire when all bytes sent.
-            # OGG mode: track_length is 0 (unknown). Do NOT fire here —
-            # spotty exits for many reasons (connection stolen, crash, etc).
-            # Kodi handles OGG track transitions via Content-Length/range.
             if self.__track_length > 0 and end_of_range >= self.__track_length and range_begin == 0:
                 self.__notify_track_finished(self.__track_id)
             self._log_transfer("finished", range_begin=range_begin, bytes_sent=bytes_sent)
@@ -280,17 +314,19 @@ class SpottyAudioStreamer:
 
     def __add_to_cleanup_queue(self, pid: int) -> None:
         """Add a process PID to the cleanup queue to be killed asynchronously."""
-        if pid != -1:
+        if pid == -1:
+            return
+        with self.__cleanup_lock:
             self.__processes_to_cleanup.append(pid)
 
     def __cleanup_old_processes(self) -> None:
         """Queue cleanup of old processes asynchronously so it doesn't block stream startup."""
-        if not self.__processes_to_cleanup:
-            return
-
-        # Copy the list and clear it immediately
-        pids_to_kill = self.__processes_to_cleanup.copy()
-        self.__processes_to_cleanup.clear()
+        with self.__cleanup_lock:
+            if not self.__processes_to_cleanup:
+                return
+            # Copy the list and clear it immediately
+            pids_to_kill = self.__processes_to_cleanup.copy()
+            self.__processes_to_cleanup.clear()
 
         # Kill processes in background thread to avoid blocking new playback
         def _kill_async():
@@ -340,12 +376,21 @@ class SpottyAudioStreamer:
         return b"", 0
 
     def _build_spotty_args(self, track_id_uri: str, start_sec: int) -> list:
-        """Build the argument list for the spotty subprocess (PCM/WAV mode)."""
-        args = SPOTTY_STREAMING_BASE_ARGS.copy()
-        args += ["--initial-volume", str(self.initial_volume)]
-        if self.use_normalization:
-            args += SPOTTY_STREAMING_NORMALIZATION_ARGS
+        """Build the argument list for the spotty subprocess."""
+        bitrate = self.bitrate if self.bitrate in _VALID_BITRATES else SPOTIFY_BITRATE
+        args = [
+            "--disable-audio-cache",
+            "--disable-discovery",
+            "--bitrate", bitrate,
+            "--initial-volume", str(self.initial_volume),
+        ]
+        gain_type = self.normalization_gain_type
+        if gain_type != "off":
+            effective_gain = gain_type if gain_type in _VALID_GAIN_TYPES else _DEFAULT_GAIN_TYPE
+            args += ["--enable-volume-normalisation", "--normalisation-gain-type", effective_gain]
         args += ["--single-track", track_id_uri]
+        if self.use_autoplay:
+            args += ["--autoplay"]
         if start_sec > 0:
             args += ["--start-position", str(start_sec)]
         return args
@@ -376,7 +421,7 @@ class SpottyAudioStreamer:
         if phase == "start":
             log_msg(
                 f"Start transfer for track '{tid}' range_begin={range_begin}, "
-                f"norm={self.use_normalization}, vol={self.initial_volume}, "
+                f"norm={self.normalization_gain_type}, vol={self.initial_volume}, "
                 f"length={self.__track_length} ({bytes_to_megabytes(self.__track_length):.1f}MB). {extra_msg}",
                 LOGDEBUG,
             )
@@ -438,28 +483,73 @@ class SpottyAudioStreamer:
                 b"data",  # Chunk id
                 data_size,  # Chunk size (excluding chunk id and this field)
             )
-            
-            # Calculate total header size
-            header_size = 4 + 4 + 8 + 16 + 8 + data_size  # RIFF + size + WAVE + fmt + size + data + size
-            
-            # Generate main header.
+            # Standard WAV: RIFF size = 36 + data_size (4 + (8+16) + (8+data_size))
+            riff_size = 36 + data_size
             main_header_spec = "<4sL4s"
             main_header = struct.pack(
                 main_header_spec,
                 b"RIFF",  # Chunk id
-                header_size - 8,  # Size of the rest of the file (excluding RIFF and size fields)
+                riff_size,  # Size of the rest of the file (excluding RIFF and size fields)
                 b"WAVE",  # Format
             )
 
-            # Write all the contents in.
+            # Write all the header contents.
             file.write(main_header)
             file.write(format_chunk)
             file.write(data_chunk)
 
-            total_length = header_size
-            return file.getvalue(), total_length
+            header_bytes = file.getvalue()
+            header_len = len(header_bytes)
+            total_length = header_len + data_size
+            return header_bytes, total_length
 
         except Exception as exc:
             log_exception(exc, "Failed to create wave header.")
             raise  # Re-raise to fail fast
+
+
+def create_wav_header_for_duration(duration_sec: float) -> Tuple[bytes, int]:
+    """Create a WAV header and total stream length for a given duration (no side effects)."""
+    try:
+        file = BytesIO()
+        num_samples = 44100 * int(max(1, duration_sec))
+        channels = 2
+        sample_rate = 44100
+        bits_per_sample = 16
+
+        # Generate format chunk.
+        format_chunk_spec = "<4sLHHLLHH"
+        format_chunk = struct.pack(
+            format_chunk_spec,
+            b"fmt ",
+            16,
+            1,
+            channels,
+            sample_rate,
+            sample_rate * channels * (bits_per_sample // 8),
+            channels * (bits_per_sample // 8),
+            bits_per_sample,
+        )
+
+        # Generate data chunk.
+        data_chunk_spec = "<4sL"
+        data_size = int(num_samples * channels * (bits_per_sample // 8))
+        data_chunk = struct.pack(data_chunk_spec, b"data", data_size)
+
+        # Standard WAV: RIFF size = 36 + data_size
+        riff_size = 36 + data_size
+        main_header_spec = "<4sL4s"
+        main_header = struct.pack(main_header_spec, b"RIFF", riff_size, b"WAVE")
+
+        file.write(main_header)
+        file.write(format_chunk)
+        file.write(data_chunk)
+
+        header_bytes = file.getvalue()
+        header_len = len(header_bytes)
+        total_length = header_len + data_size
+        return header_bytes, total_length
+    except Exception as exc:
+        log_exception(exc, "Failed to create wave header (static).")
+        raise
 

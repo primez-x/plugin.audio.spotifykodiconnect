@@ -29,6 +29,13 @@ PREBUFFER_SECONDS_MIN = 5
 PREBUFFER_SECONDS_MAX = 30
 PREBUFFER_SECONDS_DEFAULT = 15
 
+# A prebuffer that only contains the 44-byte WAV header is useless — it causes
+# the HTTP layer to open a follow-up spotty process for everything else, which
+# then races the main stream for the single Spotify connection and fails.
+# Require at least 1 full second of audio beyond the header before storing.
+WAV_HEADER_SIZE = 44
+_MIN_USEFUL_PREBUFFER_BYTES = WAV_HEADER_SIZE + WAV_BYTES_PER_SECOND
+
 
 def _clamp_prebuffer_seconds(seconds: int) -> int:
     """Clamp pre-buffer seconds to allowed range 5–30."""
@@ -96,6 +103,7 @@ class PrebufferManager:
             if self.__prebuffer_track_id == track_id:
                 return
             self.__cancel_requested = True
+            old_thread = self.__thread
             if self.__streamer_ref:
                 try:
                     self.__streamer_ref.terminate_stream()
@@ -104,9 +112,17 @@ class PrebufferManager:
                 self.__streamer_ref = None
             self.__buffer = None
             self.__prebuffer_track_id = None
+            self.__thread = None
             self.__cancel_requested = False
             self.__generation += 1
             my_gen = self.__generation
+
+        # If there was a previous prebuffer thread, join briefly to allow its teardown.
+        try:
+            if old_thread and old_thread.is_alive():
+                old_thread.join(timeout=0.5)
+        except Exception:
+            pass
 
         def _fill():
             streamer = SpottyAudioStreamer(self.__spotty)
@@ -132,12 +148,23 @@ class PrebufferManager:
                         break
 
                 with self.__lock:
-                    if not self.__cancel_requested and self.__generation == my_gen and self.__prebuffer_track_id is None:
+                    if (
+                        not self.__cancel_requested
+                        and self.__generation == my_gen
+                        and self.__prebuffer_track_id is None
+                        and len(collected) >= _MIN_USEFUL_PREBUFFER_BYTES
+                    ):
                         self.__buffer = bytes(collected[:prebuffer_bytes])
                         self.__prebuffer_track_id = track_id
                         log_msg(
                             "Prebuffer ready for track %s (%d bytes, %d sec)"
                             % (track_id, len(self.__buffer), self.__prebuffer_seconds),
+                            LOGDEBUG,
+                        )
+                    elif len(collected) < _MIN_USEFUL_PREBUFFER_BYTES:
+                        log_msg(
+                            "Prebuffer discarded for track %s: only %d bytes collected (spotty exited too early)."
+                            % (track_id, len(collected)),
                             LOGDEBUG,
                         )
             except Exception as e:
@@ -169,6 +196,8 @@ class PrebufferManager:
 
     def cancel_prebuffer(self) -> None:
         """Stop any running pre-buffer and clear state."""
+        # Mark cancel under lock and capture thread reference; join outside lock.
+        thread_to_join = None
         with self.__lock:
             self.__cancel_requested = True
             if self.__streamer_ref:
@@ -179,6 +208,15 @@ class PrebufferManager:
                 self.__streamer_ref = None
             self.__buffer = None
             self.__prebuffer_track_id = None
+            thread_to_join = self.__thread
+            self.__thread = None
+
+        if thread_to_join:
+            try:
+                if thread_to_join.is_alive():
+                    thread_to_join.join(timeout=0.5)
+            except Exception:
+                pass
 
     def set_normalization_gain_type(self, value: str) -> None:
         self.__normalization_gain_type = (value or "auto").strip().lower()
