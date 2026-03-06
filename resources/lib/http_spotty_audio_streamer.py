@@ -57,10 +57,6 @@ def _get_current_stream_settings():
 # No debounce: serve every range request immediately so Kodi's seek bar and
 # Player.Progress update right away. Let Kodi drive; we just fulfill each request.
 
-# Minimum seconds between seek restarts (terminate+new spotty). Stops held FF from
-# flooding us with seeks and freezing the UI.
-SEEK_THROTTLE_SEC = 0.4
-
 
 class HTTPSpottyAudioStreamer:
     def __init__(
@@ -87,8 +83,6 @@ class HTTPSpottyAudioStreamer:
         self.__stream_lock = threading.Lock()
         self.__current_track_id: Optional[str] = None
         self.__current_request_id: str = ""  # Track current request to ignore stale generators
-        self.__last_seek_terminate_time = 0.0
-        self.__seek_throttle_lock = threading.Lock()
         # Init coordination: when a new-track GET is being initialized, set this
         # so other concurrent GETs can wait and then reuse the same request id.
         self.__init_in_progress = False
@@ -109,6 +103,11 @@ class HTTPSpottyAudioStreamer:
         with self.__stream_lock:
             self.__is_streaming = False
             self.__current_track_id = None
+
+    def is_current_track_streaming(self, track_id: str) -> bool:
+        """Check if the given track is still being streamed to Kodi."""
+        with self.__stream_lock:
+            return self.__is_streaming and self.__current_track_id == track_id
 
     def set_on_track_started(self, func: Callable[[str, float], None]) -> None:
         self.__on_track_started = func or (lambda _id, _dur: None)
@@ -393,10 +392,8 @@ class HTTPSpottyAudioStreamer:
 
         # Re-apply this request's track at stream time so we stream the correct track even if
         # a concurrent request overwrote the shared streamer (reduces wrong-track/0-length).
-        # defer_kill_previous: when starting a new track from byte 0, defer killing the old
-        # spotty until after the first chunk is sent (avoids seek-to-start triggering
-        # "next track" on the old connection and causing 0-sec skip storms).
-        is_seek_to_start = is_new_track and range_begin == 0
+        # We NO LONGER defer killing the previous spotty. The background cache handles it.
+        is_seek_to_start = False
 
         # Check if this request is stale BEFORE returning generator (before HTTP headers commit)
         if request_id and request_id != self.__current_request_id:
@@ -414,23 +411,14 @@ class HTTPSpottyAudioStreamer:
 
             try:
                 if is_seek:
-                    with self.__seek_throttle_lock:
-                        now = time.time()
-                        elapsed = now - self.__last_seek_terminate_time
-                        if (
-                            elapsed < SEEK_THROTTLE_SEC
-                            and self.__last_seek_terminate_time > 0
-                        ):
-                            time.sleep(SEEK_THROTTLE_SEC - elapsed)
-                        self.__last_seek_terminate_time = time.time()
                     self.__terminate_streaming()
                     log_msg(
-                        f"Seek to byte {range_begin}, streaming immediately.", LOGDEBUG
+                        f"Seek to byte {range_begin}, streaming immediately from cache.", LOGDEBUG
                     )
                 elif is_new_track:
                     self.__terminate_streaming()
                     log_msg(
-                        "New track: terminated previous stream, streaming new track.",
+                        "New track: terminated previous stream, streaming new track from cache.",
                         LOGDEBUG,
                     )
 
@@ -446,11 +434,11 @@ class HTTPSpottyAudioStreamer:
                         rest_begin = max(r_begin, prebuffer_len)
                         rest_len = r_end - rest_begin
                         yield from streamer.send_part_audio_stream(
-                            rest_len, rest_begin, defer_kill_previous=is_seek_to_start
+                            rest_len, rest_begin
                         )
                 else:
                     yield from streamer.send_part_audio_stream(
-                        r_len, r_begin, defer_kill_previous=is_seek_to_start
+                        r_len, r_begin
                     )
             except GeneratorExit:
                 # Back can mean "close OSD" (playback continues) or "cancel". Do NOT clear
@@ -463,7 +451,7 @@ class HTTPSpottyAudioStreamer:
                 # clearing would make the next request look like a new track and cause
                 # desync, no audio, and skip storms. Only GeneratorExit means client left.
                 log_msg(
-                    "Stream read/write error (likely seek killed stream), not clearing state.",
+                    "Stream read/write error, not clearing state.",
                     LOGDEBUG,
                 )
                 raise

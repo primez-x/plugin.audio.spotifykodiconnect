@@ -17,7 +17,7 @@ import xbmcgui
 from http_spotty_audio_streamer import HTTPSpottyAudioStreamer
 from nexttrack_broadcast import broadcast_to_nexttrack
 from playlist_next import get_next_playlist_item, parse_track_url
-from prebuffer import PrebufferManager, _clamp_prebuffer_seconds
+from prebuffer import PrebufferManager
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import WELCOME_AUTHENTICATED_STR_ID
@@ -159,14 +159,12 @@ class MainService:
             normalization_setting = "auto"
         use_autoplay = SPOTIFY_ADDON.getSetting("spotify_autoplay").lower() == "true"
         bitrate = self._get_bitrate_setting()
-        prebuffer_seconds = self._get_prebuffer_seconds_setting()
         self.__prebuffer_enabled = (
             SPOTIFY_ADDON.getSetting("prebuffer_enabled").lower() == "true"
         )
         self.__prebuffer_manager: PrebufferManager = PrebufferManager(
             self.__spotty,
             normalization_gain_type=normalization_setting,
-            prebuffer_seconds=prebuffer_seconds,
             bitrate=bitrate,
         )
         self.__http_spotty_streamer: HTTPSpottyAudioStreamer = HTTPSpottyAudioStreamer(
@@ -273,24 +271,23 @@ class MainService:
             # causes it to compete with the main spotty, making both fail.
             if prebuffer_enabled:
                 def _deferred_prebuffer():
-                    # Start the prebuffer shortly before the current track ends so the
-                    # prebuffer process doesn't compete for the Spotify connection for
-                    # the entire track duration. Calculate delay relative to the current
-                    # track duration (duration_sec).
-                    try:
-                        prebuffer_secs = self._get_prebuffer_seconds_setting()
-                        # Safety margin (seconds) to allow spotty to stabilize and avoid racing.
-                        PREBUFFER_LEAD_SEC = 2
-                        # duration_sec is passed into __on_track_started as float(duration_sec)
-                        current_duration = float(duration_sec) if duration_sec else 0.0
-                        # Desired start time = current_duration - prebuffer_secs - PREBUFFER_LEAD_SEC
-                        wait_seconds = max(1.0, current_duration - prebuffer_secs - PREBUFFER_LEAD_SEC)
-                    except Exception:
-                        # Fallback to a short delay if anything goes wrong.
-                        wait_seconds = 1.0
+                    # Wait for the main stream to finish downloading to the disk cache
+                    # Because librespot only supports one stream per account,
+                    # starting prebuffer while the main track is still downloading
+                    # will kick the main stream and cause skips/glitches.
+                    from spotty_cache import SpottyCacheManager
+                    
+                    def is_main_downloading():
+                        dl = SpottyCacheManager.find_best_downloader(track_id, 0)
+                        return dl is not None and not dl.is_finished and not dl.error and not dl.aborted
 
-                    # Sleep until the computed time before starting prebuffer.
-                    time.sleep(wait_seconds)
+                    # Wait a little bit for the main downloader to register and start
+                    time.sleep(2.0)
+
+                    while is_main_downloading():
+                        time.sleep(1.0)
+
+                    log_msg(f"Main track {track_id} finished downloading. Safe to start prebuffer for next track.", LOGDEBUG)
 
                     bitrate = self._get_bitrate_setting()
                     norm = (
@@ -497,9 +494,6 @@ class MainService:
             if (loop_counter % 10) == 0:
                 log_msg(f"Main loop continuing. Loop counter: {loop_counter}.")
 
-            self.__prebuffer_manager.set_prebuffer_seconds(
-                self._get_prebuffer_seconds_setting()
-            )
             prebuffer_enabled_now = (
                 SPOTIFY_ADDON.getSetting("prebuffer_enabled").lower() == "true"
             )
@@ -529,6 +523,8 @@ class MainService:
 
     def __close(self) -> None:
         log_msg("Shutdown requested.")
+        from spotty_cache import SpottyCacheManager
+        SpottyCacheManager.cleanup_all()
         self.__prebuffer_manager.cancel_prebuffer()
         self.__http_spotty_streamer.stop()
         self.__spotty_helper.kill_all_spotties()
@@ -540,16 +536,6 @@ class MainService:
         """Return the bitrate setting string, validated to one of '96', '160', '320'."""
         v = (SPOTIFY_ADDON.getSetting("spotify_bitrate") or "320").strip()
         return v if v in ("96", "160", "320") else "320"
-
-    def _get_prebuffer_seconds_setting(self) -> int:
-        """
-        Prebuffer duration (seconds). Clamped to 5–30 for memory safety.
-        """
-        try:
-            v = int(SPOTIFY_ADDON.getSetting("prebuffer_seconds") or 15)
-            return _clamp_prebuffer_seconds(v)
-        except (TypeError, ValueError):
-            return _clamp_prebuffer_seconds(15)
 
     def __renew_token(self) -> None:
         try:

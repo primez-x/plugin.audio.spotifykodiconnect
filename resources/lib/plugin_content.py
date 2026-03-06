@@ -985,13 +985,14 @@ class PluginContent:
             market=self.__user_country,
         )
         cache_str = f"spotify.playlistdetails.{playlist['id']}"
-        # For dynamic playlists like Daylist, use snapshot_id to detect content changes
-        # For static playlists, fall back to total track count
+        # Spotify-curated playlists (Daylist, Daily Mixes, Discover Weekly, etc.) are
+        # owned by "spotify" and their snapshot_id does not reliably update in the API
+        # response when content changes (CDN/batch lag). Always fetch fresh for these.
+        is_spotify_curated = playlist.get("owner", {}).get("id") == "spotify"
         content_version = playlist.get("snapshot_id") or playlist["tracks"]["total"]
-        # Create a more robust checksum for playlists to detect content changes
         playlist_checksum = f"{content_version}-{playlist.get('snapshot_id', '')}"
         checksum = self.__cache_checksum(playlist_checksum)
-        playlist_details = self.cache.get(cache_str, checksum=checksum)
+        playlist_details = None if is_spotify_curated else self.cache.get(cache_str, checksum=checksum)
         expected_total = playlist["tracks"]["total"] or 0
         cached_items = (
             playlist_details.get("tracks", {}).get("items")
@@ -1024,13 +1025,8 @@ class PluginContent:
             playlist_details["tracks"]["items"] = self.__prepare_track_listitems(
                 tracks=playlist_details["tracks"]["items"], playlist_details=playlist
             )
-            # log_msg(f"playlist_details = {playlist_details}")
-            # For dynamic playlists like Daylist, use snapshot_id to detect content changes
-            # For static playlists, fall back to total track count
-            playlist_checksum = f"{content_version}-{playlist.get('snapshot_id', '')}"
-            checksum = self.__cache_checksum(playlist_checksum)
-            self.cache.set(cache_str, playlist_details, checksum=checksum)
-            # log_msg(f"Got new playlist - checksum = '{checksum}'")
+            if not is_spotify_curated:
+                self.cache.set(cache_str, playlist_details, checksum=checksum)
             cache_log(
                 f"Retrieved {playlist['tracks']['total']} UNCACHED playlist details"
                 f' for "{playlist["name"]}".'

@@ -9,8 +9,7 @@
         <setting id="prebuffer_enabled" type="bool" default="true" label="11107">
           <control type="toggle"/>
         </setting>
-        <setting id="prebuffer_seconds" type="slider" default="15" label="11097" help="11098" range="5,1,30" option="int"/>
-        <setting id="broadcast_to_service_nexttrack" type="bool" default="true" label="11111" help="11112">
+<setting id="broadcast_to_service_nexttrack" type="bool" default="true" label="11111" help="11112">
           <control type="toggle"/>
         </setting>
     </category>
