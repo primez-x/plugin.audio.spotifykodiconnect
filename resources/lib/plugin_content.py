@@ -576,6 +576,7 @@ class PluginContent:
         if artist_desc:
             li.setProperty("Artist_Description", artist_desc)
 
+
         li.setArt(
             _art_for_track(
                 track, "DefaultMusicSongs.png", track.get("artist_fanart") or ""
@@ -1037,6 +1038,9 @@ class PluginContent:
     def browse_playlist(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "songs")
         playlist_details = self.__get_playlist_details(self.__playlist_id)
+        xbmcplugin.setPluginCategory(
+            self.__addon_handle, playlist_details.get("name", "")
+        )
         xbmcplugin.setProperty(
             self.__addon_handle, "FolderName", playlist_details["name"]
         )
@@ -1407,6 +1411,7 @@ class PluginContent:
 
             if playlist_details:
                 track["playlistid"] = playlist_details["id"]
+
 
             track["contextitems"] = self.__get_playlist_track_context_menu_items(
                 track, saved_track_ids, playlist_details, followed_artists
