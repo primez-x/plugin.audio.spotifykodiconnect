@@ -10,11 +10,12 @@ from typing import Callable, Optional
 
 import bottle
 import spotipy
+import xbmc
 import xbmcaddon
 import xbmcgui
 from spotty import Spotty
 from spotty_audio_streamer import SpottyAudioStreamer
-from utils import ADDON_ID, LOGDEBUG, get_cached_auth_token, log_msg
+from utils import ADDON_ID, ADDON_WINDOW_ID, LOGDEBUG, get_cached_auth_token, log_msg
 
 
 _settings_cache = {

@@ -55,30 +55,34 @@ class _SpotifyOSDServiceMonitor(xbmc.Monitor):
             sender == "plugin.audio.spotifykodiconnect"
             and method == "Other.ToggleLike"
         ):
+            log_msg("ToggleLike notification received, spawning handler.", LOGDEBUG)
             threading.Thread(target=self._handle_toggle_like, daemon=True).start()
 
     @staticmethod
     def _handle_toggle_like() -> None:
         global _liked_state_track_id
+        log_msg("ToggleLike: handler running.", LOGDEBUG)
         try:
             win = xbmcgui.Window(ADDON_WINDOW_ID)
             track_id = win.getProperty("Spotify.CurrentTrackId")
             if not track_id:
-                log_msg("ToggleLike: no current track id.", LOGDEBUG)
+                log_msg("ToggleLike: no current track id.", LOGWARNING)
                 return
             token = get_cached_auth_token()
             if not token:
-                log_msg("ToggleLike: no auth token.", LOGDEBUG)
+                log_msg("ToggleLike: no auth token.", LOGWARNING)
                 return
             sp = spotipy.Spotify(auth=token)
             result = sp.current_user_saved_tracks_contains([track_id])
             liked = bool(result and result[0])
             if liked:
                 sp.current_user_saved_tracks_delete([track_id])
-                win.setProperty("Spotify.CurrentTrackLiked", "false")
+                win.clearProperty("Spotify.CurrentTrackLiked")
+                log_msg(f"ToggleLike: unliked {track_id}.", LOGDEBUG)
             else:
                 sp.current_user_saved_tracks_add([track_id])
                 win.setProperty("Spotify.CurrentTrackLiked", "true")
+                log_msg(f"ToggleLike: liked {track_id}.", LOGDEBUG)
             # Keep _liked_state_track_id in sync so the next buffering
             # re-request for the same track doesn't overwrite the new state.
             _liked_state_track_id = track_id
@@ -232,13 +236,18 @@ class MainService:
             try:
                 token = get_cached_auth_token()
                 if not token:
+                    log_msg(f"No auth token when checking liked state for {track_id}.", LOGWARNING)
                     return
                 sp = spotipy.Spotify(auth=token)
                 result = sp.current_user_saved_tracks_contains([track_id])
-                liked = "true" if (result and result[0]) else "false"
-                win.setProperty("Spotify.CurrentTrackLiked", liked)
+                liked = "true" if (result and result[0]) else ""
+                if liked:
+                    win.setProperty("Spotify.CurrentTrackLiked", liked)
+                else:
+                    win.clearProperty("Spotify.CurrentTrackLiked")
+                log_msg(f"Spotify.CurrentTrackLiked = {liked!r} for {track_id}.", LOGDEBUG)
             except Exception as e:
-                log_msg(f"Error setting liked state: {e}", LOGDEBUG)
+                log_msg(f"Error setting liked state for {track_id}: {e}", LOGWARNING)
                 pass
 
         # Only run the liked state check when the track actually changes.
