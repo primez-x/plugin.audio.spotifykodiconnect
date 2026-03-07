@@ -72,17 +72,33 @@ class _SpotifyOSDServiceMonitor(xbmc.Monitor):
             if not token:
                 log_msg("ToggleLike: no auth token.", LOGWARNING)
                 return
-            sp = spotipy.Spotify(auth=token)
-            result = sp.current_user_saved_tracks_contains([track_id])
-            liked = bool(result and result[0])
-            if liked:
-                sp.current_user_saved_tracks_delete([track_id])
+            # Use cached property for toggle direction — avoids an extra API round-trip.
+            currently_liked = bool(win.getProperty("Spotify.CurrentTrackLiked"))
+
+            # Optimistic update: flip the icon immediately so the UI feels instant.
+            # The API call below confirms the change; reverted on failure.
+            if currently_liked:
                 win.clearProperty("Spotify.CurrentTrackLiked")
-                log_msg(f"ToggleLike: unliked {track_id}.", LOGDEBUG)
             else:
-                sp.current_user_saved_tracks_add([track_id])
                 win.setProperty("Spotify.CurrentTrackLiked", "true")
-                log_msg(f"ToggleLike: liked {track_id}.", LOGDEBUG)
+
+            sp = spotipy.Spotify(auth=token)
+            try:
+                if currently_liked:
+                    sp.current_user_saved_tracks_delete([track_id])
+                    log_msg(f"ToggleLike: unliked {track_id}.", LOGDEBUG)
+                else:
+                    sp.current_user_saved_tracks_add([track_id])
+                    log_msg(f"ToggleLike: liked {track_id}.", LOGDEBUG)
+            except Exception as api_exc:
+                # Revert the optimistic update so the icon matches actual Spotify state.
+                if currently_liked:
+                    win.setProperty("Spotify.CurrentTrackLiked", "true")
+                else:
+                    win.clearProperty("Spotify.CurrentTrackLiked")
+                log_exception(api_exc, "ToggleLike API call failed, reverted icon")
+                return
+
             # Keep _liked_state_track_id in sync so the next buffering
             # re-request for the same track doesn't overwrite the new state.
             _liked_state_track_id = track_id
