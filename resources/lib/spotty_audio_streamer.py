@@ -131,7 +131,7 @@ class SpottyAudioStreamer:
         defer_kill_previous: bool = False,
         start_sec: int = 0,
     ):
-        """Generator: yield WAV (PCM) bytes from the background downloader cache file."""
+        """Generator: yield WAV (PCM) bytes from the background downloader's in-memory buffer."""
         from spotty_cache import SpottyCacheManager
 
         self.__terminated = False
@@ -158,34 +158,35 @@ class SpottyAudioStreamer:
 
         self._log_transfer("start", range_begin=range_begin)
 
+        buf_offset = range_begin - downloader.start_byte
+
         try:
-            with open(downloader.file_path, "rb") as f:
-                f.seek(range_begin - downloader.start_byte)
+            while bytes_sent < range_len and not self.__terminated:
+                target_bytes_in_buf = buf_offset + bytes_sent + 1
+                downloader.wait_for_bytes(target_bytes_in_buf, timeout=1.0)
 
-                while bytes_sent < range_len and not self.__terminated:
-                    target_bytes_in_file = (range_begin - downloader.start_byte) + bytes_sent + 1
-                    downloader.wait_for_bytes(target_bytes_in_file, timeout=1.0)
+                if self.__terminated:
+                    break
 
-                    if self.__terminated:
+                chunk = None
+                with downloader.cond:
+                    available = downloader.written_bytes - buf_offset - bytes_sent
+                    if downloader.error and available <= 0:
+                        self._log_transfer("error", msg="Background downloader hit an error")
                         break
-
-                    with downloader.cond:
-                        available = downloader.written_bytes - ((range_begin - downloader.start_byte) + bytes_sent)
-                        if downloader.error and available <= 0:
-                            self._log_transfer("error", msg="Background downloader hit an error")
-                            break
-                        is_finished = downloader.is_finished
-
+                    is_finished = downloader.is_finished
                     if available > 0:
                         to_read = min(self.chunk_size, available, range_len - bytes_sent)
-                        chunk = f.read(to_read)
-                        if chunk:
-                            yield chunk
-                            bytes_sent += len(chunk)
-                            if bytes_sent % 10485760 < self.chunk_size:
-                                self._log_transfer("progress", bytes_sent=bytes_sent)
-                    elif is_finished:
-                        break
+                        read_start = buf_offset + bytes_sent
+                        chunk = bytes(downloader._buffer[read_start: read_start + to_read])
+
+                if chunk:
+                    yield chunk
+                    bytes_sent += len(chunk)
+                    if bytes_sent % 10485760 < self.chunk_size:
+                        self._log_transfer("progress", bytes_sent=bytes_sent)
+                elif is_finished:
+                    break
 
             end_of_range = range_begin + bytes_sent
             if self.__track_length > 0 and end_of_range >= self.__track_length:

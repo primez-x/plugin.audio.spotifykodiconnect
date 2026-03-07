@@ -1,8 +1,6 @@
-import os
 import threading
 import time
 
-import xbmcvfs
 from xbmc import LOGDEBUG, LOGWARNING, LOGERROR
 
 from spotty import Spotty
@@ -18,7 +16,7 @@ def _clamp_volume(value: int) -> int:
 
 
 class SpottyDownloader:
-    """Downloads a single track from spotty to a temp file in the background."""
+    """Downloads a single track from spotty into an in-memory buffer in the background."""
 
     def __init__(
         self,
@@ -42,8 +40,7 @@ class SpottyDownloader:
         self.wav_header = wav_header
         self.track_length = track_length
 
-        temp_dir = xbmcvfs.translatePath("special://temp")
-        self.file_path = os.path.join(temp_dir, f"spotify_{track_id}_{start_byte}.wav")
+        self._buffer = bytearray()
 
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
@@ -59,20 +56,13 @@ class SpottyDownloader:
             if self.thread is not None:
                 return
 
-            try:
-                # Initialize file
-                with open(self.file_path, "wb") as f:
-                    header_len = len(self.wav_header)
-                    if self.start_byte == 0:
-                        f.write(self.wav_header)
-                        self.written_bytes = header_len
-                    elif self.start_byte < header_len:
-                        f.write(self.wav_header[self.start_byte :])
-                        self.written_bytes = header_len - self.start_byte
-            except Exception as e:
-                log_exception(e, f"Failed to open cache file {self.file_path}")
-                self.error = True
-                return
+            header_len = len(self.wav_header)
+            if self.start_byte == 0:
+                self._buffer.extend(self.wav_header)
+                self.written_bytes = header_len
+            elif self.start_byte < header_len:
+                self._buffer.extend(self.wav_header[self.start_byte:])
+                self.written_bytes = header_len - self.start_byte
 
             self.thread = threading.Thread(target=self._download_loop, daemon=True)
             self.thread.start()
@@ -122,16 +112,14 @@ class SpottyDownloader:
                         break
                     discarded += len(chunk)
 
-            with open(self.file_path, "ab") as f:
-                while not self.aborted:
-                    chunk = process.stdout.read(65536)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    f.flush()
-                    with self.cond:
-                        self.written_bytes += len(chunk)
-                        self.cond.notify_all()
+            while not self.aborted:
+                chunk = process.stdout.read(65536)
+                if not chunk:
+                    break
+                with self.cond:
+                    self._buffer.extend(chunk)
+                    self.written_bytes += len(chunk)
+                    self.cond.notify_all()
 
             if process.poll() is None and not self.aborted:
                 process.wait(timeout=2.0)
@@ -141,9 +129,7 @@ class SpottyDownloader:
                     remaining = (self.track_length - self.start_byte) - self.written_bytes
                     if 0 < remaining <= 176400 * 10:  # 10 secs max padding
                         log_msg(f"Padding {remaining} bytes to end of {self.track_id}")
-                        with open(self.file_path, "ab") as f:
-                            f.write(bytes(remaining))
-                            f.flush()
+                        self._buffer.extend(bytes(remaining))
                         self.written_bytes += remaining
 
                 self.is_finished = True
@@ -174,11 +160,8 @@ class SpottyDownloader:
 
     def cleanup(self):
         self.abort()
-        try:
-            if os.path.exists(self.file_path):
-                os.remove(self.file_path)
-        except:
-            pass
+        with self.cond:
+            self._buffer.clear()
 
     def wait_for_bytes(self, target_bytes: int, timeout: float = None) -> bool:
         with self.cond:
@@ -245,12 +228,17 @@ class SpottyCacheManager:
             cls._instances[key] = inst
             inst.start()
 
-            # Keep only the 3 most recent tracks to save disk space
+            # Keep only the 3 most recent tracks in memory
             tracks_to_keep = set(cls._recent_tracks[-3:])
             for k in list(cls._instances.keys()):
                 if k[0] not in tracks_to_keep:
                     cls._instances[k].cleanup()
                     del cls._instances[k]
+
+            # Trim _recent_tracks to only entries with active instances; prevents
+            # unbounded list growth and ensures stale track IDs can't skew eviction.
+            active_ids = {k[0] for k in cls._instances}
+            cls._recent_tracks = [t for t in cls._recent_tracks if t in active_ids]
 
             return inst
 
@@ -271,3 +259,4 @@ class SpottyCacheManager:
             for inst in cls._instances.values():
                 inst.cleanup()
             cls._instances.clear()
+            cls._recent_tracks.clear()
