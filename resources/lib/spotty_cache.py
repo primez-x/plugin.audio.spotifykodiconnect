@@ -125,16 +125,25 @@ class SpottyDownloader:
                 process.wait(timeout=2.0)
 
             with self.cond:
-                if not self.aborted and process.returncode == 0:
-                    remaining = (self.track_length - self.start_byte) - self.written_bytes
-                    if 0 < remaining <= 176400 * 10:  # 10 secs max padding
-                        log_msg(f"Padding {remaining} bytes to end of {self.track_id}")
-                        self._buffer.extend(bytes(remaining))
-                        self.written_bytes += remaining
+                if not self.aborted:
+                    if process.returncode == 0:
+                        remaining = (self.track_length - self.start_byte) - self.written_bytes
+                        if 0 < remaining <= 176400 * 10:  # 10 secs max padding
+                            log_msg(f"Padding {remaining} bytes to end of {self.track_id}")
+                            self._buffer.extend(bytes(remaining))
+                            self.written_bytes += remaining
+                    else:
+                        log_msg(
+                            f"Spotty exited with code {process.returncode} for {self.track_id},"
+                            f" marking downloader as errored.",
+                            LOGWARNING,
+                        )
+                        self.error = True
 
                 self.is_finished = True
                 self.cond.notify_all()
-                log_msg(f"Finished background download for {self.track_id}")
+                if not self.error:
+                    log_msg(f"Finished background download for {self.track_id}")
 
         except Exception as e:
             log_exception(e, "Error in download loop")

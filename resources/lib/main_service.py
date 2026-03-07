@@ -243,7 +243,7 @@ class MainService:
 
         # Only run the liked state check when the track actually changes.
         if track_changed:
-            _set_liked_state()
+            threading.Thread(target=_set_liked_state, daemon=True).start()
 
         try:
             current_item, next_item = get_next_playlist_item()
@@ -271,21 +271,21 @@ class MainService:
             # causes it to compete with the main spotty, making both fail.
             if prebuffer_enabled:
                 def _deferred_prebuffer():
-                    # Wait for the main stream to finish downloading to the disk cache
-                    # Because librespot only supports one stream per account,
-                    # starting prebuffer while the main track is still downloading
-                    # will kick the main stream and cause skips/glitches.
+                    # Wait for the main stream to finish downloading to the disk cache.
+                    # librespot only supports one stream per account; starting prebuffer
+                    # while the main track is still downloading kicks the main stream.
                     from spotty_cache import SpottyCacheManager
-                    
-                    def is_main_downloading():
-                        dl = SpottyCacheManager.find_best_downloader(track_id, 0)
-                        return dl is not None and not dl.is_finished and not dl.error and not dl.aborted
 
-                    # Wait a little bit for the main downloader to register and start
+                    # Wait for the main downloader to register and start.
                     time.sleep(2.0)
 
-                    while is_main_downloading():
-                        time.sleep(1.0)
+                    # Wait on the condition variable instead of polling every 1s;
+                    # wakes up immediately when the download finishes.
+                    dl = SpottyCacheManager.find_best_downloader(track_id, 0)
+                    if dl is not None and not dl.is_finished:
+                        with dl.cond:
+                            while not dl.is_finished and not dl.error and not dl.aborted:
+                                dl.cond.wait(timeout=30.0)
 
                     log_msg(f"Main track {track_id} finished downloading. Safe to start prebuffer for next track.", LOGDEBUG)
 
