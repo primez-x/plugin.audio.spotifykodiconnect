@@ -561,6 +561,8 @@ class PluginContent:
         tag.setRating(int(track.get("rating") or 0))
         tag.setMediaType("song")
         tag.setURL(url)
+        # So skin list views (Label_VideoInfo_DetailsItem) show artist when ListItem.DBType=song
+        li.setProperty("DBType", "song")
         if release_date:
             tag.setReleaseDate(release_date)
         if genres_list:
