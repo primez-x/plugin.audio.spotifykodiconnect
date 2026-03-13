@@ -1,10 +1,9 @@
 import threading
 import time
 
-from xbmc import LOGDEBUG, LOGWARNING, LOGERROR
-
 from spotty import Spotty
-from utils import log_msg, log_exception
+from utils import log_exception, log_msg
+from xbmc import LOGDEBUG, LOGERROR, LOGWARNING
 
 
 def _clamp_volume(value: int) -> int:
@@ -61,7 +60,7 @@ class SpottyDownloader:
                 self._buffer.extend(self.wav_header)
                 self.written_bytes = header_len
             elif self.start_byte < header_len:
-                self._buffer.extend(self.wav_header[self.start_byte:])
+                self._buffer.extend(self.wav_header[self.start_byte :])
                 self.written_bytes = header_len - self.start_byte
 
             self.thread = threading.Thread(target=self._download_loop, daemon=True)
@@ -92,49 +91,117 @@ class SpottyDownloader:
             args += ["--start-position", str(start_sec_wav)]
         return args, (pcm_target_offset % 176400)
 
+    # Session-conflict retry: when spotty exits cleanly (rc=0) but produces
+    # 0 PCM bytes, Spotify's backend hasn't released the previous session yet.
+    # The new spotty process gets kicked immediately.  Retry after a delay so
+    # the HTTP generator keeps the response open (is_finished stays False) and
+    # Kodi doesn't see a partial-file error.
+    _MAX_SESSION_RETRIES = 3
+    _RETRY_DELAYS = [1.0, 3.0, 5.0]
+
     def _download_loop(self):
-        log_msg(f"Starting background download for {self.track_id} at {self.start_byte}")
-        process = None
-        try:
-            args, pcm_skip = self._build_args()
-            process = self.spotty.run_spotty(args)
+        log_msg(
+            f"Starting background download for {self.track_id} at {self.start_byte}"
+        )
 
-            with self.cond:
-                self.process = process
-                if self.aborted:
-                    return
+        for attempt in range(self._MAX_SESSION_RETRIES + 1):
+            if self.aborted:
+                return
 
-            if pcm_skip > 0:
-                discarded = 0
-                while discarded < pcm_skip and not self.aborted:
-                    chunk = process.stdout.read(min(8192, pcm_skip - discarded))
+            process = None
+            pcm_bytes_read = 0
+            try:
+                args, pcm_skip = self._build_args()
+                process = self.spotty.run_spotty(args)
+
+                with self.cond:
+                    self.process = process
+                    if self.aborted:
+                        return
+
+                if pcm_skip > 0:
+                    discarded = 0
+                    while discarded < pcm_skip and not self.aborted:
+                        chunk = process.stdout.read(min(8192, pcm_skip - discarded))
+                        if not chunk:
+                            break
+                        discarded += len(chunk)
+
+                while not self.aborted:
+                    chunk = process.stdout.read(65536)
                     if not chunk:
                         break
-                    discarded += len(chunk)
+                    pcm_bytes_read += len(chunk)
+                    with self.cond:
+                        self._buffer.extend(chunk)
+                        self.written_bytes += len(chunk)
+                        self.cond.notify_all()
 
-            while not self.aborted:
-                chunk = process.stdout.read(65536)
-                if not chunk:
-                    break
+                if process.poll() is None and not self.aborted:
+                    process.wait(timeout=2.0)
+
+            except Exception as e:
+                log_exception(e, "Error in download loop")
                 with self.cond:
-                    self._buffer.extend(chunk)
-                    self.written_bytes += len(chunk)
+                    self.error = True
+                    self.is_finished = True
                     self.cond.notify_all()
+                return
+            finally:
+                if process:
+                    try:
+                        process.kill()
+                    except:
+                        pass
 
-            if process.poll() is None and not self.aborted:
-                process.wait(timeout=2.0)
+            if self.aborted:
+                return
 
+            # Detect session conflict: spotty exits cleanly but produced no audio.
+            rc = process.returncode if process else -1
+            if rc == 0 and pcm_bytes_read == 0 and attempt < self._MAX_SESSION_RETRIES:
+                delay = self._RETRY_DELAYS[min(attempt, len(self._RETRY_DELAYS) - 1)]
+                log_msg(
+                    f"Spotty produced 0 PCM bytes for {self.track_id} "
+                    f"(session conflict). Retry {attempt + 1}/{self._MAX_SESSION_RETRIES} "
+                    f"after {delay}s.",
+                    LOGWARNING,
+                )
+                # Use condition wait so abort() can interrupt the sleep.
+                with self.cond:
+                    self.process = None
+                    if self.aborted:
+                        return
+                    self.cond.wait(timeout=delay)
+                    if self.aborted:
+                        return
+                continue
+
+            # Normal finish or final retry failure.
             with self.cond:
                 if not self.aborted:
-                    if process.returncode == 0:
-                        remaining = (self.track_length - self.start_byte) - self.written_bytes
-                        if 0 < remaining <= 176400 * 10:  # 10 secs max padding
-                            log_msg(f"Padding {remaining} bytes to end of {self.track_id}")
-                            self._buffer.extend(bytes(remaining))
-                            self.written_bytes += remaining
+                    if rc == 0:
+                        if pcm_bytes_read == 0:
+                            log_msg(
+                                f"Spotty produced 0 PCM bytes after "
+                                f"{self._MAX_SESSION_RETRIES} retries for "
+                                f"{self.track_id}. Marking as error.",
+                                LOGWARNING,
+                            )
+                            self.error = True
+                        else:
+                            remaining = (
+                                self.track_length - self.start_byte
+                            ) - self.written_bytes
+                            if 0 < remaining <= 176400 * 10:  # 10 secs max padding
+                                log_msg(
+                                    f"Padding {remaining} bytes to end of {self.track_id}"
+                                )
+                                self._buffer.extend(bytes(remaining))
+                                self.written_bytes += remaining
                     else:
                         log_msg(
-                            f"Spotty exited with code {process.returncode} for {self.track_id},"
+                            f"Spotty exited with code {rc} for {self.track_id},"
                             f" marking downloader as errored.",
                             LOGWARNING,
                         )
@@ -144,18 +211,7 @@ class SpottyDownloader:
                 self.cond.notify_all()
                 if not self.error:
                     log_msg(f"Finished background download for {self.track_id}")
-
-        except Exception as e:
-            log_exception(e, "Error in download loop")
-            with self.cond:
-                self.error = True
-                self.cond.notify_all()
-        finally:
-            if process:
-                try:
-                    process.kill()
-                except:
-                    pass
+            return
 
     def abort(self):
         with self.cond:
