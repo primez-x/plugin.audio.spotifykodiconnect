@@ -134,6 +134,10 @@ class HTTPSpottyAudioStreamer:
     def spotty_stream_audio_track(
         self, track_id: str, duration: str
     ) -> bottle.Response:
+        # Strip optional .wav suffix — URLs include it so Kodi selects PAPlayer
+        # directly instead of trying VideoPlayer first (demuxer error + retry).
+        if duration.endswith(".wav"):
+            duration = duration[:-4]
         log_msg(f"{bottle.request.method} request: {bottle.request}", LOGDEBUG)
 
         # HEAD requests: return headers only. NEVER mutate state, call set_track(),
@@ -259,16 +263,17 @@ class HTTPSpottyAudioStreamer:
 
     def _handle_head_only(self, track_id: str, duration: str):
         """Return headers for HEAD requests without touching any streaming state."""
-        bitrate, _ = _get_current_stream_settings()
         try:
             dur = max(1.0, float(duration))
         except (ValueError, TypeError):
             dur = 1.0
 
-        file_size = self.__spotty_streamer.get_track_length()
-        if file_size <= 0:
-            pcm_bps = 44100 * 2 * 2  # 176400 bytes/sec
-            file_size = int(dur * pcm_bps) + 44  # + WAV header
+        # Always derive size from the URL's duration — the current streamer may have a
+        # different track loaded, which would return the wrong Content-Length for queued
+        # (non-current) tracks and confuse Kodi's prefetch queue.
+        pcm_bps = 44100 * 2 * 2  # 176400 bytes/sec at 44.1 kHz 16-bit stereo
+        file_size = int(dur * pcm_bps) + 44  # +44 for WAV header
+
         bottle.response.status = 200
         bottle.response.content_type = "audio/x-wav"
         bottle.response.content_length = file_size

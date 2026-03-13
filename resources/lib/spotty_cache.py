@@ -235,6 +235,15 @@ class SpottyCacheManager:
                 track_length,
             )
             cls._instances[key] = inst
+
+            # Abort all other still-running downloads before starting this one.
+            # librespot only allows one active Spotify stream per account; a second
+            # spotty process connecting kicks the first (and vice-versa), causing a
+            # mutual-kick loop that leaves every track with only the 44-byte WAV header.
+            for k, other in list(cls._instances.items()):
+                if k != key and not other.is_finished and not other.aborted:
+                    other.abort()
+
             inst.start()
 
             # Keep only the 3 most recent tracks in memory

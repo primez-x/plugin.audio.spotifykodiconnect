@@ -4,9 +4,10 @@ SpotifyKodiConnect - service: spotty + HTTP audio streaming to Kodi.
 """
 
 import math
+import os
 import threading
 import time
-import os
+
 import bottle_manager
 import spotipy
 import spotty
@@ -24,6 +25,7 @@ from string_ids import WELCOME_AUTHENTICATED_STR_ID
 from utils import (
     ADDON_ID,
     ADDON_WINDOW_ID,
+    PROXY_HOST,
     PROXY_PORT,
     get_cached_auth_token,
     log_exception,
@@ -40,6 +42,7 @@ _artist_fanart_index = 0
 # from resetting Spotify.CurrentTrackLiked on every Kodi buffering re-request.
 _liked_state_track_id: str = ""
 
+
 class _SpotifyOSDServiceMonitor(xbmc.Monitor):
     """Receives inter-addon notifications so the service can act on skin-triggered events.
 
@@ -51,10 +54,7 @@ class _SpotifyOSDServiceMonitor(xbmc.Monitor):
     """
 
     def onNotification(self, sender: str, method: str, data: str) -> None:
-        if (
-            sender == "plugin.audio.spotifykodiconnect"
-            and method == "Other.ToggleLike"
-        ):
+        if sender == "plugin.audio.spotifykodiconnect" and method == "Other.ToggleLike":
             log_msg("ToggleLike notification received, spawning handler.", LOGDEBUG)
             threading.Thread(target=self._handle_toggle_like, daemon=True).start()
 
@@ -200,6 +200,13 @@ class MainService:
         # Keep a strong reference so Kodi doesn't GC the player monitor.
         self.__osd_player_monitor = _SpotifyOSDPlayerMonitor()
 
+        # Cancellation token for _deferred_prebuffer threads.  Incremented each
+        # time __on_track_started fires so only the latest thread proceeds to call
+        # get_or_start.  Prevents cascade-mode threads from all firing at once and
+        # evicting each other's buffers.
+        self._prebuffer_token = 0
+        self._prebuffer_token_lock = threading.Lock()
+
         bottle_manager.route_all(self.__http_spotty_streamer)
 
     def __on_track_started(self, track_id: str, duration_sec: float) -> None:
@@ -252,7 +259,10 @@ class MainService:
             try:
                 token = get_cached_auth_token()
                 if not token:
-                    log_msg(f"No auth token when checking liked state for {track_id}.", LOGWARNING)
+                    log_msg(
+                        f"No auth token when checking liked state for {track_id}.",
+                        LOGWARNING,
+                    )
                     return
                 sp = spotipy.Spotify(auth=token)
                 result = sp.current_user_saved_tracks_contains([track_id])
@@ -261,7 +271,9 @@ class MainService:
                     win.setProperty("Spotify.CurrentTrackLiked", liked)
                 else:
                     win.clearProperty("Spotify.CurrentTrackLiked")
-                log_msg(f"Spotify.CurrentTrackLiked = {liked!r} for {track_id}.", LOGDEBUG)
+                log_msg(
+                    f"Spotify.CurrentTrackLiked = {liked!r} for {track_id}.", LOGDEBUG
+                )
             except Exception as e:
                 log_msg(f"Error setting liked state for {track_id}: {e}", LOGWARNING)
                 pass
@@ -295,6 +307,10 @@ class MainService:
             # connection per account — starting the prebuffer's spotty immediately
             # causes it to compete with the main spotty, making both fail.
             if prebuffer_enabled:
+                with self._prebuffer_token_lock:
+                    self._prebuffer_token += 1
+                    my_token = self._prebuffer_token
+
                 def _deferred_prebuffer():
                     # Wait for the main stream to finish downloading to the disk cache.
                     # librespot only supports one stream per account; starting prebuffer
@@ -304,15 +320,78 @@ class MainService:
                     # Wait for the main downloader to register and start.
                     time.sleep(2.0)
 
+                    # During a cascade, many _deferred_prebuffer threads are spawned
+                    # in quick succession (one per skipped track).  Only the most
+                    # recent one should proceed — older threads would call get_or_start
+                    # with stale track IDs, rapidly filling _recent_tracks past its
+                    # 3-entry limit and evicting the freshly prebuffered track's buffer.
+                    with self._prebuffer_token_lock:
+                        if self._prebuffer_token != my_token:
+                            log_msg(
+                                f"_deferred_prebuffer: cancelled (stale, track={track_id})",
+                                LOGDEBUG,
+                            )
+                            return
+
                     # Wait on the condition variable instead of polling every 1s;
                     # wakes up immediately when the download finishes.
                     dl = SpottyCacheManager.find_best_downloader(track_id, 0)
                     if dl is not None and not dl.is_finished:
                         with dl.cond:
-                            while not dl.is_finished and not dl.error and not dl.aborted:
+                            while (
+                                not dl.is_finished and not dl.error and not dl.aborted
+                            ):
                                 dl.cond.wait(timeout=30.0)
 
-                    log_msg(f"Main track {track_id} finished downloading. Safe to start prebuffer for next track.", LOGDEBUG)
+                    log_msg(
+                        f"Main track {track_id} finished downloading. Safe to start prebuffer for next track.",
+                        LOGDEBUG,
+                    )
+
+                    # Brief pause so Spotify's backend releases the previous
+                    # session before the prebuffer's spotty process connects.
+                    # Without this, the new spotty may get kicked immediately
+                    # and exit with 0 PCM bytes (returncode=0, 0 bytes).
+                    # 1s was insufficient (~1.3s total gap still caused 0-byte
+                    # prebuffers); 2s gives enough margin for session release.
+                    # 15s provides ample room for error on slow connections.
+                    time.sleep(15.0)
+
+                    # Final stale-check after the session-release sleep.
+                    with self._prebuffer_token_lock:
+                        if self._prebuffer_token != my_token:
+                            log_msg(
+                                f"_deferred_prebuffer: cancelled after sleep (track={track_id})",
+                                LOGDEBUG,
+                            )
+                            return
+
+                    # Re-query the playlist here instead of using the value
+                    # captured at __on_track_started time.  When the HTTP
+                    # stream starts, Kodi's player position has often not
+                    # advanced yet, so the captured "next" is wrong (it is
+                    # the current track or even the previous one).
+                    try:
+                        _, next_item_now = get_next_playlist_item()
+                    except Exception:
+                        return
+                    if not next_item_now:
+                        return
+                    next_id_now, next_dur_now = parse_track_url(
+                        next_item_now.get("file") or ""
+                    )
+                    if not next_id_now or next_dur_now is None:
+                        return
+                    # Guard: never prebuffer the track that triggered this
+                    # deferred prebuffer — that means the playlist position
+                    # is still stale and we would download the current track.
+                    if next_id_now == track_id:
+                        log_msg(
+                            f"_deferred_prebuffer: next track same as triggering track"
+                            f" ({track_id}), skipping.",
+                            LOGDEBUG,
+                        )
+                        return
 
                     bitrate = self._get_bitrate_setting()
                     norm = (
@@ -323,11 +402,12 @@ class MainService:
                     if norm not in ("off", "auto", "track", "album"):
                         norm = "auto"
                     self.__prebuffer_manager.start_prebuffer(
-                        next_track_id,
-                        next_duration,
+                        next_id_now,
+                        next_dur_now,
                         bitrate=bitrate,
                         normalization_gain_type=norm,
                     )
+
                 threading.Thread(target=_deferred_prebuffer, daemon=True).start()
 
             broadcast_enabled = (
@@ -367,7 +447,9 @@ class MainService:
 
             # Fetch a larger set of recommendations to fill the autoplay playlist.
             RECOMMEND_LIMIT = 49
-            result = sp.recommendations(seed_tracks=[seed_track_id], limit=RECOMMEND_LIMIT)
+            result = sp.recommendations(
+                seed_tracks=[seed_track_id], limit=RECOMMEND_LIMIT
+            )
             rec_tracks = (result or {}).get("tracks") or []
             if not rec_tracks:
                 log_msg("Autoplay: no recommendations returned.", LOGDEBUG)
@@ -389,13 +471,17 @@ class MainService:
                 seed_name = (seed_info or {}).get("name") or ""
                 seed_duration_ms = (seed_info or {}).get("duration_ms") or 0
                 seed_artists = (seed_info or {}).get("artists") or []
-                seed_artist_name = seed_artists[0].get("name") or "" if seed_artists else ""
+                seed_artist_name = (
+                    seed_artists[0].get("name") or "" if seed_artists else ""
+                )
                 seed_album = (seed_info or {}).get("album") or {}
                 seed_album_name = seed_album.get("name") or ""
                 seed_images = seed_album.get("images") or []
                 seed_art_url = seed_images[0].get("url") if seed_images else ""
-                seed_duration_sec = math.ceil(seed_duration_ms / 1000) if seed_duration_ms else 1
-                seed_url = f"http://localhost:{PROXY_PORT}/track/{seed_track_id}/{seed_duration_sec}"
+                seed_duration_sec = (
+                    math.ceil(seed_duration_ms / 1000) if seed_duration_ms else 1
+                )
+                seed_url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{seed_track_id}/{seed_duration_sec}.wav"
                 li = xbmcgui.ListItem(label=seed_name or seed_track_id)
                 li.setProperty("IsPlayable", "true")
                 li.setProperty("spotifytrackid", seed_track_id)
@@ -411,7 +497,13 @@ class MainService:
                 )
                 if seed_art_url:
                     try:
-                        li.setArt({"thumb": seed_art_url, "icon": seed_art_url, "fanart": seed_art_url})
+                        li.setArt(
+                            {
+                                "thumb": seed_art_url,
+                                "icon": seed_art_url,
+                                "fanart": seed_art_url,
+                            }
+                        )
                     except Exception:
                         pass
                 playlist.add(seed_url, li)
@@ -419,7 +511,7 @@ class MainService:
             except Exception:
                 # If fetching metadata fails, still add a minimal entry for the seed track.
                 try:
-                    seed_url = f"http://localhost:{PROXY_PORT}/track/{seed_track_id}/1"
+                    seed_url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{seed_track_id}/1.wav"
                     li = xbmcgui.ListItem(label=seed_track_id)
                     li.setProperty("IsPlayable", "true")
                     li.setProperty("spotifytrackid", seed_track_id)
@@ -467,18 +559,33 @@ class MainService:
                         album_name = album.get("name") or ""
                         images = album.get("images") or []
                         art_url = images[0].get("url") if images else ""
-                        duration_sec = math.ceil(duration_ms / 1000) if duration_ms else 1
-                        url = f"http://localhost:{PROXY_PORT}/track/{tid}/{duration_sec}"
+                        duration_sec = (
+                            math.ceil(duration_ms / 1000) if duration_ms else 1
+                        )
+                        url = (
+                            f"http://{PROXY_HOST}:{PROXY_PORT}/track/{tid}/{duration_sec}.wav"
+                        )
                         li = xbmcgui.ListItem(label=name)
                         li.setProperty("IsPlayable", "true")
                         li.setProperty("spotifytrackid", tid)
                         li.setInfo(
                             "music",
-                            {"title": name, "artist": artist_name, "album": album_name, "duration": duration_sec},
+                            {
+                                "title": name,
+                                "artist": artist_name,
+                                "album": album_name,
+                                "duration": duration_sec,
+                            },
                         )
                         if art_url:
                             try:
-                                li.setArt({"thumb": art_url, "icon": art_url, "fanart": art_url})
+                                li.setArt(
+                                    {
+                                        "thumb": art_url,
+                                        "icon": art_url,
+                                        "fanart": art_url,
+                                    }
+                                )
                             except Exception:
                                 pass
                         playlist.add(url, li)
@@ -549,6 +656,7 @@ class MainService:
     def __close(self) -> None:
         log_msg("Shutdown requested.")
         from spotty_cache import SpottyCacheManager
+
         SpottyCacheManager.cleanup_all()
         self.__prebuffer_manager.cancel_prebuffer()
         self.__http_spotty_streamer.stop()

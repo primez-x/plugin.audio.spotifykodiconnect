@@ -22,6 +22,7 @@ from utils import (
     ADDON_ID,
     ADDON_WINDOW_ID,
     LOGINFO,
+    PROXY_HOST,
     PROXY_PORT,
     get_chunks,
     log_exception,
@@ -136,7 +137,11 @@ class PluginContent:
 
             self.cache: simplecache.SimpleCache = simplecache.SimpleCache(ADDON_ID)
 
-            self.__spotty: spotty.Spotty = spotty.get_spotty(SpottyHelper())
+            # Spotty binary is ONLY needed for the zeroconf authentication flow.
+            # Defer creation so normal browse/play actions skip the expensive
+            # SpottyHelper self-test (runs spotty subprocess on every invocation
+            # on ARM Linux, with no timeout — can hang on slow devices).
+            self.__spotty: Optional[spotty.Spotty] = None
 
             self.check_auth_and_refresh_spotipy()
 
@@ -182,10 +187,22 @@ class PluginContent:
 
     def init_spotipy(self, auth_token: str) -> None:
         self.__spotipy: spotipy.Spotify = spotipy.Spotify(auth=auth_token)
+        # Use cached user profile from a previous invocation to avoid an extra
+        # Spotify API round-trip (sp.me()) on every browse / play action.
+        win = xbmcgui.Window(ADDON_WINDOW_ID)
+        cached_id = win.getProperty("Spotify.UserId")
+        if cached_id:
+            self.__userid = cached_id
+            self.__username = win.getProperty("Spotify.Username") or cached_id
+            self.__user_country = win.getProperty("Spotify.UserCountry") or ""
+            return
         me = self.__spotipy.me()
         self.__userid = me["id"]
         self.__username = me.get("email") or me.get("id") or ""
         self.__user_country = me.get("country") or ""
+        win.setProperty("Spotify.UserId", self.__userid)
+        win.setProperty("Spotify.Username", self.__username)
+        win.setProperty("Spotify.UserCountry", self.__user_country)
 
     def authenticate_plugin_after_login_failure(self) -> None:
         self.authenticate_plugin(
@@ -203,6 +220,9 @@ class PluginContent:
         dialog = xbmcgui.Dialog()
         dialog_title = self.__addon.getAddonInfo("name")
 
+        # Lazy-init Spotty only when authentication is actually needed.
+        if self.__spotty is None:
+            self.__spotty = spotty.get_spotty(SpottyHelper())
         spotty_auth = SpottyAuth(self.__spotty)
 
         zeroconf_auth = spotty_auth.start_zeroconf_authenticate()
@@ -544,7 +564,7 @@ class PluginContent:
                 genres_list = [str(g) for g in genre if g]
 
         # Local playback by using proxy on this machine.
-        url = f"http://localhost:{PROXY_PORT}/track/{track['id']}/{duration_sec}"
+        url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{track['id']}/{duration_sec}.wav"
 
         li = xbmcgui.ListItem(label, offscreen=True)
         li.setProperty("isPlayable", "true")
