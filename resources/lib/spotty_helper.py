@@ -110,6 +110,11 @@ class SpottyHelper:
             spotty_path = os.path.join(
                 os.path.dirname(__file__), SPOTTY_SUBDIR, "x86-linux", "spotty-x86_64"
             )
+        elif architecture.startswith("aarch64") or architecture.startswith("arm64"):
+            # Native ARM64 binary (e.g. Ugoos/CoreELEC, Pi 4/5 64-bit OS).
+            spotty_path = os.path.join(
+                os.path.dirname(__file__), SPOTTY_SUBDIR, "aarch64-linux", "spotty"
+            )
         else:
             # When we're unsure about the platform/cpu, try by testing to get
             # the correct binary path.
@@ -132,7 +137,7 @@ class SpottyHelper:
         try:
             st = os.stat(binary_path)
             os.chmod(binary_path, st.st_mode | stat.S_IEXEC)
-            args = [binary_path, "--name", "selftest", "--disable-discovery", "-x", "-v"]
+            args = [binary_path, "--name", "selftest", "--disable-discovery", "--check", "-v"]
             startupinfo = None
             if os.name == "nt":
                 startupinfo = subprocess.STARTUPINFO()

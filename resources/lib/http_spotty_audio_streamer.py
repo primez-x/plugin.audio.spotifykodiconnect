@@ -271,7 +271,7 @@ class HTTPSpottyAudioStreamer:
         # Always derive size from the URL's duration — the current streamer may have a
         # different track loaded, which would return the wrong Content-Length for queued
         # (non-current) tracks and confuse Kodi's prefetch queue.
-        pcm_bps = 44100 * 2 * 2  # 176400 bytes/sec at 44.1 kHz 16-bit stereo
+        pcm_bps = 44100 * 2 * 4  # 352800 bytes/sec at 44.1 kHz 32-bit stereo (S32)
         file_size = int(dur * pcm_bps) + 44  # +44 for WAV header
 
         bottle.response.status = 200

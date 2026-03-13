@@ -67,16 +67,19 @@ class SpottyDownloader:
             self.thread.start()
 
     def _build_args(self):
-        # Calculate start position in seconds. 176400 bytes per second (44.1kHz, 16-bit, stereo)
+        # Calculate start position in seconds. 352800 bytes per second (44.1kHz, 32-bit, stereo)
+        _pcm_bps = 44100 * 2 * 4
         header_len = len(self.wav_header)
         pcm_target_offset = max(0, self.start_byte - header_len)
-        start_sec_wav = (pcm_target_offset // 176400) if pcm_target_offset > 0 else 0
+        start_sec_wav = (pcm_target_offset // _pcm_bps) if pcm_target_offset > 0 else 0
 
         args = [
             "--disable-audio-cache",
             "--disable-discovery",
             "--bitrate",
             self.bitrate,
+            "--format",
+            "S32",
             "--initial-volume",
             str(self.volume),
         ]
@@ -89,7 +92,7 @@ class SpottyDownloader:
         args += ["--single-track", f"spotify:track:{self.track_id}"]
         if start_sec_wav > 0:
             args += ["--start-position", str(start_sec_wav)]
-        return args, (pcm_target_offset % 176400)
+        return args, (pcm_target_offset % _pcm_bps)
 
     # Session-conflict retry: when spotty exits cleanly (rc=0) but produces
     # 0 PCM bytes, Spotify's backend hasn't released the previous session yet.
@@ -193,7 +196,7 @@ class SpottyDownloader:
                             remaining = (
                                 self.track_length - self.start_byte
                             ) - self.written_bytes
-                            if 0 < remaining <= 176400 * 10:  # 10 secs max padding
+                            if 0 < remaining <= 44100 * 2 * 4 * 10:  # 10 secs max padding (S32)
                                 log_msg(
                                     f"Padding {remaining} bytes to end of {self.track_id}"
                                 )

@@ -20,10 +20,10 @@ _VALID_GAIN_TYPES = ("auto", "track", "album")
 _DEFAULT_GAIN_TYPE = "track"
 
 # Maximum bytes of PCM silence to pad at the end of a stream when spotty exits
-# cleanly but short of the WAV-declared length. 10 seconds @ 176400 B/s = 1,764,000.
+# cleanly but short of the WAV-declared length. 10 seconds @ 352800 B/s = 3,528,000.
 # Duration mismatches between the declared track length and spotty's actual output
 # are typically < 10 s; larger gaps indicate a real error and should not be masked.
-_SILENCE_PADDING_MAX_BYTES = 176400 * 10
+_SILENCE_PADDING_MAX_BYTES = 44100 * 2 * 4 * 10  # S32: 352800 bytes/sec
 
 
 def _clamp_volume(value: int) -> int:
@@ -207,7 +207,7 @@ def create_wav_header_for_duration(duration_sec: float) -> Tuple[bytes, int]:
         num_samples = 44100 * int(max(1, duration_sec))
         channels = 2
         sample_rate = 44100
-        bits_per_sample = 16
+        bits_per_sample = 32  # S32 output from spotty --format S32
 
         # Generate format chunk.
         format_chunk_spec = "<4sLHHLLHH"
