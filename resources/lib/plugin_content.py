@@ -22,8 +22,8 @@ from utils import (
     ADDON_ID,
     ADDON_WINDOW_ID,
     LOGINFO,
-    PROXY_HOST,
     PROXY_PORT,
+    PROXY_URL_HOST,
     get_chunks,
     log_exception,
     log_msg,
@@ -103,6 +103,12 @@ def _art_for_track(
     return base
 
 
+# Kodi window property used to gate the "authenticate" dialog to once per session.
+# Window properties persist across plugin invocations (separate Python processes)
+# as long as Kodi is running, so this works where a module-level flag cannot.
+_KODI_PROP_AUTH_DIALOG_SHOWN = "spotifykodiconnect-auth-dialog-shown"
+
+
 class PluginContent:
     __addon: xbmcaddon.Addon = xbmcaddon.Addon(id=ADDON_ID)
     __win: xbmcgui.Window = xbmcgui.Window(utils.ADDON_WINDOW_ID)
@@ -137,15 +143,24 @@ class PluginContent:
 
             self.cache: simplecache.SimpleCache = simplecache.SimpleCache(ADDON_ID)
 
-            # Spotty binary is ONLY needed for the zeroconf authentication flow.
-            # Defer creation so normal browse/play actions skip the expensive
-            # SpottyHelper self-test (runs spotty subprocess on every invocation
-            # on ARM Linux, with no timeout — can hang on slow devices).
+            # Spotty binary is only needed for caching streaming credentials
+            # after an OAuth login.  Defer creation so normal browse/play
+            # actions skip the expensive SpottyHelper self-test.
             self.__spotty: Optional[spotty.Spotty] = None
 
             self.check_auth_and_refresh_spotipy()
 
             self.parse_params()
+
+            # If not authenticated, only allow the authenticate action.
+            # Show the "Authenticate" menu item so the user can always re-trigger login.
+            if not self.__spotipy:
+                if self.__action == self.authenticate_plugin_request.__name__:
+                    self.authenticate_plugin_request()
+                else:
+                    log_msg("Not authenticated — showing authenticate-only menu.", LOGINFO)
+                    self.__browse_unauthenticated()
+                return
 
             if self.__action:
                 log_msg(f"Evaluating action '{self.__action}'.")
@@ -173,7 +188,25 @@ class PluginContent:
             self.init_spotipy(auth_token)
             return
 
-        self.authenticate_plugin_after_login_failure()
+        # No cached token in Kodi properties — try a direct OAuth refresh.
+        from spotify_oauth import oauth
+        token = oauth.get_valid_token()
+        if token:
+            utils.cache_auth_token(token)
+            stored = oauth.get_stored_token()
+            if stored:
+                utils.cache_auth_token_expires_at(str(stored.get("expires_at", "")))
+            self.init_spotipy(token)
+            return
+
+        # Not authenticated and no stored token.
+        # Use a Kodi window property as the cross-process session flag so
+        # we only show the auth dialog once per Kodi session, not on every
+        # plugin invocation (each invocation is a fresh Python process).
+        win = xbmcgui.Window(utils.ADDON_WINDOW_ID)
+        if not win.getProperty(_KODI_PROP_AUTH_DIALOG_SHOWN):
+            win.setProperty(_KODI_PROP_AUTH_DIALOG_SHOWN, "true")
+            self.authenticate_plugin_after_login_failure()
 
     def refresh_spotipy(self):
         auth_token: str = utils.get_cached_auth_token()
@@ -205,68 +238,116 @@ class PluginContent:
         win.setProperty("Spotify.UserCountry", self.__user_country)
 
     def authenticate_plugin_after_login_failure(self) -> None:
-        self.authenticate_plugin(
-            self.__addon.getLocalizedString(
-                AUTHENTICATE_INSTRUCTIONS_AFTER_LOGIN_FAIL_STR_ID
-            )
-        )
+        self.authenticate_plugin()
 
     def authenticate_plugin_request(self) -> None:
-        self.authenticate_plugin(
-            self.__addon.getLocalizedString(AUTHENTICATE_INSTRUCTIONS_STR_ID)
-        )
+        self.authenticate_plugin()
 
-    def authenticate_plugin(self, instructions: str) -> None:
+    def authenticate_plugin(self) -> None:
+        """Start OAuth2 PKCE login flow.
+
+        Tries to open the system browser.  On headless devices (no browser),
+        shows the device's LAN IP so the user can visit a URL on their phone
+        to complete authentication remotely.
+        """
+        import webbrowser
+        from spotify_oauth import oauth, REDIRECT_URI
+
         dialog = xbmcgui.Dialog()
         dialog_title = self.__addon.getAddonInfo("name")
 
-        # Lazy-init Spotty only when authentication is actually needed.
+        # Detect LAN IP for remote-auth instructions.
+        lan_ip = self._get_lan_ip()
+
+        # Determine whether we can use a local browser or need remote auth.
+        # On headless devices (Ugoos, CoreELEC, etc.), webbrowser.open() fails
+        # or opens nothing.  Detect this and offer the remote-auth flow instead.
+        browser_opened = False
+        auth_url = oauth.start_auth()
+        try:
+            browser_opened = webbrowser.open(auth_url)
+        except Exception:
+            pass
+
+        if browser_opened:
+            dialog.ok(
+                dialog_title,
+                "A browser window has been opened for Spotify login.\n\n"
+                "Log in with your Spotify account, then return here and press OK.",
+            )
+        else:
+            # No browser — show remote auth instructions.
+            if lan_ip:
+                remote_url = f"http://{lan_ip}:{PROXY_PORT}/auth/start"
+                dialog.ok(
+                    dialog_title,
+                    f"No browser detected on this device.\n\n"
+                    f"On your phone or computer, open:\n"
+                    f"[B]{remote_url}[/B]\n\n"
+                    f"Complete the Spotify login, then press OK here.",
+                )
+            else:
+                dialog.ok(
+                    dialog_title,
+                    "No browser detected and could not determine this device's "
+                    "IP address.\n\nPlease authenticate on a PC running Kodi, "
+                    "then copy the token file to this device.",
+                )
+                return
+
+        # After the user presses OK, check if the callback was received.
+        token_info = oauth.get_stored_token()
+        if not token_info or "access_token" not in token_info:
+            dialog.ok(
+                dialog_title,
+                "Authentication was not completed.\n\n"
+                "Please try again from the addon menu.",
+            )
+            return
+
+        # Cache spotty streaming credentials in the background.
+        access_token = token_info["access_token"]
         if self.__spotty is None:
             self.__spotty = spotty.get_spotty(SpottyHelper())
         spotty_auth = SpottyAuth(self.__spotty)
+        spotty_auth.cache_spotty_credentials(access_token)
 
-        zeroconf_auth = spotty_auth.start_zeroconf_authenticate()
-        if zeroconf_auth is None:
-            dialog.ok(dialog_title, self.get_zeroconf_program_failed_msg(spotty_auth))
-            utils.kill_this_plugin()
-            return
+        # Push the token into Kodi properties so the service picks it up.
+        utils.cache_auth_token(access_token)
+        utils.cache_auth_token_expires_at(str(token_info.get("expires_at", "")))
 
-        dialog.ok(dialog_title, instructions)
+        # Clear the session gate so the auth dialog can show again if needed.
+        xbmcgui.Window(utils.ADDON_WINDOW_ID).clearProperty(_KODI_PROP_AUTH_DIALOG_SHOWN)
 
-        zeroconf_auth.terminate()
-
-        if not spotty_auth.zeroconf_authenticated_ok():
-            dialog.ok(
-                dialog_title, self.get_zeroconf_authentication_failed_msg(spotty_auth)
-            )
-            utils.kill_this_plugin()
-            return
-
-        spotty_auth.renew_token()
         self.refresh_spotipy()
 
-        dialog.ok(dialog_title, self.get_authenticated_success_msg())
-
-    def get_authenticated_success_msg(self) -> str:
-        msg = self.__addon.getLocalizedString(AUTHENTICATE_SUCCESS_STR_ID)
-
-        max_str_len = len(max(msg.split("\n"), key=len))
-        blanks = " " * (int(max_str_len / 2) - 1)
-        msg += f"\n\n{blanks}'{self.__username}'."
-
-        return msg
-
-    def get_zeroconf_program_failed_msg(self, spotty_auth: SpottyAuth) -> str:
-        return (
-            f"{spotty_auth.get_zeroconf_program_failed_msg()}\n\n"
-            f"{self.__addon.getLocalizedString(TERMINATING_SPOTIFY_PLUGIN_STR_ID)}"
+        dialog.ok(
+            dialog_title,
+            "Successfully authenticated with Spotify!",
         )
 
-    def get_zeroconf_authentication_failed_msg(self, spotty_auth: SpottyAuth) -> str:
-        return (
-            f"{spotty_auth.get_zeroconf_authentication_failed_msg()}\n\n"
-            f"{self.__addon.getLocalizedString(TERMINATING_SPOTIFY_PLUGIN_STR_ID)}"
-        )
+    @staticmethod
+    def _get_lan_ip() -> str:
+        """Best-effort detection of the device's LAN IP address."""
+        import socket
+        try:
+            # Connect to an external address (doesn't send data) to determine
+            # which local interface would be used.
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            pass
+        # Fallback: use Kodi's network info if available.
+        try:
+            ip = xbmc.getIPAddress()
+            if ip and ip != "0.0.0.0":
+                return ip
+        except Exception:
+            pass
+        return ""
 
     def parse_params(self):
         """parse parameters from the plugin entry path"""
@@ -564,7 +645,7 @@ class PluginContent:
                 genres_list = [str(g) for g in genre if g]
 
         # Local playback by using proxy on this machine.
-        url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{track['id']}/{duration_sec}.wav"
+        url = f"http://{PROXY_URL_HOST}:{PROXY_PORT}/track/{track['id']}/{duration_sec}.wav"
 
         li = xbmcgui.ListItem(label, offscreen=True)
         li.setProperty("isPlayable", "true")
@@ -611,6 +692,21 @@ class PluginContent:
         li.setMimeType("audio/x-wav")
 
         return url, li
+
+    def __browse_unauthenticated(self) -> None:
+        """Show a minimal menu with just the Authenticate option when not logged in."""
+        xbmcplugin.setContent(self.__addon_handle, "files")
+        url = f"plugin://{ADDON_ID}/?action={self.authenticate_plugin_request.__name__}"
+        li = xbmcgui.ListItem(
+            self.__addon.getLocalizedString(AUTHENTICATE_PLUGIN_STR_ID)
+        )
+        li.setProperty("IsPlayable", "false")
+        li.setArt({"icon": os.path.join(self.__addon_icon_path, CLEAR_CACHE_ICON)})
+        li.addContextMenuItems([], True)
+        xbmcplugin.addDirectoryItem(
+            handle=self.__addon_handle, url=url, listitem=li, isFolder=False
+        )
+        xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
     def __browse_main(self) -> None:
         # Main listing.

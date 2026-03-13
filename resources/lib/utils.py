@@ -21,12 +21,14 @@ ADDON_DATA_PATH = xbmcvfs.translatePath(f"special://profile/addon_data/{ADDON_ID
 ADDON_WINDOW_ID = 10000
 # Different port so this addon can run alongside plugin.audio.spotify if needed
 PROXY_PORT = 52309
-# Use 127.0.0.1 instead of "localhost" to avoid IPv6/IPv4 dual-stack resolution
-# delays.  WSGIServer defaults to AF_INET (IPv4), so the server always binds to
-# 127.0.0.1.  If URLs say "localhost", Kodi's libcurl may try ::1 (IPv6) first,
-# wait ~14 s for the timeout, then fall back to IPv4.  On some Linux devices
-# (CoreELEC / LibreELEC) localhost resolution can fail entirely.
-PROXY_HOST = "127.0.0.1"
+# Bind to 0.0.0.0 so the HTTP server is reachable from the LAN — required for
+# remote OAuth authentication on headless devices (phone visits the /auth/start
+# URL on the Kodi device's LAN IP).  Audio streaming URLs still use 127.0.0.1
+# (PROXY_URL_HOST) so Kodi connects locally without IPv6 dual-stack delays.
+PROXY_HOST = "0.0.0.0"
+# Host used in URLs that Kodi fetches locally (audio streams).  127.0.0.1 avoids
+# the IPv6 dual-stack resolution delay that "localhost" can cause on some devices.
+PROXY_URL_HOST = "127.0.0.1"
 
 KODI_PROPERTY_SPOTIFY_AUTH_TOKEN = "spotifykodiconnect-auth-token"
 KODI_PROPERTY_AUTH_TOKEN_EXPIRES_AT = "spotifykodiconnect-auth-token-expires-at"

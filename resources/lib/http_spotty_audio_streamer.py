@@ -16,6 +16,7 @@ import xbmcgui
 from spotty import Spotty
 from spotty_audio_streamer import SpottyAudioStreamer
 from utils import ADDON_ID, ADDON_WINDOW_ID, LOGDEBUG, get_cached_auth_token, log_msg
+from xbmc import LOGERROR, LOGWARNING
 
 
 _settings_cache = {
@@ -523,3 +524,137 @@ class HTTPSpottyAudioStreamer:
             return {"success": False, "error": str(e)}
 
     toggle_track_like.route = "/toggle_like/<track_id>"
+
+    # ------------------------------------------------------------------
+    #  OAuth2 PKCE callback
+    # ------------------------------------------------------------------
+
+    OAUTH_CALLBACK_ROUTE = "/auth/callback"
+
+    def oauth_callback(self) -> str:
+        """Handle Spotify's OAuth redirect after user authorizes."""
+        from spotify_oauth import oauth
+
+        code = bottle.request.params.get("code", "")
+        state = bottle.request.params.get("state", "")
+        error = bottle.request.params.get("error", "")
+
+        if error:
+            log_msg(f"OAuth callback received error: {error}", LOGWARNING)
+            bottle.response.content_type = "text/html; charset=utf-8"
+            return (
+                "<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
+                "<h2>Authentication Failed</h2>"
+                f"<p>Spotify returned an error: <b>{error}</b></p>"
+                "<p>You can close this tab and try again from Kodi.</p>"
+                "</body></html>"
+            )
+
+        if not code:
+            log_msg("OAuth callback: no code parameter received.", LOGERROR)
+            bottle.response.content_type = "text/html; charset=utf-8"
+            return (
+                "<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
+                "<h2>Authentication Failed</h2>"
+                "<p>No authorization code received.</p>"
+                "<p>You can close this tab and try again from Kodi.</p>"
+                "</body></html>"
+            )
+
+        token_info = oauth.handle_callback(code, state)
+        if not token_info:
+            bottle.response.content_type = "text/html; charset=utf-8"
+            return (
+                "<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
+                "<h2>Authentication Failed</h2>"
+                "<p>Could not exchange the authorization code for tokens.</p>"
+                "<p>Check the Kodi log for details, then try again.</p>"
+                "</body></html>"
+            )
+
+        log_msg("OAuth callback: authentication successful.")
+        bottle.response.content_type = "text/html; charset=utf-8"
+        return (
+            "<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
+            "<h2>Authentication Successful!</h2>"
+            "<p>You are now logged in to Spotify.</p>"
+            "<p>You can close this tab and return to Kodi.</p>"
+            "</body></html>"
+        )
+
+    oauth_callback.route = OAUTH_CALLBACK_ROUTE
+
+    # ------------------------------------------------------------------
+    #  Remote OAuth — for headless devices (phone visits these URLs)
+    # ------------------------------------------------------------------
+
+    OAUTH_START_ROUTE = "/auth/start"
+
+    def oauth_start(self) -> str:
+        """Serve an HTML page for remote OAuth authentication on headless devices.
+
+        Flow:
+          1. Phone visits http://KODI_IP:52309/auth/start
+          2. Page extracts Kodi IP from request and shows "Login with Spotify" button
+          3. Auth URL is generated with GitHub Pages relay as redirect_uri
+          4. User clicks button, authenticates with Spotify
+          5. Spotify redirects to GitHub Pages relay with code+state
+          6. Relay page extracts Kodi IP from state and redirects back to
+             http://KODI_IP:52309/auth/complete
+          7. Kodi exchanges code for tokens
+
+        Redirect URI registered in Spotify Dashboard:
+          https://primez-x.github.io/plugin.audio.spotifykodiconnect/auth/callback
+        """
+        from spotify_oauth import oauth
+
+        # Extract Kodi device's host from the incoming request
+        # bottle.request.environ['HTTP_HOST'] or bottle.request.environ.get('SERVER_NAME')
+        kodi_host = bottle.request.environ.get('HTTP_HOST') or \
+                   f"{bottle.request.environ.get('SERVER_NAME', 'localhost')}:{bottle.request.environ.get('SERVER_PORT', 52309)}"
+
+        # Generate auth URL with Kodi host embedded in state for relay
+        auth_url = oauth.start_auth(kodi_host=kodi_host)
+
+        bottle.response.content_type = "text/html; charset=utf-8"
+        return f"""<!DOCTYPE html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Spotify Login — Kodi</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 500px; margin: 60px auto; padding: 20px; color: #222; text-align: center; }}
+  h2 {{ color: #1DB954; margin-bottom: 30px; }}
+  .info {{ margin: 20px 0; padding: 16px; background: #f5f5f5; border-radius: 8px; line-height: 1.6; }}
+  a.btn {{ display: inline-block; background: #1DB954; color: #fff; padding: 14px 32px; border-radius: 24px; text-decoration: none; font-weight: bold; font-size: 16px; margin-top: 20px; transition: background 0.2s; }}
+  a.btn:hover {{ background: #1aa34a; }}
+</style></head><body>
+<h2>Spotify Login for Kodi</h2>
+<div class="info">
+  <p>Click the button below to log in to Spotify.</p>
+  <p style="font-size: 13px; color: #666;">You will be redirected to complete authentication.</p>
+  <a class="btn" href="{auth_url}">Login with Spotify</a>
+</div>
+</body></html>"""
+
+    oauth_start.route = OAUTH_START_ROUTE
+
+    OAUTH_COMPLETE_ROUTE = "/auth/complete"
+
+    def oauth_complete(self) -> dict:
+        """Receive code+state relayed from the /auth/start page's form."""
+        from spotify_oauth import oauth
+
+        code = bottle.request.params.get("code", "")
+        state = bottle.request.params.get("state", "")
+
+        if not code:
+            bottle.response.status = 400
+            return {"success": False, "error": "Missing authorization code."}
+
+        token_info = oauth.handle_callback(code, state)
+        if not token_info:
+            bottle.response.status = 500
+            return {"success": False, "error": "Token exchange failed. Check Kodi log."}
+
+        return {"success": True}
+
+    oauth_complete.route = OAUTH_COMPLETE_ROUTE

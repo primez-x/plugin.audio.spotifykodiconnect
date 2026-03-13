@@ -19,14 +19,14 @@ from http_spotty_audio_streamer import HTTPSpottyAudioStreamer
 from nexttrack_broadcast import broadcast_to_nexttrack
 from playlist_next import get_next_playlist_item, parse_track_url
 from prebuffer import PrebufferManager
-from spotty_auth import SpottyAuth
+from spotty_auth import SpottyAuth, AuthTokenUnavailable
 from spotty_helper import SpottyHelper
 from string_ids import WELCOME_AUTHENTICATED_STR_ID
 from utils import (
     ADDON_ID,
     ADDON_WINDOW_ID,
-    PROXY_HOST,
     PROXY_PORT,
+    PROXY_URL_HOST,
     get_cached_auth_token,
     log_exception,
     log_msg,
@@ -481,7 +481,7 @@ class MainService:
                 seed_duration_sec = (
                     math.ceil(seed_duration_ms / 1000) if seed_duration_ms else 1
                 )
-                seed_url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{seed_track_id}/{seed_duration_sec}.wav"
+                seed_url = f"http://{PROXY_URL_HOST}:{PROXY_PORT}/track/{seed_track_id}/{seed_duration_sec}.wav"
                 li = xbmcgui.ListItem(label=seed_name or seed_track_id)
                 li.setProperty("IsPlayable", "true")
                 li.setProperty("spotifytrackid", seed_track_id)
@@ -511,7 +511,7 @@ class MainService:
             except Exception:
                 # If fetching metadata fails, still add a minimal entry for the seed track.
                 try:
-                    seed_url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{seed_track_id}/1.wav"
+                    seed_url = f"http://{PROXY_URL_HOST}:{PROXY_PORT}/track/{seed_track_id}/1.wav"
                     li = xbmcgui.ListItem(label=seed_track_id)
                     li.setProperty("IsPlayable", "true")
                     li.setProperty("spotifytrackid", seed_track_id)
@@ -563,7 +563,7 @@ class MainService:
                             math.ceil(duration_ms / 1000) if duration_ms else 1
                         )
                         url = (
-                            f"http://{PROXY_HOST}:{PROXY_PORT}/track/{tid}/{duration_sec}.wav"
+                            f"http://{PROXY_URL_HOST}:{PROXY_PORT}/track/{tid}/{duration_sec}.wav"
                         )
                         li = xbmcgui.ListItem(label=name)
                         li.setProperty("IsPlayable", "true")
@@ -621,6 +621,9 @@ class MainService:
 
         loop_counter = 0
         loop_wait_in_secs = 6
+        # Tracks whether we've already logged the "not authenticated" message
+        # so we don't spam the log every 6 seconds.
+        auth_warning_shown = False
         while True:
             loop_counter += 1
             if (loop_counter % 10) == 0:
@@ -634,8 +637,21 @@ class MainService:
             self.__prebuffer_enabled = prebuffer_enabled_now
 
             if self.__auth_token_expires_at == "":
-                log_msg("Spotify not yet authorized. Refreshing auth token now.")
-                self.__renew_token()
+                # Not authenticated.  Check if the user has completed OAuth
+                # login (token file appears on disk) before retrying.
+                from spotify_oauth import SpotifyOAuth
+                if SpotifyOAuth.is_authenticated():
+                    log_msg("OAuth token detected — attempting authentication.")
+                    self.__renew_token()
+                    if self.__auth_token_expires_at:
+                        auth_warning_shown = False
+                elif not auth_warning_shown:
+                    log_msg(
+                        "Spotify not authenticated."
+                        "  Open the addon and select 'Authenticate with Spotify'.",
+                        LOGWARNING,
+                    )
+                    auth_warning_shown = True
             elif (int(self.__auth_token_expires_at) - 60) <= int(time.time()):
                 expire_time = int(self.__auth_token_expires_at)
                 time_now = int(time.time())
@@ -677,6 +693,10 @@ class MainService:
             if self.__welcome_msg:
                 self.__welcome_msg = False
                 self.__show_welcome_notification()
+        except AuthTokenUnavailable:
+            # No credentials at all — user hasn't authenticated yet.
+            # Logged once by the main loop; no popup, no exception trace.
+            self.__auth_token_expires_at = ""
         except Exception as exc:
             log_exception(exc, "Could not renew Spotify auth token")
             self.__auth_token_expires_at = ""
