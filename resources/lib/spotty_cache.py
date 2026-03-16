@@ -157,14 +157,16 @@ class SpottyDownloader:
             if self.aborted:
                 return
 
-            # Detect session conflict: spotty exits cleanly but produced no audio.
+            # Detect session conflict or transient error: spotty produced no audio.
+            # Retry regardless of exit code when 0 PCM bytes were received — a non-zero
+            # exit with 0 bytes is equally unplayable (network blip, auth hiccup, etc.).
             rc = process.returncode if process else -1
-            if rc == 0 and pcm_bytes_read == 0 and attempt < self._MAX_SESSION_RETRIES:
+            if pcm_bytes_read == 0 and attempt < self._MAX_SESSION_RETRIES:
                 delay = self._RETRY_DELAYS[min(attempt, len(self._RETRY_DELAYS) - 1)]
                 log_msg(
                     f"Spotty produced 0 PCM bytes for {self.track_id} "
-                    f"(session conflict). Retry {attempt + 1}/{self._MAX_SESSION_RETRIES} "
-                    f"after {delay}s.",
+                    f"(rc={rc}, session conflict or transient error). "
+                    f"Retry {attempt + 1}/{self._MAX_SESSION_RETRIES} after {delay}s.",
                     LOGWARNING,
                 )
                 # Use condition wait so abort() can interrupt the sleep.
@@ -180,25 +182,24 @@ class SpottyDownloader:
             # Normal finish or final retry failure.
             with self.cond:
                 if not self.aborted:
-                    if rc == 0:
-                        if pcm_bytes_read == 0:
+                    if pcm_bytes_read == 0:
+                        log_msg(
+                            f"Spotty produced 0 PCM bytes after "
+                            f"{self._MAX_SESSION_RETRIES} retries for "
+                            f"{self.track_id} (rc={rc}). Marking as error.",
+                            LOGWARNING,
+                        )
+                        self.error = True
+                    elif rc == 0:
+                        remaining = (
+                            self.track_length - self.start_byte
+                        ) - self.written_bytes
+                        if 0 < remaining <= 176400 * 10:  # 10 secs max padding
                             log_msg(
-                                f"Spotty produced 0 PCM bytes after "
-                                f"{self._MAX_SESSION_RETRIES} retries for "
-                                f"{self.track_id}. Marking as error.",
-                                LOGWARNING,
+                                f"Padding {remaining} bytes to end of {self.track_id}"
                             )
-                            self.error = True
-                        else:
-                            remaining = (
-                                self.track_length - self.start_byte
-                            ) - self.written_bytes
-                            if 0 < remaining <= 176400 * 10:  # 10 secs max padding
-                                log_msg(
-                                    f"Padding {remaining} bytes to end of {self.track_id}"
-                                )
-                                self._buffer.extend(bytes(remaining))
-                                self.written_bytes += remaining
+                            self._buffer.extend(bytes(remaining))
+                            self.written_bytes += remaining
                     else:
                         log_msg(
                             f"Spotty exited with code {rc} for {self.track_id},"

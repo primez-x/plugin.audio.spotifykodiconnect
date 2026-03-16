@@ -134,27 +134,55 @@ class SpottyAudioStreamer:
         """Generator: yield WAV (PCM) bytes from the background downloader's in-memory buffer."""
         from spotty_cache import SpottyCacheManager
 
+        # Capture track-specific state at entry — set_track() may be called concurrently
+        # when Kodi pre-loads the next track via QueueNextFileEx while this generator is
+        # still draining the current one.  Local copies insulate this generator from those
+        # updates so we always stream the correct track from the cache.
+        track_id = self.__track_id
+        track_length = self.__track_length
+        track_duration = self.__track_duration
+        wav_header = bytes(self.__wav_header)
+
         self.__terminated = False
         bytes_sent = 0
-        
+
         # Check if we have an active background downloader for this track that covers our request
-        downloader = SpottyCacheManager.find_best_downloader(self.__track_id, range_begin)
-        
+        downloader = SpottyCacheManager.find_best_downloader(track_id, range_begin)
+
         # If no suitable downloader, or the downloader is too far behind (e.g. > 2MB behind),
         # start a new downloader at the requested position.
         # Since librespot downloads fast, we only jump if the user seeks far ahead of current progress.
         if not downloader:
             downloader = SpottyCacheManager.get_or_start(
-                self.__spotty, self.__track_id, self.__track_duration, range_begin,
+                self.__spotty, track_id, track_duration, range_begin,
                 self.bitrate, self.normalization_gain_type, self.initial_volume,
-                self.__wav_header, self.__track_length
+                wav_header, track_length
             )
         elif range_begin > downloader.start_byte + downloader.written_bytes + 2097152 and not downloader.is_finished:
             downloader = SpottyCacheManager.get_or_start(
-                self.__spotty, self.__track_id, self.__track_duration, range_begin,
+                self.__spotty, track_id, track_duration, range_begin,
                 self.bitrate, self.normalization_gain_type, self.initial_volume,
-                self.__wav_header, self.__track_length
+                wav_header, track_length
             )
+
+        # Wait for a minimum initial buffer before yielding to prevent codec init failures.
+        # PAPlayer's QueueNextFileEx opens the URL while the current track is playing;
+        # if only the 44-byte WAV header is available, the codec reports
+        # "CAudioDecoder: Unable to Init Codec" and skips to the next track, cascading.
+        # This guard holds until 256 KB are buffered (typically < 1 s) or the download
+        # finishes/errors — whichever comes first.  Seeks (range_begin > 0) are exempt
+        # because the user expects an immediate response.
+        if range_begin == 0:
+            _min_bytes = 262144  # 256 KB
+            _deadline = time.time() + 5.0
+            while (
+                not self.__terminated
+                and not downloader.is_finished
+                and not downloader.error
+                and downloader.written_bytes < _min_bytes
+                and time.time() < _deadline
+            ):
+                downloader.wait_for_bytes(downloader.written_bytes + 65536, timeout=0.25)
 
         self._log_transfer("start", range_begin=range_begin)
 
@@ -189,8 +217,8 @@ class SpottyAudioStreamer:
                     break
 
             end_of_range = range_begin + bytes_sent
-            if self.__track_length > 0 and end_of_range >= self.__track_length:
-                self.__notify_track_finished(self.__track_id)
+            if track_length > 0 and end_of_range >= track_length:
+                self.__notify_track_finished(track_id)
             self._log_transfer("finished", range_begin=range_begin, bytes_sent=bytes_sent)
 
         except Exception as ex:

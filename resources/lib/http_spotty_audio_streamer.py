@@ -219,6 +219,29 @@ class HTTPSpottyAudioStreamer:
             if self.__prebuffer_manager:
                 self.__prebuffer_manager.cancel_prebuffer()
 
+            # Terminate the previous track's stream — unless this is Kodi's QueueNextFileEx
+            # pre-load (new track ID while the previous track's download is already complete
+            # in the cache).  In that case, killing the HTTP generator cuts the current track
+            # ~5 seconds short; let it drain naturally instead.  send_part_audio_stream()
+            # captures its track-specific state at entry, so two generators running briefly
+            # in parallel read from independent cache entries without interfering.
+            # If the previous download is still in progress we must terminate: a competing
+            # spotty process would cause a mutual-kick session conflict.
+            _skip_terminate = False
+            if self.__current_track_id and self.__current_track_id != track_id:
+                from spotty_cache import SpottyCacheManager
+                _cur_dl = SpottyCacheManager.find_best_downloader(self.__current_track_id, 0)
+                if _cur_dl and _cur_dl.is_finished and not _cur_dl.error:
+                    _skip_terminate = True
+                    log_msg(
+                        f"QueueNextFileEx detected: {self.__current_track_id} download complete, "
+                        f"not terminating stream — letting generator drain for seamless transition "
+                        f"to {track_id}.",
+                        LOGDEBUG,
+                    )
+            if not _skip_terminate:
+                self.__terminate_streaming()
+
             # Set up new track with proper locking to prevent concurrent overwrites
             with self.__stream_lock:
                 self.__spotty_streamer.bitrate = bitrate
@@ -417,14 +440,19 @@ class HTTPSpottyAudioStreamer:
 
             try:
                 if is_seek:
-                    self.__terminate_streaming()
+                    # Do NOT terminate the active stream on seek. Kodi opens multiple connections
+                    # (e.g. GET bytes=0- then GET bytes=20- after reading WAV header). Terminating
+                    # here closed the first connection prematurely, causing "Transferred a partial
+                    # file" and "Open - Unhandled exception". Both connections can read from cache.
                     log_msg(
-                        f"Seek to byte {range_begin}, streaming immediately from cache.", LOGDEBUG
+                        f"Seek to byte {range_begin}, streaming from cache (parallel read, no terminate).",
+                        LOGDEBUG,
                     )
                 elif is_new_track:
-                    self.__terminate_streaming()
+                    # Previous track already terminated in spotty_stream_audio_track();
+                    # do not terminate here or a second GET for this track would kill the first.
                     log_msg(
-                        "New track: terminated previous stream, streaming new track from cache.",
+                        "New track: streaming from cache (previous stream already terminated).",
                         LOGDEBUG,
                     )
 
