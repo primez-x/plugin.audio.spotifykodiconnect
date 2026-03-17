@@ -441,11 +441,6 @@ class HTTPSpottyAudioStreamer:
                 LOGDEBUG,
             )
 
-        # Re-apply this request's track at stream time so we stream the correct track even if
-        # a concurrent request overwrote the shared streamer (reduces wrong-track/0-length).
-        # We NO LONGER defer killing the previous spotty. The background cache handles it.
-        is_seek_to_start = False
-
         # Check if this request is stale BEFORE returning generator (before HTTP headers commit)
         if request_id and request_id != self.__current_request_id:
             log_msg(f"WAV request {request_id} is stale (current: {self.__current_request_id}), returning empty.", LOGDEBUG)
