@@ -609,7 +609,7 @@ class MainService:
         every range chunk). OSD properties are cleared by _SpotifyOSDPlayerMonitor
         on real playback stop/end events.
         """
-        self.__http_spotty_streamer.set_stream_ended()
+        self.__http_spotty_streamer.set_stream_ended(track_id)
 
     def run(self) -> None:
         log_msg("Starting main service loop.")

@@ -184,6 +184,23 @@ class SpottyAudioStreamer:
             ):
                 downloader.wait_for_bytes(downloader.written_bytes + 65536, timeout=0.25)
 
+        # Rate-throttle: keep the HTTP connection alive for the full track duration so
+        # Kodi's QueueNextFileEx fires while our connection is still active.
+        # Without throttling, tracks opened via QueueNextFileEx are pre-buffered by Kodi
+        # at full speed (40+ MB in ~6 seconds), closing the connection minutes before the
+        # *next* QueueNextFileEx fires — causing "Unhandled exception" and cascading skips.
+        # Allow a 2 MB initial burst so Kodi's decode buffer fills instantly, then pace
+        # at 176400 B/s (44.1 kHz × 2 ch × 2 bytes).  Only from-start requests are
+        # throttled; seeks (range_begin > 0) must respond immediately.
+        _PCM_BYTES_PER_SEC = 176400  # 44.1 kHz × 2 ch × 2 bytes/sample
+        _THROTTLE_LEAD_BYTES = 2097152  # 2 MB burst window before throttle engages
+        # Throttle for from-start requests (range_begin == 0) AND for WAV-header
+        # restarts (range_begin == 44, i.e. "prev" skips the 44-byte header).
+        # Both are full-track deliveries that must keep the connection alive.
+        # Mid-song seeks (range_begin > 44) are never throttled.
+        _WAV_HEADER_SIZE = 44
+        stream_start_time = time.monotonic() if range_begin <= _WAV_HEADER_SIZE else None
+
         self._log_transfer("start", range_begin=range_begin)
 
         buf_offset = range_begin - downloader.start_byte
@@ -213,6 +230,16 @@ class SpottyAudioStreamer:
                     bytes_sent += len(chunk)
                     if bytes_sent % 10485760 < self.chunk_size:
                         self._log_transfer("progress", bytes_sent=bytes_sent)
+                    # Throttle to real-time rate after the initial burst window.
+                    # Sleep in 100 ms increments so terminate signals are honoured quickly.
+                    if stream_start_time is not None:
+                        elapsed = time.monotonic() - stream_start_time
+                        budget = elapsed * _PCM_BYTES_PER_SEC + _THROTTLE_LEAD_BYTES
+                        if bytes_sent > budget:
+                            sleep_needed = (bytes_sent - budget) / _PCM_BYTES_PER_SEC
+                            sleep_end = time.monotonic() + sleep_needed
+                            while time.monotonic() < sleep_end and not self.__terminated:
+                                time.sleep(0.1)
                 elif is_finished:
                     break
 

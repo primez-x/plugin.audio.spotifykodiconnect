@@ -99,11 +99,27 @@ class HTTPSpottyAudioStreamer:
         self.__notify_track_finished = func or (lambda _id: None)
         self.__spotty_streamer.set_notify_track_finished(self.__notify_track_finished)
 
-    def set_stream_ended(self) -> None:
-        """Mark that the current stream has finished so the next request starts fresh."""
+    def set_stream_ended(self, track_id: Optional[str] = None) -> None:
+        """Mark that the current stream has finished so the next request starts fresh.
+
+        Pass the track_id that just finished so we can ignore stale calls when a new
+        track has already started (e.g. the old generator finishes *after* QueueNextFileEx
+        has already transitioned __current_track_id to the next track).
+        """
         with self.__stream_lock:
+            if track_id is not None and self.__current_track_id != track_id:
+                # A newer track is already loaded — don't clobber its __is_streaming flag.
+                log_msg(
+                    f"set_stream_ended: ignoring stale end for {track_id} "
+                    f"(current={self.__current_track_id})",
+                    LOGDEBUG,
+                )
+                return
             self.__is_streaming = False
-            self.__current_track_id = None
+            # Do NOT clear __current_track_id here. It must remain set so that
+            # _previous_track_id is non-null when QueueNextFileEx fires after the
+            # stream ends naturally (minutes before audio fully plays out of Kodi's
+            # buffer), allowing _skip_terminate to correctly skip the terminate call.
 
     def is_current_track_streaming(self, track_id: str) -> bool:
         """Check if the given track is still being streamed to Kodi."""
@@ -154,6 +170,9 @@ class HTTPSpottyAudioStreamer:
 
         request_range = bottle.request.headers.get("Range", "")
         is_new_track = not self.__is_streaming or self.__current_track_id != track_id
+        # Capture BEFORE the is_new_track lock block sets self.__current_track_id = track_id
+        # (line ~191). Used by _skip_terminate to identify QueueNextFileEx pre-loads.
+        _previous_track_id = self.__current_track_id
 
         _r = (request_range or "").strip()
         from_start = (
@@ -228,13 +247,13 @@ class HTTPSpottyAudioStreamer:
             # If the previous download is still in progress we must terminate: a competing
             # spotty process would cause a mutual-kick session conflict.
             _skip_terminate = False
-            if self.__current_track_id and self.__current_track_id != track_id:
+            if _previous_track_id and _previous_track_id != track_id:
                 from spotty_cache import SpottyCacheManager
-                _cur_dl = SpottyCacheManager.find_best_downloader(self.__current_track_id, 0)
+                _cur_dl = SpottyCacheManager.find_best_downloader(_previous_track_id, 0)
                 if _cur_dl and _cur_dl.is_finished and not _cur_dl.error:
                     _skip_terminate = True
                     log_msg(
-                        f"QueueNextFileEx detected: {self.__current_track_id} download complete, "
+                        f"QueueNextFileEx detected: {_previous_track_id} download complete, "
                         f"not terminating stream — letting generator drain for seamless transition "
                         f"to {track_id}.",
                         LOGDEBUG,
@@ -405,12 +424,15 @@ class HTTPSpottyAudioStreamer:
             # so the first response returns immediately (UI snappy); Kodi then requests the
             # rest using its cache.chunksize for everything after.
             if is_new_track and range_begin > 0:
-                range_begin = 0
-                range_end = min(file_size, 65536)
-                content_range = f"bytes 0-{range_end - 1}/{file_size}"
-                status = "206 Partial Content"
+                # "prev" or stale range: Kodi sends bytes=44- (WAV header size) to
+                # restart from the first PCM byte, or carries over a mid-track range
+                # from a previous track.  Honor the requested byte offset exactly —
+                # Kodi uses CURLOPT_RESUME_FROM which enforces that the server starts
+                # at the requested byte, so returning any other range causes error 33.
+                # send_part_audio_stream throttles range_begin <= WAV_HEADER_SIZE (44)
+                # at real-time rate, keeping the connection alive for QueueNextFileEx.
                 log_msg(
-                    f"New track request had range_begin>0 (stale?), serving first chunk from start (size={range_end}).",
+                    f"New track request with range_begin={range_begin} (restart/stale), serving from that byte.",
                     LOGDEBUG,
                 )
             log_msg(
