@@ -282,14 +282,6 @@ msgctxt "#11108"
 msgid "When enabled, the prebuffer duration is derived from the Up Next preview duration (clamped to 5–30 seconds)."
 msgstr ""
 
-msgctxt "#11111"
-msgid "Broadcast to Next Track service"
-msgstr "Broadcast to Next Track service"
-
-msgctxt "#11112"
-msgid "When enabled, sends next-track data to the Next Track service addon so it can show the next-track overlay. Disable if you use only the built-in overlay or another addon."
-msgstr "When enabled, sends next-track data to the Next Track service addon so it can show the next-track overlay. Disable if you use only the built-in overlay or another addon."
-
 msgctxt "#11122"
 msgid "Welcome"
 msgstr ""

@@ -1,16 +1,40 @@
-<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<?xml version="1.0" encoding="utf-8" standalone="yes" ?>
 <settings>
     <category label="11054">
-        <setting id="spotify_normalization" type="labelenum" label="11075" help="11143" default="auto" lvalues="11134|11135|11136|11137" values="off|auto|track|album"/>
-        <setting id="spotify_autoplay" type="bool" default="false" label="11130" help="11131">
-          <control type="toggle"/>
+        <setting
+            id="spotify_normalization"
+            type="labelenum"
+            label="11075"
+            help="11143"
+            default="auto"
+            lvalues="11134|11135|11136|11137"
+            values="off|auto|track|album"
+        />
+        <setting
+            id="spotify_autoplay"
+            type="bool"
+            default="false"
+            label="11130"
+            help="11131"
+        >
+          <control type="toggle" />
         </setting>
-        <setting id="spotify_bitrate" type="labelenum" label="11138" help="11139" default="320" lvalues="11140|11141|11142" values="96|160|320"/>
-        <setting id="prebuffer_enabled" type="bool" default="true" label="11107">
-          <control type="toggle"/>
-        </setting>
-<setting id="broadcast_to_service_nexttrack" type="bool" default="true" label="11111" help="11112">
-          <control type="toggle"/>
+        <setting
+            id="spotify_bitrate"
+            type="labelenum"
+            label="11138"
+            help="11139"
+            default="320"
+            lvalues="11140|11141|11142"
+            values="96|160|320"
+        />
+        <setting
+            id="prebuffer_enabled"
+            type="bool"
+            default="true"
+            label="11107"
+        >
+          <control type="toggle" />
         </setting>
     </category>
 </settings>
