@@ -16,7 +16,6 @@ import xbmc
 import xbmcaddon
 import xbmcgui
 from http_spotty_audio_streamer import HTTPSpottyAudioStreamer
-from nexttrack_broadcast import broadcast_to_nexttrack
 from playlist_next import get_next_playlist_item, parse_track_url
 from prebuffer import PrebufferManager
 from spotty_auth import SpottyAuth
@@ -410,28 +409,6 @@ class MainService:
 
                 threading.Thread(target=_deferred_prebuffer, daemon=True).start()
 
-            broadcast_enabled = (
-                SPOTIFY_ADDON.getSetting("broadcast_to_service_nexttrack").lower()
-                != "false"
-            )
-            if broadcast_enabled:
-
-                def _do_broadcast():
-                    time.sleep(2)
-                    try:
-                        current_item, next_item = get_next_playlist_item()
-                        if not next_item:
-                            return
-                        broadcast_to_nexttrack(
-                            current_item,
-                            next_item,
-                            int(duration_sec),
-                        )
-                    except Exception:
-                        pass
-
-                t = threading.Thread(target=_do_broadcast, daemon=True)
-                t.start()
         except Exception:
             pass
 
@@ -511,7 +488,9 @@ class MainService:
             except Exception:
                 # If fetching metadata fails, still add a minimal entry for the seed track.
                 try:
-                    seed_url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{seed_track_id}/1.wav"
+                    seed_url = (
+                        f"http://{PROXY_HOST}:{PROXY_PORT}/track/{seed_track_id}/1.wav"
+                    )
                     li = xbmcgui.ListItem(label=seed_track_id)
                     li.setProperty("IsPlayable", "true")
                     li.setProperty("spotifytrackid", seed_track_id)
@@ -562,9 +541,7 @@ class MainService:
                         duration_sec = (
                             math.ceil(duration_ms / 1000) if duration_ms else 1
                         )
-                        url = (
-                            f"http://{PROXY_HOST}:{PROXY_PORT}/track/{tid}/{duration_sec}.wav"
-                        )
+                        url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{tid}/{duration_sec}.wav"
                         li = xbmcgui.ListItem(label=name)
                         li.setProperty("IsPlayable", "true")
                         li.setProperty("spotifytrackid", tid)
