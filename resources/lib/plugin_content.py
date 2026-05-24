@@ -435,7 +435,7 @@ class PluginContent:
             liked = bool(result and result[0])
             if liked:
                 self.__spotipy.current_user_saved_tracks_delete([track_id])
-                win.setProperty("Spotify.CurrentTrackLiked", "false")
+                win.clearProperty("Spotify.CurrentTrackLiked")
             else:
                 self.__spotipy.current_user_saved_tracks_add([track_id])
                 win.setProperty("Spotify.CurrentTrackLiked", "true")
