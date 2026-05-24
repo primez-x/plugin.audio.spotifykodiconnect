@@ -538,7 +538,7 @@ class HTTPSpottyAudioStreamer:
             if is_liked:
                 # Unlike the track
                 sp.current_user_saved_tracks_delete([track_id])
-                liked_status = "false"
+                liked_status = ""
             else:
                 # Like the track
                 sp.current_user_saved_tracks_add([track_id])
@@ -546,7 +546,10 @@ class HTTPSpottyAudioStreamer:
 
             # Update the window property for the current track
             win = xbmcgui.Window(ADDON_WINDOW_ID)
-            win.setProperty("Spotify.CurrentTrackLiked", liked_status)
+            if liked_status:
+                win.setProperty("Spotify.CurrentTrackLiked", liked_status)
+            else:
+                win.clearProperty("Spotify.CurrentTrackLiked")
 
             # Also update the window property to indicate the change occurred
             win.setProperty("Spotify.TrackLikeChanged", "true")

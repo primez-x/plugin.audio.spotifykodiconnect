@@ -33,6 +33,17 @@ from utils import (
 from xbmc import LOGDEBUG, LOGWARNING
 
 SPOTIFY_ADDON = xbmcaddon.Addon(id=ADDON_ID)
+SPOTIFY_TRACK_HOOK_KEYS = (
+    "Id",
+    "Title",
+    "Artist",
+    "Album",
+    "Thumb",
+    "Fanart",
+    "Duration",
+    "File",
+    "Available",
+)
 
 # Artist fanart for Music OSD (single largest image URL; no rotation – Spotify only provides same image in multiple sizes)
 _artist_fanart_urls = []  # type: list
@@ -116,6 +127,91 @@ def _clear_artist_fanart_rotation() -> None:
     win.clearProperty("Spotify.ArtistFanartCurrent")
 
 
+def _set_or_clear(win, key: str, value) -> None:
+    if value:
+        win.setProperty(key, str(value))
+    else:
+        win.clearProperty(key)
+
+
+def _join_artist(value) -> str:
+    if isinstance(value, list):
+        return ", ".join([str(item) for item in value if item])
+    return str(value or "")
+
+
+def _item_art(item, *keys) -> str:
+    art = (item or {}).get("art") or {}
+    if not isinstance(art, dict):
+        return ""
+    for key in keys:
+        value = art.get(key)
+        if value:
+            return value
+    return ""
+
+
+def _publish_track_hook(win, prefix: str, item, track_id: str = "", duration=None) -> None:
+    item = item or {}
+    title = item.get("title") or item.get("label") or ""
+    artist = _join_artist(item.get("artist"))
+    album = item.get("album") or ""
+    file_url = item.get("file") or ""
+    thumb = _item_art(item, "thumb", "poster", "icon", "fanart", "landscape")
+    fanart = _item_art(item, "artist.fanart", "fanart", "landscape", "thumb", "poster")
+    duration_value = duration or item.get("duration") or item.get("runtime") or ""
+
+    _set_or_clear(win, f"Spotify.{prefix}Id", track_id)
+    _set_or_clear(win, f"Spotify.{prefix}Title", title)
+    _set_or_clear(win, f"Spotify.{prefix}Artist", artist)
+    _set_or_clear(win, f"Spotify.{prefix}Album", album)
+    _set_or_clear(win, f"Spotify.{prefix}Thumb", thumb)
+    _set_or_clear(win, f"Spotify.{prefix}Fanart", fanart)
+    _set_or_clear(win, f"Spotify.{prefix}Duration", duration_value)
+    _set_or_clear(win, f"Spotify.{prefix}File", file_url)
+    _set_or_clear(win, f"Spotify.{prefix}Available", track_id or title or file_url)
+
+
+def _clear_track_hook(win, prefix: str) -> None:
+    for key in SPOTIFY_TRACK_HOOK_KEYS:
+        win.clearProperty(f"Spotify.{prefix}{key}")
+
+
+def _clear_playback_hooks() -> None:
+    win = xbmcgui.Window(ADDON_WINDOW_ID)
+    _clear_track_hook(win, "CurrentTrack")
+    _clear_track_hook(win, "NextTrack")
+
+
+def _refresh_playback_hooks(current_track_id: str, delay_ms: int = 0) -> None:
+    def _run():
+        if delay_ms:
+            xbmc.sleep(delay_ms)
+        win = xbmcgui.Window(ADDON_WINDOW_ID)
+        try:
+            current_item, next_item = get_next_playlist_item()
+            current_id, current_duration = parse_track_url(
+                (current_item or {}).get("file") or ""
+            )
+            if current_id == current_track_id:
+                _publish_track_hook(
+                    win, "CurrentTrack", current_item, current_id, current_duration
+                )
+            else:
+                _clear_track_hook(win, "CurrentTrack")
+                _set_or_clear(win, "Spotify.CurrentTrackId", current_track_id)
+
+            next_id, next_duration = parse_track_url((next_item or {}).get("file") or "")
+            if next_id and next_id != current_track_id:
+                _publish_track_hook(win, "NextTrack", next_item, next_id, next_duration)
+            else:
+                _clear_track_hook(win, "NextTrack")
+        except Exception as exc:
+            log_exception(exc, "refreshing Spotify skin playback hooks failed")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def abort_app(timeout_in_secs: int) -> bool:
     return _monitor.waitForAbort(timeout_in_secs)
 
@@ -134,6 +230,7 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
         win = xbmcgui.Window(ADDON_WINDOW_ID)
         win.clearProperty("Spotify.CurrentTrackId")
         win.clearProperty("Spotify.CurrentTrackLiked")
+        _clear_playback_hooks()
 
     def onPlayBackStopped(self) -> None:
         self._clear()
@@ -219,7 +316,9 @@ class MainService:
         track_changed = track_id != _liked_state_track_id
         if track_changed:
             _liked_state_track_id = track_id
-            win.setProperty("Spotify.CurrentTrackLiked", "")
+            win.clearProperty("Spotify.CurrentTrackLiked")
+
+        _refresh_playback_hooks(track_id, delay_ms=1000)
 
         def _fetch_artist_fanart_urls():
             global _artist_fanart_urls, _artist_fanart_index
