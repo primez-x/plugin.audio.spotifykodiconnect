@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import urllib.parse
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import simplecache
@@ -39,6 +40,7 @@ MUSIC_LIBRARY_ICON = "icon_music_library.png"
 MUSIC_SEARCH_ICON = "icon_music_search.png"
 MUSIC_EXPLORE_ICON = "icon_music_explore.png"
 CLEAR_CACHE_ICON = "icon_clear_cache.png"
+ARTIST_FANART_CACHE_MAX_ITEMS = 500
 
 # Bump this when the cached data structure changes (e.g. new fields pulled
 # from the Spotify API, different track/album/artist dict shapes, serialisation
@@ -1510,25 +1512,26 @@ class PluginContent:
         # We can implement a simple in-memory cache for artist fanart to reduce API calls
         # since this is called frequently
         if not hasattr(self, "_artist_fanart_cache"):
-            self._artist_fanart_cache = {}
+            self._artist_fanart_cache = OrderedDict()
+        elif not isinstance(self._artist_fanart_cache, OrderedDict):
+            self._artist_fanart_cache = OrderedDict(self._artist_fanart_cache)
 
         for artist_id in artist_ids:
             if artist_id in self._artist_fanart_cache:
                 artist_fanart_map[artist_id] = self._artist_fanart_cache[artist_id]
+                self._artist_fanart_cache.move_to_end(artist_id)
             else:
                 missing_artist_ids.append(artist_id)
 
         if missing_artist_ids:
             fetched_map = self.__get_artist_fanart_map(missing_artist_ids)
             artist_fanart_map.update(fetched_map)
-            self._artist_fanart_cache.update(fetched_map)
+            for artist_id, fanart in fetched_map.items():
+                self._artist_fanart_cache[artist_id] = fanart
+                self._artist_fanart_cache.move_to_end(artist_id)
 
-            # Keep cache size reasonable (max 500 artists)
-            if len(self._artist_fanart_cache) > 500:
-                # Remove oldest entries (simple approach: clear half the cache)
-                keys_to_remove = list(self._artist_fanart_cache.keys())[:250]
-                for k in keys_to_remove:
-                    del self._artist_fanart_cache[k]
+            while len(self._artist_fanart_cache) > ARTIST_FANART_CACHE_MAX_ITEMS:
+                self._artist_fanart_cache.popitem(last=False)
 
         for t in new_tracks:
             t["artist_fanart"] = artist_fanart_map.get(t.get("artistid") or "", "")
@@ -1552,7 +1555,7 @@ class PluginContent:
                         # Spotify: images sorted by width descending; [0]=largest
                         result[artist["id"]] = images[0].get("url") or ""
         except Exception as e:
-            log_exception("artist fanart fetch", e)
+            log_exception(e, "artist fanart fetch")
         return result
 
     def __get_playlist_track_context_menu_items(
