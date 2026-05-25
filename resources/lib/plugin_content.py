@@ -359,6 +359,20 @@ class PluginContent:
         meth = getattr(self, action, None)
         return meth if callable(meth) else None
 
+    def __get_saved_track_total(self) -> int:
+        saved_tracks = self.__spotipy.current_user_saved_tracks(
+            limit=1, offset=0, market=self.__user_country
+        )
+        return int(saved_tracks.get("total") or 0)
+
+    def __get_saved_album_total(self) -> int:
+        saved_albums = self.__spotipy.current_user_saved_albums(limit=1, offset=0)
+        return int(saved_albums.get("total") or 0)
+
+    def __get_followed_artist_total(self) -> int:
+        followed_artists = self.__spotipy.current_user_followed_artists(limit=1)
+        return int((followed_artists.get("artists") or {}).get("total") or 0)
+
     def __cache_checksum(self, opt_value: Any = None) -> str:
         """Simple cache checksum based on library counts. Cached after first computation.
 
@@ -368,13 +382,13 @@ class PluginContent:
         """
         result = self.__cached_checksum
         if not result:
-            saved_tracks = self.__get_saved_track_ids()
-            saved_albums = self.__get_saved_album_ids()
-            followed_artists = self.__get_followed_artists()
+            saved_track_total = self.__get_saved_track_total()
+            saved_album_total = self.__get_saved_album_total()
+            followed_artist_total = self.__get_followed_artist_total()
             generic_checksum = self.__addon.getSetting("cache_checksum")
             result = (
                 f"v{CACHE_SCHEMA_VERSION}"
-                f"-{len(saved_tracks)}-{len(saved_albums)}-{len(followed_artists)}"
+                f"-{saved_track_total}-{saved_album_total}-{followed_artist_total}"
                 f"-{generic_checksum}"
             )
             self.__cached_checksum = result
@@ -599,7 +613,6 @@ class PluginContent:
             li.setProperty("Album_Description", album_desc)
         if artist_desc:
             li.setProperty("Artist_Description", artist_desc)
-
 
         li.setArt(
             _art_for_track(
@@ -1486,7 +1499,6 @@ class PluginContent:
 
             if playlist_details:
                 track["playlistid"] = playlist_details["id"]
-
 
             if include_context_items:
                 track["contextitems"] = self.__get_playlist_track_context_menu_items(

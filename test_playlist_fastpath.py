@@ -3,7 +3,6 @@ import sys
 import types
 import unittest
 
-
 REPO_ROOT = os.path.dirname(__file__)
 LIB_DIR = os.path.join(REPO_ROOT, "resources", "lib")
 
@@ -273,6 +272,64 @@ class FailingFanartSpotify(FakeSpotify):
         raise RuntimeError("artist api failed")
 
 
+def spotify_artist(index):
+    return {
+        "id": f"artist-{index}",
+        "name": f"Artist {index}",
+        "images": [],
+        "genres": [],
+        "popularity": 0,
+        "followers": {"total": 0},
+    }
+
+
+class ChecksumSpotify(FakeSpotify):
+    def __init__(self, events, saved_track_total=3, saved_album_total=5, followed_total=7):
+        super().__init__(events, total=1)
+        self.saved_track_total = saved_track_total
+        self.saved_album_total = saved_album_total
+        self.followed_total = followed_total
+        self.saved_track_requests = []
+        self.saved_album_requests = []
+        self.followed_artist_requests = []
+
+    def current_user_saved_tracks(self, limit=50, offset=0, market=None):
+        self.saved_track_calls += 1
+        self.saved_track_requests.append((limit, offset, market))
+        return {
+            "total": self.saved_track_total,
+            "items": [
+                {"track": spotify_track(i)}
+                for i in range(offset, min(offset + limit, self.saved_track_total))
+            ],
+        }
+
+    def current_user_saved_albums(self, limit=50, offset=0):
+        self.saved_album_calls += 1
+        self.saved_album_requests.append((limit, offset))
+        return {
+            "total": self.saved_album_total,
+            "items": [
+                {"album": {"id": f"album-{i}"}}
+                for i in range(offset, min(offset + limit, self.saved_album_total))
+            ],
+        }
+
+    def current_user_followed_artists(self, limit=50, after=None):
+        self.followed_artist_calls += 1
+        self.followed_artist_requests.append((limit, after))
+        start = int(after or 0)
+        end = min(start + limit, self.followed_total)
+        next_after = str(end) if end < self.followed_total else None
+        return {
+            "artists": {
+                "total": self.followed_total,
+                "items": [spotify_artist(i) for i in range(start, end)],
+                "cursors": {"after": next_after},
+            }
+        }
+
+
 class PlaylistFastPathTests(unittest.TestCase):
     def setUp(self):
         self.plugin_content = import_plugin_content()
@@ -323,9 +380,7 @@ class PlaylistFastPathTests(unittest.TestCase):
         content = self.build_content(spotify)
         logged = []
 
-        self.plugin_content.log_exception = lambda exc, details: logged.append(
-            (exc, details)
-        )
+        self.plugin_content.log_exception = lambda exc, details: logged.append((exc, details))
 
         result = content._PluginContent__get_artist_fanart_map(["artist-1"])
 
@@ -358,8 +413,7 @@ class PlaylistFastPathTests(unittest.TestCase):
         spotify = FanartSpotify(events, total=1)
         content = self.build_content(spotify)
         content._artist_fanart_cache = {
-            f"artist-{i}": f"https://images.example/artist-{i}.jpg"
-            for i in range(500)
+            f"artist-{i}": f"https://images.example/artist-{i}.jpg" for i in range(500)
         }
 
         content._PluginContent__prepare_track_listitems(
@@ -375,6 +429,32 @@ class PlaylistFastPathTests(unittest.TestCase):
         self.assertIn("artist-0", content._artist_fanart_cache)
         self.assertIn("artist-500", content._artist_fanart_cache)
         self.assertNotIn("artist-1", content._artist_fanart_cache)
+
+    def test_cache_checksum_uses_lightweight_total_requests(self):
+        events = RecordingPlayer.events
+        spotify = ChecksumSpotify(events)
+        content = self.build_content(spotify)
+
+        checksum = content._PluginContent__cache_checksum()
+
+        self.assertEqual("v2-3-5-7-", checksum)
+        self.assertEqual([(1, 0, "US")], spotify.saved_track_requests)
+        self.assertEqual([(1, 0)], spotify.saved_album_requests)
+        self.assertEqual([(1, None)], spotify.followed_artist_requests)
+
+    def test_cache_checksum_reuses_base_for_optional_values(self):
+        events = RecordingPlayer.events
+        spotify = ChecksumSpotify(events)
+        content = self.build_content(spotify)
+
+        first = content._PluginContent__cache_checksum("playlist-snapshot")
+        second = content._PluginContent__cache_checksum("artist-albums")
+
+        self.assertEqual("v2-3-5-7--playlist-snapshot", first)
+        self.assertEqual("v2-3-5-7--artist-albums", second)
+        self.assertEqual(1, spotify.saved_track_calls)
+        self.assertEqual(1, spotify.saved_album_calls)
+        self.assertEqual(1, spotify.followed_artist_calls)
 
 
 if __name__ == "__main__":
