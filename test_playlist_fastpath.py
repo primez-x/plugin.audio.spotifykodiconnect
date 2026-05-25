@@ -253,6 +253,26 @@ class FakeSpotify:
         return {"artists": [{"id": artist_id, "images": []} for artist_id in artist_ids]}
 
 
+class FanartSpotify(FakeSpotify):
+    def artists(self, artist_ids):
+        self.artist_calls += 1
+        return {
+            "artists": [
+                {
+                    "id": artist_id,
+                    "images": [{"url": f"https://images.example/{artist_id}.jpg"}],
+                }
+                for artist_id in artist_ids
+            ]
+        }
+
+
+class FailingFanartSpotify(FakeSpotify):
+    def artists(self, artist_ids):
+        self.artist_calls += 1
+        raise RuntimeError("artist api failed")
+
+
 class PlaylistFastPathTests(unittest.TestCase):
     def setUp(self):
         self.plugin_content = import_plugin_content()
@@ -296,6 +316,65 @@ class PlaylistFastPathTests(unittest.TestCase):
         self.assertEqual(0, spotify.saved_album_calls)
         self.assertEqual(0, spotify.followed_artist_calls)
         self.assertEqual(0, spotify.artist_calls)
+
+    def test_artist_fanart_fetch_logs_exception_with_exception_first(self):
+        events = RecordingPlayer.events
+        spotify = FailingFanartSpotify(events, total=1)
+        content = self.build_content(spotify)
+        logged = []
+
+        self.plugin_content.log_exception = lambda exc, details: logged.append(
+            (exc, details)
+        )
+
+        result = content._PluginContent__get_artist_fanart_map(["artist-1"])
+
+        self.assertEqual({}, result)
+        self.assertEqual(1, len(logged))
+        self.assertIsInstance(logged[0][0], RuntimeError)
+        self.assertEqual("artist fanart fetch", logged[0][1])
+
+    def test_artist_fanart_cache_hit_avoids_duplicate_artist_lookup(self):
+        events = RecordingPlayer.events
+        spotify = FanartSpotify(events, total=1)
+        content = self.build_content(spotify)
+        track = spotify_track(1)
+
+        first = content._PluginContent__prepare_track_listitems(
+            tracks=[track],
+            include_context_items=False,
+        )
+        second = content._PluginContent__prepare_track_listitems(
+            tracks=[spotify_track(1)],
+            include_context_items=False,
+        )
+
+        self.assertEqual("https://images.example/artist-1.jpg", first[0]["artist_fanart"])
+        self.assertEqual("https://images.example/artist-1.jpg", second[0]["artist_fanart"])
+        self.assertEqual(1, spotify.artist_calls)
+
+    def test_artist_fanart_cache_evicts_least_recently_used_entries(self):
+        events = RecordingPlayer.events
+        spotify = FanartSpotify(events, total=1)
+        content = self.build_content(spotify)
+        content._artist_fanart_cache = {
+            f"artist-{i}": f"https://images.example/artist-{i}.jpg"
+            for i in range(500)
+        }
+
+        content._PluginContent__prepare_track_listitems(
+            tracks=[spotify_track(0)],
+            include_context_items=False,
+        )
+        content._PluginContent__prepare_track_listitems(
+            tracks=[spotify_track(500)],
+            include_context_items=False,
+        )
+
+        self.assertLessEqual(len(content._artist_fanart_cache), 500)
+        self.assertIn("artist-0", content._artist_fanart_cache)
+        self.assertIn("artist-500", content._artist_fanart_cache)
+        self.assertNotIn("artist-1", content._artist_fanart_cache)
 
 
 if __name__ == "__main__":
