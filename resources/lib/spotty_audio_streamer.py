@@ -19,11 +19,17 @@ _VALID_BITRATES = ("96", "160", "320")
 _VALID_GAIN_TYPES = ("auto", "track", "album")
 _DEFAULT_GAIN_TYPE = "track"
 
+_PCM_BYTES_PER_SEC = 176400  # 44.1 kHz * 2 ch * 2 bytes/sample
+_WAV_HEADER_SIZE = 44
+_INITIAL_HEADER_WAIT_SECONDS = 0.2
+_INITIAL_PCM_PREROLL_BYTES = 32768
+_INITIAL_BUFFER_POLL_BYTES = 8192
+
 # Maximum bytes of PCM silence to pad at the end of a stream when spotty exits
 # cleanly but short of the WAV-declared length. 10 seconds @ 176400 B/s = 1,764,000.
 # Duration mismatches between the declared track length and spotty's actual output
 # are typically < 10 s; larger gaps indicate a real error and should not be masked.
-_SILENCE_PADDING_MAX_BYTES = 176400 * 10
+_SILENCE_PADDING_MAX_BYTES = _PCM_BYTES_PER_SEC * 10
 
 
 def _clamp_volume(value: int) -> int:
@@ -35,19 +41,23 @@ def _clamp_volume(value: int) -> int:
         return 35
 
 
-
 def _get_kodi_chunk_size() -> int:
     """Dynamically get the user's chunk size setting from Kodi (cache.chunksize).
     Defaults to 1MB if not found.
     """
     try:
         import xbmc
-        raw = xbmc.executeJSONRPC(json.dumps({
-            "jsonrpc": "2.0",
-            "method": "Settings.GetSettingValue",
-            "params": {"setting": "cache.chunksize"},
-            "id": 1
-        }))
+
+        raw = xbmc.executeJSONRPC(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "Settings.GetSettingValue",
+                    "params": {"setting": "cache.chunksize"},
+                    "id": 1,
+                }
+            )
+        )
         res = json.loads(raw)
         val = int(res.get("result", {}).get("value", 0))
         if val > 0:
@@ -55,6 +65,7 @@ def _get_kodi_chunk_size() -> int:
     except Exception:
         pass
     return 1048576  # Default fallback
+
 
 class SpottyAudioStreamer:
     """
@@ -97,17 +108,24 @@ class SpottyAudioStreamer:
         self.__track_id = track_id
         try:
             if track_duration <= 0:
-                log_msg(f"Warning: Invalid track duration {track_duration} for track {track_id}. Using 1s fallback.", LOGWARNING)
+                log_msg(
+                    f"Warning: Invalid track duration {track_duration} for track {track_id}. Using 1s fallback.",
+                    LOGWARNING,
+                )
                 self.__track_duration = 1
             else:
                 self.__track_duration = int(track_duration)
         except (TypeError, ValueError):
-            log_msg(f"Warning: Could not parse track duration {track_duration} for track {track_id}. Using 1s fallback.", LOGWARNING)
+            log_msg(
+                f"Warning: Could not parse track duration {track_duration} for track {track_id}. Using 1s fallback.",
+                LOGWARNING,
+            )
             self.__track_duration = 1
 
         # Always create WAV header for PCM streaming.
-        self.__wav_header, self.__track_length = create_wav_header_for_duration(self.__track_duration)
-
+        self.__wav_header, self.__track_length = create_wav_header_for_duration(
+            self.__track_duration
+        )
 
     def set_notify_track_finished(self, func: Callable[[str], None]) -> None:
         """Set callback invoked when the full track has been sent (not on every range chunk)."""
@@ -154,35 +172,61 @@ class SpottyAudioStreamer:
         # Since librespot downloads fast, we only jump if the user seeks far ahead of current progress.
         if not downloader:
             downloader = SpottyCacheManager.get_or_start(
-                self.__spotty, track_id, track_duration, range_begin,
-                self.bitrate, self.normalization_gain_type, self.initial_volume,
-                wav_header, track_length
+                self.__spotty,
+                track_id,
+                track_duration,
+                range_begin,
+                self.bitrate,
+                self.normalization_gain_type,
+                self.initial_volume,
+                wav_header,
+                track_length,
             )
-        elif range_begin > downloader.start_byte + downloader.written_bytes + 2097152 and not downloader.is_finished:
+        elif (
+            range_begin > downloader.start_byte + downloader.written_bytes + 2097152
+            and not downloader.is_finished
+        ):
             downloader = SpottyCacheManager.get_or_start(
-                self.__spotty, track_id, track_duration, range_begin,
-                self.bitrate, self.normalization_gain_type, self.initial_volume,
-                wav_header, track_length
+                self.__spotty,
+                track_id,
+                track_duration,
+                range_begin,
+                self.bitrate,
+                self.normalization_gain_type,
+                self.initial_volume,
+                wav_header,
+                track_length,
             )
 
-        # Wait for a minimum initial buffer before yielding to prevent codec init failures.
-        # PAPlayer's QueueNextFileEx opens the URL while the current track is playing;
-        # if only the 44-byte WAV header is available, the codec reports
-        # "CAudioDecoder: Unable to Init Codec" and skips to the next track, cascading.
-        # This guard holds until 256 KB are buffered (typically < 1 s) or the download
-        # finishes/errors — whichever comes first.  Seeks (range_begin > 0) are exempt
-        # because the user expects an immediate response.
+        # PAPlayer gives HTTP-backed WAV streams a very small startup window.
+        # Waiting for a large preroll before yielding anything makes Kodi abandon
+        # the file and skip to the next playlist item.
+        # Let the WAV header go promptly so the decoder can initialize, while
+        # still giving fast Spotty starts a small PCM preroll.
+        # Seeks (range_begin > 0) must stay immediate.
         if range_begin == 0:
-            _min_bytes = 262144  # 256 KB
-            _deadline = time.time() + 5.0
+            initial_target = min(
+                track_length,
+                len(wav_header) + _INITIAL_PCM_PREROLL_BYTES,
+            )
+            deadline = time.monotonic() + _INITIAL_HEADER_WAIT_SECONDS
             while (
                 not self.__terminated
                 and not downloader.is_finished
                 and not downloader.error
-                and downloader.written_bytes < _min_bytes
-                and time.time() < _deadline
+                and downloader.written_bytes < initial_target
+                and time.monotonic() < deadline
             ):
-                downloader.wait_for_bytes(downloader.written_bytes + 65536, timeout=0.25)
+                next_target = min(
+                    initial_target,
+                    max(
+                        downloader.written_bytes + _INITIAL_BUFFER_POLL_BYTES,
+                        len(wav_header) + 1,
+                    ),
+                )
+                downloader.wait_for_bytes(
+                    next_target, timeout=max(0.01, deadline - time.monotonic())
+                )
 
         # Rate-throttle: keep the HTTP connection alive for the full track duration so
         # Kodi's QueueNextFileEx fires while our connection is still active.
@@ -223,7 +267,7 @@ class SpottyAudioStreamer:
                     if available > 0:
                         to_read = min(self.chunk_size, available, range_len - bytes_sent)
                         read_start = buf_offset + bytes_sent
-                        chunk = bytes(downloader._buffer[read_start: read_start + to_read])
+                        chunk = bytes(downloader._buffer[read_start : read_start + to_read])
 
                 if chunk:
                     yield chunk
@@ -299,4 +343,3 @@ def create_wav_header_for_duration(duration_sec: float) -> Tuple[bytes, int]:
     except Exception as exc:
         log_exception(exc, "Failed to create wave header (static).")
         raise
-
