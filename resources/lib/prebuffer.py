@@ -6,6 +6,7 @@ the first chunk is already available and playback starts without delay.
 With the local disk cache implementation, prebuffering simply means triggering
 the background Spotty downloader for the next track ahead of time.
 """
+
 from __future__ import absolute_import, unicode_literals
 
 import threading
@@ -14,7 +15,7 @@ from typing import Optional, Tuple
 
 from spotty import Spotty
 from spotty_cache import SpottyCacheManager
-from spotty_audio_streamer import create_wav_header_for_duration
+from spotty_audio_streamer import STARTUP_SILENCE_BYTES, create_wav_header_for_duration
 from utils import log_msg
 from xbmc import LOGDEBUG
 
@@ -22,6 +23,7 @@ from xbmc import LOGDEBUG
 @dataclass
 class PrebufferResult:
     """Result from get_and_clear_prebuffer(). Contains WAV PCM bytes."""
+
     data: Optional[bytes] = None
 
 
@@ -52,7 +54,7 @@ class PrebufferManager:
         norm = (normalization_gain_type or self.__normalization_gain_type).strip().lower() or "auto"
         if norm not in ("off", "auto", "track", "album"):
             norm = "auto"
-        
+
         with self.__lock:
             if self.__prebuffer_track_id == track_id:
                 return
@@ -60,9 +62,18 @@ class PrebufferManager:
 
         log_msg(f"Triggering prebuffer background download for {track_id}", LOGDEBUG)
         wav_header, track_length = create_wav_header_for_duration(duration_sec)
-        
+
         SpottyCacheManager.get_or_start(
-            self.__spotty, track_id, duration_sec, 0, br, norm, 35, wav_header, track_length
+            self.__spotty,
+            track_id,
+            duration_sec,
+            0,
+            br,
+            norm,
+            35,
+            wav_header,
+            track_length,
+            STARTUP_SILENCE_BYTES,
         )
 
     def get_and_clear_prebuffer(self, track_id: str) -> Tuple[Optional[PrebufferResult], bool]:

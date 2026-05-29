@@ -21,9 +21,7 @@ _DEFAULT_GAIN_TYPE = "track"
 
 _PCM_BYTES_PER_SEC = 176400  # 44.1 kHz * 2 ch * 2 bytes/sample
 _WAV_HEADER_SIZE = 44
-_INITIAL_HEADER_WAIT_SECONDS = 0.2
-_INITIAL_PCM_PREROLL_BYTES = 32768
-_INITIAL_BUFFER_POLL_BYTES = 8192
+STARTUP_SILENCE_BYTES = 65536
 
 # Maximum bytes of PCM silence to pad at the end of a stream when spotty exits
 # cleanly but short of the WAV-declared length. 10 seconds @ 176400 B/s = 1,764,000.
@@ -122,7 +120,8 @@ class SpottyAudioStreamer:
             )
             self.__track_duration = 1
 
-        # Always create WAV header for PCM streaming.
+        # Include a short silent PCM preroll in the declared length so PAPlayer
+        # can initialize before Spotty has produced real PCM on cold starts.
         self.__wav_header, self.__track_length = create_wav_header_for_duration(
             self.__track_duration
         )
@@ -181,6 +180,7 @@ class SpottyAudioStreamer:
                 self.initial_volume,
                 wav_header,
                 track_length,
+                STARTUP_SILENCE_BYTES,
             )
         elif (
             range_begin > downloader.start_byte + downloader.written_bytes + 2097152
@@ -196,37 +196,8 @@ class SpottyAudioStreamer:
                 self.initial_volume,
                 wav_header,
                 track_length,
+                STARTUP_SILENCE_BYTES,
             )
-
-        # PAPlayer gives HTTP-backed WAV streams a very small startup window.
-        # Waiting for a large preroll before yielding anything makes Kodi abandon
-        # the file and skip to the next playlist item.
-        # Let the WAV header go promptly so the decoder can initialize, while
-        # still giving fast Spotty starts a small PCM preroll.
-        # Seeks (range_begin > 0) must stay immediate.
-        if range_begin == 0:
-            initial_target = min(
-                track_length,
-                len(wav_header) + _INITIAL_PCM_PREROLL_BYTES,
-            )
-            deadline = time.monotonic() + _INITIAL_HEADER_WAIT_SECONDS
-            while (
-                not self.__terminated
-                and not downloader.is_finished
-                and not downloader.error
-                and downloader.written_bytes < initial_target
-                and time.monotonic() < deadline
-            ):
-                next_target = min(
-                    initial_target,
-                    max(
-                        downloader.written_bytes + _INITIAL_BUFFER_POLL_BYTES,
-                        len(wav_header) + 1,
-                    ),
-                )
-                downloader.wait_for_bytes(
-                    next_target, timeout=max(0.01, deadline - time.monotonic())
-                )
 
         # Rate-throttle: keep the HTTP connection alive for the full track duration so
         # Kodi's QueueNextFileEx fires while our connection is still active.
@@ -299,14 +270,19 @@ class SpottyAudioStreamer:
             self.__terminated = False
 
 
-def create_wav_header_for_duration(duration_sec: float) -> Tuple[bytes, int]:
+def create_wav_header_for_duration(
+    duration_sec: float, startup_silence_bytes: int = STARTUP_SILENCE_BYTES
+) -> Tuple[bytes, int]:
     """Create a WAV header and total stream length for a given duration (no side effects)."""
     try:
         file = BytesIO()
-        num_samples = 44100 * int(max(1, duration_sec))
+        num_samples = int(44100 * max(1.0, float(duration_sec)))
         channels = 2
         sample_rate = 44100
         bits_per_sample = 16
+        block_align = channels * (bits_per_sample // 8)
+        preroll_size = max(0, int(startup_silence_bytes))
+        preroll_size -= preroll_size % block_align
 
         # Generate format chunk.
         format_chunk_spec = "<4sLHHLLHH"
@@ -317,14 +293,14 @@ def create_wav_header_for_duration(duration_sec: float) -> Tuple[bytes, int]:
             1,
             channels,
             sample_rate,
-            sample_rate * channels * (bits_per_sample // 8),
-            channels * (bits_per_sample // 8),
+            sample_rate * block_align,
+            block_align,
             bits_per_sample,
         )
 
         # Generate data chunk.
         data_chunk_spec = "<4sL"
-        data_size = int(num_samples * channels * (bits_per_sample // 8))
+        data_size = int(num_samples * block_align) + preroll_size
         data_chunk = struct.pack(data_chunk_spec, b"data", data_size)
 
         # Standard WAV: RIFF size = 36 + data_size

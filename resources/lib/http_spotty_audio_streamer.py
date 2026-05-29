@@ -14,9 +14,8 @@ import xbmc
 import xbmcaddon
 import xbmcgui
 from spotty import Spotty
-from spotty_audio_streamer import SpottyAudioStreamer
+from spotty_audio_streamer import SpottyAudioStreamer, create_wav_header_for_duration
 from utils import ADDON_ID, ADDON_WINDOW_ID, LOGDEBUG, get_cached_auth_token, log_msg
-
 
 _settings_cache = {
     "bitrate": "320",
@@ -91,9 +90,7 @@ class HTTPSpottyAudioStreamer:
         self.__init_event.set()
 
     def set_normalization_gain_type(self, value: str) -> None:
-        self.__spotty_streamer.normalization_gain_type = (
-            value or "auto"
-        ).strip().lower() or "auto"
+        self.__spotty_streamer.normalization_gain_type = (value or "auto").strip().lower() or "auto"
 
     def set_notify_track_finished(self, func: Callable[[str], None]) -> None:
         self.__notify_track_finished = func or (lambda _id: None)
@@ -147,9 +144,7 @@ class HTTPSpottyAudioStreamer:
 
     SPOTTY_AUDIO_TRACK_ROUTE = "/track/<track_id>/<duration>"
 
-    def spotty_stream_audio_track(
-        self, track_id: str, duration: str
-    ) -> bottle.Response:
+    def spotty_stream_audio_track(self, track_id: str, duration: str) -> bottle.Response:
         # Strip optional .wav suffix — URLs include it so Kodi selects PAPlayer
         # directly instead of trying VideoPlayer first (demuxer error + retry).
         if duration.endswith(".wav"):
@@ -222,9 +217,7 @@ class HTTPSpottyAudioStreamer:
         prebuf_result = None
         has_prebuf = False
         if is_new_track and self.__prebuffer_manager:
-            prebuf_result, has_prebuf = (
-                self.__prebuffer_manager.get_and_clear_prebuffer(track_id)
-            )
+            prebuf_result, has_prebuf = self.__prebuffer_manager.get_and_clear_prebuffer(track_id)
             if has_prebuf:
                 kind = f"{len(prebuf_result.data)} bytes"
                 log_msg(f"Prebuffer hit for track {track_id} ({kind}).", LOGDEBUG)
@@ -249,6 +242,7 @@ class HTTPSpottyAudioStreamer:
             _skip_terminate = False
             if _previous_track_id and _previous_track_id != track_id:
                 from spotty_cache import SpottyCacheManager
+
                 _cur_dl = SpottyCacheManager.find_best_downloader(_previous_track_id, 0)
                 if _cur_dl and _cur_dl.is_finished and not _cur_dl.error:
                     _skip_terminate = True
@@ -313,8 +307,7 @@ class HTTPSpottyAudioStreamer:
         # Always derive size from the URL's duration — the current streamer may have a
         # different track loaded, which would return the wrong Content-Length for queued
         # (non-current) tracks and confuse Kodi's prefetch queue.
-        pcm_bps = 44100 * 2 * 2  # 176400 bytes/sec at 44.1 kHz 16-bit stereo
-        file_size = int(dur * pcm_bps) + 44  # +44 for WAV header
+        _, file_size = create_wav_header_for_duration(dur)
 
         bottle.response.status = 200
         bottle.response.content_type = "audio/x-wav"
@@ -362,8 +355,6 @@ class HTTPSpottyAudioStreamer:
             # Compute WAV header length without mutating shared streamer state to
             # ensure HEAD/early requests can return accurate Content-Length.
             try:
-                from spotty_audio_streamer import create_wav_header_for_duration
-
                 _, total_length = create_wav_header_for_duration(_duration_sec)
                 file_size = total_length
                 range_end = file_size
@@ -389,18 +380,11 @@ class HTTPSpottyAudioStreamer:
         if not request_range or (request_range == "bytes=0-"):
             status = 200
             content_range = ""
-            log_msg(
-                f"Full request, content length = {range_end - range_begin}.", LOGDEBUG
-            )
+            log_msg(f"Full request, content length = {range_end - range_begin}.", LOGDEBUG)
         else:
             status = "206 Partial Content"
             try:
-                parts = (
-                    bottle.request.headers["Range"]
-                    .strip()
-                    .split("bytes=", 1)[1]
-                    .split("-", 1)
-                )
+                parts = bottle.request.headers["Range"].strip().split("bytes=", 1)[1].split("-", 1)
                 start_s = parts[0].strip() if parts else ""
                 end_s = parts[1].strip() if len(parts) > 1 else ""
                 if not start_s and end_s.isdigit():
@@ -436,14 +420,16 @@ class HTTPSpottyAudioStreamer:
                     LOGDEBUG,
                 )
             log_msg(
-                f"Partial request, range = {content_range},"
-                f" length = {range_end - range_begin}",
+                f"Partial request, range = {content_range}," f" length = {range_end - range_begin}",
                 LOGDEBUG,
             )
 
         # Check if this request is stale BEFORE returning generator (before HTTP headers commit)
         if request_id and request_id != self.__current_request_id:
-            log_msg(f"WAV request {request_id} is stale (current: {self.__current_request_id}), returning empty.", LOGDEBUG)
+            log_msg(
+                f"WAV request {request_id} is stale (current: {self.__current_request_id}), returning empty.",
+                LOGDEBUG,
+            )
             bottle.response.status = 204  # No Content
             return ""
 
@@ -452,7 +438,10 @@ class HTTPSpottyAudioStreamer:
             with self.__stream_lock:
                 # Only proceed if this is still the active request
                 if request_id and request_id != self.__current_request_id:
-                    log_msg(f"Generator for request {request_id} is stale (current: {self.__current_request_id}), aborting.", LOGDEBUG)
+                    log_msg(
+                        f"Generator for request {request_id} is stale (current: {self.__current_request_id}), aborting.",
+                        LOGDEBUG,
+                    )
                     return
 
             try:
@@ -484,13 +473,9 @@ class HTTPSpottyAudioStreamer:
                     if r_end > prebuffer_len:
                         rest_begin = max(r_begin, prebuffer_len)
                         rest_len = r_end - rest_begin
-                        yield from streamer.send_part_audio_stream(
-                            rest_len, rest_begin
-                        )
+                        yield from streamer.send_part_audio_stream(rest_len, rest_begin)
                 else:
-                    yield from streamer.send_part_audio_stream(
-                        r_len, r_begin
-                    )
+                    yield from streamer.send_part_audio_stream(r_len, r_begin)
             except GeneratorExit:
                 # Back can mean "close OSD" (playback continues) or "cancel". Do NOT clear
                 # state here—we only clear when the track truly ends (__notify_track_finished).
