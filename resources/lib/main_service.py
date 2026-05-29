@@ -44,6 +44,16 @@ SPOTIFY_TRACK_HOOK_KEYS = (
     "File",
     "Available",
 )
+SPOTIFY_PLAYER_METADATA_POLL_MS = 100
+SPOTIFY_PLAYER_METADATA_ATTEMPTS = 30
+SPOTIFY_TRACK_PROPERTY_LABELS = (
+    "MusicPlayer.Property(spotifytrackid)",
+    "MusicPlayer.(1).Property(spotifytrackid)",
+)
+PLAYER_FILE_LABELS = (
+    "Player.FileNameAndPath",
+    "MusicPlayer.FileNameAndPath",
+)
 
 # Artist fanart for Music OSD (single largest image URL; no rotation – Spotify only provides same image in multiple sizes)
 _artist_fanart_urls = []  # type: list
@@ -183,6 +193,27 @@ def _clear_playback_hooks() -> None:
     _clear_track_hook(win, "NextTrack")
 
 
+def _read_active_spotify_player_state(win) -> tuple[bool, str, bool]:
+    for label in SPOTIFY_TRACK_PROPERTY_LABELS:
+        track_id = (xbmc.getInfoLabel(label) or "").strip()
+        if track_id:
+            return True, track_id, True
+
+    has_player_file = False
+    for label in PLAYER_FILE_LABELS:
+        file_path = (xbmc.getInfoLabel(label) or "").strip()
+        if not file_path:
+            continue
+        has_player_file = True
+        track_id, _duration = parse_track_url(file_path)
+        if track_id:
+            return True, track_id, True
+        if ADDON_ID in file_path:
+            return True, win.getProperty("Spotify.CurrentTrackId"), True
+
+    return False, "", has_player_file
+
+
 def _refresh_playback_hooks(current_track_id: str, delay_ms: int = 0) -> None:
     def _run():
         if delay_ms:
@@ -243,11 +274,29 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
 
     def onPlayBackStarted(self) -> None:
         # If a non-Spotify item starts playing, clear the Spotify OSD state.
-        # Give Kodi a moment to populate MusicPlayer properties.
+        # PAPlayer can fire before MusicPlayer properties settle, so wait until
+        # Kodi exposes either a Spotify marker or a concrete non-Spotify file.
         def _check():
-            xbmc.sleep(500)
-            track_id = xbmc.getInfoLabel("MusicPlayer.Property(spotifytrackid)")
-            if not track_id:
+            win = xbmcgui.Window(ADDON_WINDOW_ID)
+            for _attempt in range(SPOTIFY_PLAYER_METADATA_ATTEMPTS):
+                is_spotify, track_id, has_player_file = _read_active_spotify_player_state(
+                    win
+                )
+                if is_spotify:
+                    if track_id:
+                        win.setProperty("Spotify.CurrentTrackId", track_id)
+                    return
+                if has_player_file:
+                    self._clear()
+                    return
+                xbmc.sleep(SPOTIFY_PLAYER_METADATA_POLL_MS)
+
+            if win.getProperty("Spotify.CurrentTrackId"):
+                log_msg(
+                    "Keeping Spotify OSD state; player metadata did not settle.",
+                    LOGDEBUG,
+                )
+            else:
                 self._clear()
 
         threading.Thread(target=_check, daemon=True).start()
