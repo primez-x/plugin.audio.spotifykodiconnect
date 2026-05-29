@@ -39,9 +39,10 @@ def import_streamer():
 
 
 class FakeDownloader:
-    def __init__(self, wav_header):
+    def __init__(self, wav_header, initial_pcm=b""):
         self.start_byte = 0
         self._buffer = bytearray(wav_header)
+        self._buffer.extend(initial_pcm)
         self.written_bytes = len(self._buffer)
         self.is_finished = False
         self.error = False
@@ -76,6 +77,7 @@ class FakeSpottyCacheManager:
         volume,
         wav_header,
         track_length,
+        startup_silence_bytes=0,
     ):
         return cls.downloader
 
@@ -97,11 +99,20 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         ):
             sys.modules.pop(module_name, None)
 
-    def test_from_start_request_waits_only_for_small_preroll(self):
+    def test_wav_header_declares_startup_silence(self):
+        wav_header, total_length = self.module.create_wav_header_for_duration(180)
+
+        self.assertEqual(44, len(wav_header))
+        self.assertEqual(
+            44 + 180 * self.module._PCM_BYTES_PER_SEC + self.module.STARTUP_SILENCE_BYTES,
+            total_length,
+        )
+
+    def test_from_start_request_has_immediate_silent_preroll(self):
         streamer = self.module.SpottyAudioStreamer(object())
         streamer.set_track("track-1", 180)
         wav_header, _ = self.module.create_wav_header_for_duration(180)
-        downloader = FakeDownloader(wav_header)
+        downloader = FakeDownloader(wav_header, bytes(self.module.STARTUP_SILENCE_BYTES))
         FakeSpottyCacheManager.downloader = downloader
 
         generator = streamer.send_part_audio_stream(65536, 0)
@@ -111,10 +122,60 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             generator.close()
 
         self.assertGreaterEqual(len(first_chunk), len(wav_header))
-        self.assertLessEqual(
-            max(downloader.wait_targets),
-            len(wav_header) + self.module._INITIAL_PCM_PREROLL_BYTES,
+        self.assertEqual([1], downloader.wait_targets)
+
+    def test_downloader_seeds_silence_and_maps_seek_offset_to_real_pcm(self):
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+
+        wav_header, track_length = self.module.create_wav_header_for_duration(180)
+        downloader = spotty_cache.SpottyDownloader(
+            spotty=object(),
+            track_id="track-1",
+            duration_sec=180,
+            start_byte=0,
+            bitrate="320",
+            normalization="auto",
+            volume=35,
+            wav_header=wav_header,
+            track_length=track_length,
+            startup_silence_bytes=self.module.STARTUP_SILENCE_BYTES,
         )
+        downloader._download_loop = lambda: None
+
+        downloader.start()
+
+        self.assertEqual(
+            len(wav_header) + self.module.STARTUP_SILENCE_BYTES,
+            downloader.written_bytes,
+        )
+        self.assertEqual(wav_header, bytes(downloader._buffer[: len(wav_header)]))
+        self.assertEqual(
+            bytes(self.module.STARTUP_SILENCE_BYTES),
+            bytes(downloader._buffer[len(wav_header) :]),
+        )
+
+        seek_downloader = spotty_cache.SpottyDownloader(
+            spotty=object(),
+            track_id="track-1",
+            duration_sec=180,
+            start_byte=len(wav_header)
+            + self.module.STARTUP_SILENCE_BYTES
+            + self.module._PCM_BYTES_PER_SEC
+            + 123,
+            bitrate="320",
+            normalization="off",
+            volume=35,
+            wav_header=wav_header,
+            track_length=track_length,
+            startup_silence_bytes=self.module.STARTUP_SILENCE_BYTES,
+        )
+
+        args, pcm_skip = seek_downloader._build_args()
+
+        self.assertIn("--start-position", args)
+        self.assertEqual("1", args[args.index("--start-position") + 1])
+        self.assertEqual(123, pcm_skip)
 
 
 if __name__ == "__main__":

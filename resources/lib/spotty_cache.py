@@ -5,6 +5,8 @@ from spotty import Spotty
 from utils import log_exception, log_msg
 from xbmc import LOGDEBUG, LOGERROR, LOGWARNING
 
+PCM_BYTES_PER_SEC = 176400
+
 
 def _clamp_volume(value: int) -> int:
     try:
@@ -28,6 +30,7 @@ class SpottyDownloader:
         volume: int,
         wav_header: bytes,
         track_length: int,
+        startup_silence_bytes: int = 0,
     ):
         self.spotty = spotty
         self.track_id = track_id
@@ -38,6 +41,8 @@ class SpottyDownloader:
         self.volume = _clamp_volume(volume)
         self.wav_header = wav_header
         self.track_length = track_length
+        self.startup_silence_bytes = max(0, int(startup_silence_bytes))
+        self.startup_silence_bytes -= self.startup_silence_bytes % 4
 
         self._buffer = bytearray()
 
@@ -56,12 +61,20 @@ class SpottyDownloader:
                 return
 
             header_len = len(self.wav_header)
+            prefix_end = header_len + self.startup_silence_bytes
             if self.start_byte == 0:
                 self._buffer.extend(self.wav_header)
-                self.written_bytes = header_len
+                if self.startup_silence_bytes:
+                    self._buffer.extend(bytes(self.startup_silence_bytes))
+                self.written_bytes = prefix_end
             elif self.start_byte < header_len:
                 self._buffer.extend(self.wav_header[self.start_byte :])
-                self.written_bytes = header_len - self.start_byte
+                if self.startup_silence_bytes:
+                    self._buffer.extend(bytes(self.startup_silence_bytes))
+                self.written_bytes = prefix_end - self.start_byte
+            elif self.start_byte < prefix_end:
+                self._buffer.extend(bytes(prefix_end - self.start_byte))
+                self.written_bytes = prefix_end - self.start_byte
 
             self.thread = threading.Thread(target=self._download_loop, daemon=True)
             self.thread.start()
@@ -69,8 +82,8 @@ class SpottyDownloader:
     def _build_args(self):
         # Calculate start position in seconds. 176400 bytes per second (44.1kHz, 16-bit, stereo)
         header_len = len(self.wav_header)
-        pcm_target_offset = max(0, self.start_byte - header_len)
-        start_sec_wav = (pcm_target_offset // 176400) if pcm_target_offset > 0 else 0
+        pcm_target_offset = max(0, self.start_byte - header_len - self.startup_silence_bytes)
+        start_sec_wav = pcm_target_offset // PCM_BYTES_PER_SEC if pcm_target_offset > 0 else 0
 
         args = [
             "--disable-audio-cache",
@@ -89,7 +102,7 @@ class SpottyDownloader:
         args += ["--single-track", f"spotify:track:{self.track_id}"]
         if start_sec_wav > 0:
             args += ["--start-position", str(start_sec_wav)]
-        return args, (pcm_target_offset % 176400)
+        return args, (pcm_target_offset % PCM_BYTES_PER_SEC)
 
     # Session-conflict retry: when spotty exits cleanly (rc=0) but produces
     # 0 PCM bytes, Spotify's backend hasn't released the previous session yet.
@@ -100,9 +113,7 @@ class SpottyDownloader:
     _RETRY_DELAYS = [1.0, 3.0, 5.0]
 
     def _download_loop(self):
-        log_msg(
-            f"Starting background download for {self.track_id} at {self.start_byte}"
-        )
+        log_msg(f"Starting background download for {self.track_id} at {self.start_byte}")
 
         for attempt in range(self._MAX_SESSION_RETRIES + 1):
             if self.aborted:
@@ -191,13 +202,9 @@ class SpottyDownloader:
                         )
                         self.error = True
                     elif rc == 0:
-                        remaining = (
-                            self.track_length - self.start_byte
-                        ) - self.written_bytes
-                        if 0 < remaining <= 176400 * 10:  # 10 secs max padding
-                            log_msg(
-                                f"Padding {remaining} bytes to end of {self.track_id}"
-                            )
+                        remaining = (self.track_length - self.start_byte) - self.written_bytes
+                        if 0 < remaining <= PCM_BYTES_PER_SEC * 10:
+                            log_msg(f"Padding {remaining} bytes to end of {self.track_id}")
                             self._buffer.extend(bytes(remaining))
                             self.written_bytes += remaining
                     else:
@@ -265,6 +272,7 @@ class SpottyCacheManager:
         volume: int,
         wav_header: bytes,
         track_length: int,
+        startup_silence_bytes: int = 0,
     ) -> SpottyDownloader:
         with cls._lock:
             if track_id in cls._recent_tracks:
@@ -290,6 +298,7 @@ class SpottyCacheManager:
                 volume,
                 wav_header,
                 track_length,
+                startup_silence_bytes,
             )
             cls._instances[key] = inst
 
