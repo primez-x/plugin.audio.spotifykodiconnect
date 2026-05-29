@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<addon id="plugin.audio.spotifykodiconnect" version="1.0.0" name="SpotifyKodiConnect" provider-name="SpotifyKodiConnect">
+<addon id="plugin.audio.spotifykodiconnect" version="1.0.1" name="SpotifyKodiConnect" provider-name="primez-x">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
         <import addon="xbmc.addon" version="18.9.701" />
@@ -18,8 +18,11 @@
         <summary lang="en_GB">Spotify for Kodi with consistent art, metadata, and background loading (Kodi Connect style)</summary>
         <description lang="en_GB">Unofficial Spotify music plugin for Kodi. Improves on the original Spotify addon with consistent album/artist art in all views (including playlists), correct metadata tags, and background loading so navigation and playback feel smooth. Requires Spotify Premium.</description>
         <disclaimer lang="en_GB">This product uses the SPOTIFY WEB API but is not endorsed, certified or otherwise approved in any way by Spotify. Spotify is the registered trademark of Spotify AB.</disclaimer>
-        <source>https://github.com/</source>
-        <news>v1.0.0
+        <source>https://github.com/primez-x/plugin.audio.spotifykodiconnect</source>
+        <news>v1.0.1
+- Primez branch metadata/version bump for repository auto-updates.
+
+v1.0.0
 - Fork of plugin.audio.spotify with Kodi Connect–style improvements.
 - Consistent art: thumb, poster, fanart, and icon set for albums, artists, playlists, and tracks so every list view shows art.
 - Correct metadata: proper Kodi music info types (year, duration, tracknumber, albumartist, etc.) for reliable tagging.
