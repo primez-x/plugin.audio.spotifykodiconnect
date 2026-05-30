@@ -103,7 +103,7 @@ class DeferredThread:
         self.daemon = daemon
 
     def start(self):
-        if getattr(self.target, "__name__", "") == "add_remaining":
+        if getattr(self.target, "__name__", "") in ("add_remaining", "_run"):
             DeferredThread.started_targets.append(self.target)
             return
         self.target()
@@ -113,11 +113,20 @@ class DeferredThread:
 
 
 class FakeCache:
-    def get(self, key, checksum=None):
-        return None
+    def __init__(self):
+        self.values = {}
 
-    def set(self, key, value, checksum=None):
-        pass
+    def get(self, key, checksum=None):
+        item = self.values.get(key)
+        if not item:
+            return None
+        value, item_checksum = item
+        if checksum is not None and item_checksum != checksum:
+            return None
+        return value
+
+    def set(self, key, value, checksum=None, **kwargs):
+        self.values[key] = (value, checksum)
 
 
 def install_kodi_stubs():
@@ -220,6 +229,10 @@ class FakeSpotify:
         self.saved_album_calls = 0
         self.followed_artist_calls = 0
         self.artist_calls = 0
+        self.saved_track_contains_requests = []
+        self.saved_album_contains_requests = []
+        self.following_artist_requests = []
+        self.playlist_follow_requests = []
 
     def playlist(self, playlist_id, fields="", market=None):
         return {
@@ -251,6 +264,22 @@ class FakeSpotify:
         self.artist_calls += 1
         return {"artists": [{"id": artist_id, "images": []} for artist_id in artist_ids]}
 
+    def current_user_saved_tracks_contains(self, track_ids):
+        self.saved_track_contains_requests.append(tuple(track_ids))
+        return [False for _ in track_ids]
+
+    def current_user_saved_albums_contains(self, album_ids):
+        self.saved_album_contains_requests.append(tuple(album_ids))
+        return [False for _ in album_ids]
+
+    def current_user_following_artists(self, artist_ids):
+        self.following_artist_requests.append(tuple(artist_ids))
+        return [False for _ in artist_ids]
+
+    def playlist_is_following(self, playlist_id, user_ids):
+        self.playlist_follow_requests.append((playlist_id, tuple(user_ids)))
+        return [False]
+
 
 class FanartSpotify(FakeSpotify):
     def artists(self, artist_ids):
@@ -280,6 +309,27 @@ def spotify_artist(index):
         "genres": [],
         "popularity": 0,
         "followers": {"total": 0},
+    }
+
+
+def spotify_album(index):
+    return {
+        "id": f"album-{index}",
+        "name": f"Album {index}",
+        "images": [],
+        "artists": [{"id": f"artist-{index}", "name": f"Artist {index}"}],
+        "genres": [],
+        "popularity": 50,
+        "release_date": "2024-01-01",
+    }
+
+
+def spotify_playlist(index, owner_id="other-user"):
+    return {
+        "id": f"playlist-{index}",
+        "name": f"Playlist {index}",
+        "images": [],
+        "owner": {"id": owner_id},
     }
 
 
@@ -373,6 +423,56 @@ class PlaylistFastPathTests(unittest.TestCase):
         self.assertEqual(0, spotify.saved_album_calls)
         self.assertEqual(0, spotify.followed_artist_calls)
         self.assertEqual(0, spotify.artist_calls)
+
+    def test_browse_playlist_uses_first_page_and_hidden_continuation(self):
+        events = RecordingPlayer.events
+        spotify = FakeSpotify(events, total=75)
+        content = self.build_content(spotify)
+        content._PluginContent__params = {
+            "action": ["browse_playlist"],
+            "playlistid": ["playlist-1"],
+        }
+
+        content.browse_playlist()
+
+        self.assertEqual(["fetch:0"], events)
+        self.assertEqual(1, len(DeferredThread.started_targets))
+
+    def test_prepare_tracks_uses_page_local_relation_checks(self):
+        events = RecordingPlayer.events
+        spotify = FakeSpotify(events, total=1)
+        content = self.build_content(spotify)
+
+        content._PluginContent__prepare_track_listitems(
+            tracks=[spotify_track(1), spotify_track(2)],
+            include_artist_fanart=False,
+        )
+
+        self.assertEqual(0, spotify.saved_track_calls)
+        self.assertEqual(0, spotify.followed_artist_calls)
+        self.assertEqual([("track-1", "track-2")], spotify.saved_track_contains_requests)
+        self.assertEqual([("artist-1", "artist-2")], spotify.following_artist_requests)
+
+    def test_prepare_albums_uses_page_local_saved_checks(self):
+        events = RecordingPlayer.events
+        spotify = FakeSpotify(events, total=1)
+        content = self.build_content(spotify)
+
+        content._PluginContent__prepare_album_listitems(albums=[spotify_album(1), spotify_album(2)])
+
+        self.assertEqual(0, spotify.saved_album_calls)
+        self.assertEqual([("album-1", "album-2")], spotify.saved_album_contains_requests)
+
+    def test_prepare_playlists_uses_page_local_follow_checks(self):
+        events = RecordingPlayer.events
+        spotify = FakeSpotify(events, total=1)
+        content = self.build_content(spotify)
+
+        content._PluginContent__prepare_playlist_listitems(
+            [spotify_playlist(1), spotify_playlist(2, owner_id="user")]
+        )
+
+        self.assertEqual([("playlist-1", ("user",))], spotify.playlist_follow_requests)
 
     def test_artist_fanart_fetch_logs_exception_with_exception_first(self):
         events = RecordingPlayer.events

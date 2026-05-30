@@ -54,6 +54,12 @@ PLAYER_FILE_LABELS = (
     "Player.FileNameAndPath",
     "MusicPlayer.FileNameAndPath",
 )
+PREBUFFER_RELEASE_DELAY_PROP = "Spotify.PrebufferReleaseDelay"
+PREBUFFER_RELEASE_DELAY_DEFAULT = 5.0
+PREBUFFER_RELEASE_DELAY_MIN = 2.0
+PREBUFFER_RELEASE_DELAY_MAX = 15.0
+PREBUFFER_RELEASE_DELAY_STEP_UP = 2.0
+PREBUFFER_RELEASE_DELAY_STEP_DOWN = 0.5
 
 # Artist fanart for Music OSD (single largest image URL; no rotation – Spotify only provides same image in multiple sizes)
 _artist_fanart_urls = []  # type: list
@@ -221,13 +227,9 @@ def _refresh_playback_hooks(current_track_id: str, delay_ms: int = 0) -> None:
         win = xbmcgui.Window(ADDON_WINDOW_ID)
         try:
             current_item, next_item = get_next_playlist_item()
-            current_id, current_duration = parse_track_url(
-                (current_item or {}).get("file") or ""
-            )
+            current_id, current_duration = parse_track_url((current_item or {}).get("file") or "")
             if current_id == current_track_id:
-                _publish_track_hook(
-                    win, "CurrentTrack", current_item, current_id, current_duration
-                )
+                _publish_track_hook(win, "CurrentTrack", current_item, current_id, current_duration)
             else:
                 _clear_track_hook(win, "CurrentTrack")
                 _set_or_clear(win, "Spotify.CurrentTrackId", current_track_id)
@@ -279,9 +281,7 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
         def _check():
             win = xbmcgui.Window(ADDON_WINDOW_ID)
             for _attempt in range(SPOTIFY_PLAYER_METADATA_ATTEMPTS):
-                is_spotify, track_id, has_player_file = _read_active_spotify_player_state(
-                    win
-                )
+                is_spotify, track_id, has_player_file = _read_active_spotify_player_state(win)
                 if is_spotify:
                     if track_id:
                         win.setProperty("Spotify.CurrentTrackId", track_id)
@@ -304,9 +304,7 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
 
 class MainService:
     def __init__(self):
-        log_msg(
-            f"Spotify plugin version: {xbmcaddon.Addon(id=ADDON_ID).getAddonInfo('version')}."
-        )
+        log_msg(f"Spotify plugin version: {xbmcaddon.Addon(id=ADDON_ID).getAddonInfo('version')}.")
 
         self.__spotty_helper: SpottyHelper = SpottyHelper()
         self.__spotty = spotty.get_spotty(self.__spotty_helper)
@@ -316,17 +314,13 @@ class MainService:
         self.__welcome_msg = True
 
         normalization_setting = (
-            (SPOTIFY_ADDON.getSetting("spotify_normalization") or "auto")
-            .strip()
-            .lower()
+            (SPOTIFY_ADDON.getSetting("spotify_normalization") or "auto").strip().lower()
         )
         if normalization_setting not in ("off", "auto", "track", "album"):
             normalization_setting = "auto"
         use_autoplay = SPOTIFY_ADDON.getSetting("spotify_autoplay").lower() == "true"
         bitrate = self._get_bitrate_setting()
-        self.__prebuffer_enabled = (
-            SPOTIFY_ADDON.getSetting("prebuffer_enabled").lower() == "true"
-        )
+        self.__prebuffer_enabled = SPOTIFY_ADDON.getSetting("prebuffer_enabled").lower() == "true"
         self.__prebuffer_manager: PrebufferManager = PrebufferManager(
             self.__spotty,
             normalization_gain_type=normalization_setting,
@@ -353,6 +347,49 @@ class MainService:
         self._prebuffer_token_lock = threading.Lock()
 
         bottle_manager.route_all(self.__http_spotty_streamer)
+
+    @staticmethod
+    def _get_prebuffer_release_delay() -> float:
+        win = xbmcgui.Window(ADDON_WINDOW_ID)
+        try:
+            value = float(win.getProperty(PREBUFFER_RELEASE_DELAY_PROP) or "")
+        except (TypeError, ValueError):
+            value = PREBUFFER_RELEASE_DELAY_DEFAULT
+        return max(PREBUFFER_RELEASE_DELAY_MIN, min(PREBUFFER_RELEASE_DELAY_MAX, value))
+
+    @staticmethod
+    def _set_prebuffer_release_delay(value: float) -> None:
+        delay = max(PREBUFFER_RELEASE_DELAY_MIN, min(PREBUFFER_RELEASE_DELAY_MAX, value))
+        xbmcgui.Window(ADDON_WINDOW_ID).setProperty(PREBUFFER_RELEASE_DELAY_PROP, f"{delay:.1f}")
+        log_msg(f"Prebuffer release delay now {delay:.1f}s.", LOGDEBUG)
+
+    def _watch_prebuffer_result(self, downloader, track_id: str, delay_used: float) -> None:
+        if downloader is None:
+            return
+        try:
+            with downloader.cond:
+                while (
+                    not downloader.is_finished and not downloader.error and not downloader.aborted
+                ):
+                    downloader.cond.wait(timeout=30.0)
+                error = downloader.error
+                aborted = downloader.aborted
+            if aborted:
+                return
+            if error:
+                self._set_prebuffer_release_delay(delay_used + PREBUFFER_RELEASE_DELAY_STEP_UP)
+                log_msg(
+                    f"Prebuffer for {track_id} errored after {delay_used:.1f}s delay.",
+                    LOGDEBUG,
+                )
+            else:
+                self._set_prebuffer_release_delay(delay_used - PREBUFFER_RELEASE_DELAY_STEP_DOWN)
+                log_msg(
+                    f"Prebuffer for {track_id} succeeded after {delay_used:.1f}s delay.",
+                    LOGDEBUG,
+                )
+        except Exception as exc:
+            log_exception(exc, "watching prebuffer result failed")
 
     def __on_track_started(self, track_id: str, duration_sec: float) -> None:
         """Set OSD properties for Spotify track; pre-buffer next; broadcast to service.nexttrack."""
@@ -418,9 +455,7 @@ class MainService:
                     win.setProperty("Spotify.CurrentTrackLiked", liked)
                 else:
                     win.clearProperty("Spotify.CurrentTrackLiked")
-                log_msg(
-                    f"Spotify.CurrentTrackLiked = {liked!r} for {track_id}.", LOGDEBUG
-                )
+                log_msg(f"Spotify.CurrentTrackLiked = {liked!r} for {track_id}.", LOGDEBUG)
             except Exception as e:
                 log_msg(f"Error setting liked state for {track_id}: {e}", LOGWARNING)
                 pass
@@ -444,9 +479,7 @@ class MainService:
             if not next_track_id or next_duration is None:
                 return
 
-            prebuffer_enabled = (
-                SPOTIFY_ADDON.getSetting("prebuffer_enabled").lower() == "true"
-            )
+            prebuffer_enabled = SPOTIFY_ADDON.getSetting("prebuffer_enabled").lower() == "true"
             # Prebuffer collects PCM bytes for the next track. Pass current
             # settings so prebuffer uses them without addon restart.
             # IMPORTANT: Delay prebuffer start so the main track's spotty process
@@ -485,9 +518,7 @@ class MainService:
                     dl = SpottyCacheManager.find_best_downloader(track_id, 0)
                     if dl is not None and not dl.is_finished:
                         with dl.cond:
-                            while (
-                                not dl.is_finished and not dl.error and not dl.aborted
-                            ):
+                            while not dl.is_finished and not dl.error and not dl.aborted:
                                 dl.cond.wait(timeout=30.0)
 
                     log_msg(
@@ -495,14 +526,16 @@ class MainService:
                         LOGDEBUG,
                     )
 
-                    # Brief pause so Spotify's backend releases the previous
-                    # session before the prebuffer's spotty process connects.
-                    # Without this, the new spotty may get kicked immediately
-                    # and exit with 0 PCM bytes (returncode=0, 0 bytes).
-                    # 1s was insufficient (~1.3s total gap still caused 0-byte
-                    # prebuffers); 2s gives enough margin for session release.
-                    # 15s provides ample room for error on slow connections.
-                    time.sleep(15.0)
+                    # Brief adaptive pause so Spotify's backend releases the
+                    # previous session before the prebuffer spotty connects.
+                    # The watcher below backs off after failed prebuffers and
+                    # trims the delay after clean ones.
+                    release_delay = self._get_prebuffer_release_delay()
+                    log_msg(
+                        f"_deferred_prebuffer: waiting {release_delay:.1f}s for session release.",
+                        LOGDEBUG,
+                    )
+                    time.sleep(release_delay)
 
                     # Final stale-check after the session-release sleep.
                     with self._prebuffer_token_lock:
@@ -524,9 +557,7 @@ class MainService:
                         return
                     if not next_item_now:
                         return
-                    next_id_now, next_dur_now = parse_track_url(
-                        next_item_now.get("file") or ""
-                    )
+                    next_id_now, next_dur_now = parse_track_url(next_item_now.get("file") or "")
                     if not next_id_now or next_dur_now is None:
                         return
                     # Guard: never prebuffer the track that triggered this
@@ -548,12 +579,17 @@ class MainService:
                     )
                     if norm not in ("off", "auto", "track", "album"):
                         norm = "auto"
-                    self.__prebuffer_manager.start_prebuffer(
+                    downloader = self.__prebuffer_manager.start_prebuffer(
                         next_id_now,
                         next_dur_now,
                         bitrate=bitrate,
                         normalization_gain_type=norm,
                     )
+                    threading.Thread(
+                        target=self._watch_prebuffer_result,
+                        args=(downloader, next_id_now, release_delay),
+                        daemon=True,
+                    ).start()
 
                 threading.Thread(target=_deferred_prebuffer, daemon=True).start()
 
@@ -572,9 +608,7 @@ class MainService:
 
             # Fetch a larger set of recommendations to fill the autoplay playlist.
             RECOMMEND_LIMIT = 49
-            result = sp.recommendations(
-                seed_tracks=[seed_track_id], limit=RECOMMEND_LIMIT
-            )
+            result = sp.recommendations(seed_tracks=[seed_track_id], limit=RECOMMEND_LIMIT)
             rec_tracks = (result or {}).get("tracks") or []
             if not rec_tracks:
                 log_msg("Autoplay: no recommendations returned.", LOGDEBUG)
@@ -596,16 +630,12 @@ class MainService:
                 seed_name = (seed_info or {}).get("name") or ""
                 seed_duration_ms = (seed_info or {}).get("duration_ms") or 0
                 seed_artists = (seed_info or {}).get("artists") or []
-                seed_artist_name = (
-                    seed_artists[0].get("name") or "" if seed_artists else ""
-                )
+                seed_artist_name = seed_artists[0].get("name") or "" if seed_artists else ""
                 seed_album = (seed_info or {}).get("album") or {}
                 seed_album_name = seed_album.get("name") or ""
                 seed_images = seed_album.get("images") or []
                 seed_art_url = seed_images[0].get("url") if seed_images else ""
-                seed_duration_sec = (
-                    math.ceil(seed_duration_ms / 1000) if seed_duration_ms else 1
-                )
+                seed_duration_sec = math.ceil(seed_duration_ms / 1000) if seed_duration_ms else 1
                 seed_url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{seed_track_id}/{seed_duration_sec}.wav"
                 li = xbmcgui.ListItem(label=seed_name or seed_track_id)
                 li.setProperty("IsPlayable", "true")
@@ -636,9 +666,7 @@ class MainService:
             except Exception:
                 # If fetching metadata fails, still add a minimal entry for the seed track.
                 try:
-                    seed_url = (
-                        f"http://{PROXY_HOST}:{PROXY_PORT}/track/{seed_track_id}/1.wav"
-                    )
+                    seed_url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{seed_track_id}/1.wav"
                     li = xbmcgui.ListItem(label=seed_track_id)
                     li.setProperty("IsPlayable", "true")
                     li.setProperty("spotifytrackid", seed_track_id)
@@ -686,9 +714,7 @@ class MainService:
                         album_name = album.get("name") or ""
                         images = album.get("images") or []
                         art_url = images[0].get("url") if images else ""
-                        duration_sec = (
-                            math.ceil(duration_ms / 1000) if duration_ms else 1
-                        )
+                        duration_sec = math.ceil(duration_ms / 1000) if duration_ms else 1
                         url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{tid}/{duration_sec}.wav"
                         li = xbmcgui.ListItem(label=name)
                         li.setProperty("IsPlayable", "true")
@@ -751,9 +777,7 @@ class MainService:
             if (loop_counter % 10) == 0:
                 log_msg(f"Main loop continuing. Loop counter: {loop_counter}.")
 
-            prebuffer_enabled_now = (
-                SPOTIFY_ADDON.getSetting("prebuffer_enabled").lower() == "true"
-            )
+            prebuffer_enabled_now = SPOTIFY_ADDON.getSetting("prebuffer_enabled").lower() == "true"
             if self.__prebuffer_enabled and not prebuffer_enabled_now:
                 self.__prebuffer_manager.cancel_prebuffer()
             self.__prebuffer_enabled = prebuffer_enabled_now
@@ -814,8 +838,6 @@ class MainService:
             welcome = addon.getLocalizedString(WELCOME_AUTHENTICATED_STR_ID)
             msg = f"{welcome} {username}" if username else welcome
             icon = addon.getAddonInfo("icon")
-            xbmcgui.Dialog().notification(
-                addon_name, msg, icon=icon, time=2000, sound=False
-            )
+            xbmcgui.Dialog().notification(addon_name, msg, icon=icon, time=2000, sound=False)
         except Exception as exc:
             log_exception(exc, "Could not show welcome notification")

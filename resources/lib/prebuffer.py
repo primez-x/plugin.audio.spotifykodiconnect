@@ -48,7 +48,7 @@ class PrebufferManager:
         duration_sec: float,
         bitrate: Optional[str] = None,
         normalization_gain_type: Optional[str] = None,
-    ) -> None:
+    ):
         """Start filling the pre-buffer for the given track in a background thread."""
         br = bitrate if bitrate is not None else self.__bitrate
         norm = (normalization_gain_type or self.__normalization_gain_type).strip().lower() or "auto"
@@ -57,13 +57,13 @@ class PrebufferManager:
 
         with self.__lock:
             if self.__prebuffer_track_id == track_id:
-                return
+                return None
             self.__prebuffer_track_id = track_id
 
         log_msg(f"Triggering prebuffer background download for {track_id}", LOGDEBUG)
         wav_header, track_length = create_wav_header_for_duration(duration_sec)
 
-        SpottyCacheManager.get_or_start(
+        return SpottyCacheManager.get_or_start(
             self.__spotty,
             track_id,
             duration_sec,
