@@ -233,6 +233,7 @@ class FakeSpotify:
         self.saved_album_contains_requests = []
         self.following_artist_requests = []
         self.playlist_follow_requests = []
+        self.track_detail_requests = []
 
     def playlist(self, playlist_id, fields="", market=None):
         return {
@@ -247,6 +248,14 @@ class FakeSpotify:
         self.events.append(f"fetch:{offset}")
         end = min(offset + limit, self.total)
         return {"items": [{"track": spotify_track(i)} for i in range(offset, end)]}
+
+    def tracks(self, track_ids, market=None):
+        self.track_detail_requests.append((tuple(track_ids), market))
+        tracks = []
+        for track_id in track_ids:
+            index = int(str(track_id).split("-")[-1])
+            tracks.append(spotify_track(index))
+        return {"tracks": tracks}
 
     def current_user_saved_tracks(self, limit=50, offset=0, market=None):
         self.saved_track_calls += 1
@@ -380,6 +389,24 @@ class ChecksumSpotify(FakeSpotify):
         }
 
 
+class SavedTracksSpotify(FakeSpotify):
+    def __init__(self, events, saved_track_total=75):
+        super().__init__(events, total=1)
+        self.saved_track_total = saved_track_total
+        self.saved_track_requests = []
+
+    def current_user_saved_tracks(self, limit=50, offset=0, market=None):
+        self.saved_track_calls += 1
+        self.saved_track_requests.append((limit, offset, market))
+        return {
+            "total": self.saved_track_total,
+            "items": [
+                {"track": spotify_track(i)}
+                for i in range(offset, min(offset + limit, self.saved_track_total))
+            ],
+        }
+
+
 class PlaylistFastPathTests(unittest.TestCase):
     def setUp(self):
         self.plugin_content = import_plugin_content()
@@ -437,6 +464,38 @@ class PlaylistFastPathTests(unittest.TestCase):
 
         self.assertEqual(["fetch:0"], events)
         self.assertEqual(1, len(DeferredThread.started_targets))
+
+    def test_browse_saved_tracks_uses_first_page_and_hidden_continuation(self):
+        events = RecordingPlayer.events
+        spotify = SavedTracksSpotify(events, saved_track_total=75)
+        content = self.build_content(spotify)
+        content._PluginContent__params = {"action": ["browse_saved_tracks"]}
+        content._PluginContent__action = "browse_saved_tracks"
+
+        content.browse_saved_tracks()
+
+        self.assertEqual([(50, 0, "US")], spotify.saved_track_requests)
+        self.assertEqual([], spotify.track_detail_requests)
+        self.assertEqual([], spotify.saved_track_contains_requests)
+        self.assertEqual(1, len(DeferredThread.started_targets))
+        cached = content.cache.values["spotify.savedtracks.user"][0]
+        self.assertEqual(50, len(cached["items"]))
+        self.assertFalse(cached["_dynamic_paging_complete"])
+
+    def test_saved_tracks_continuation_hydrates_remaining_pages(self):
+        events = RecordingPlayer.events
+        spotify = SavedTracksSpotify(events, saved_track_total=75)
+        content = self.build_content(spotify)
+        content._PluginContent__params = {"action": ["browse_saved_tracks"]}
+        content._PluginContent__action = "browse_saved_tracks"
+
+        content.browse_saved_tracks()
+        DeferredThread.started_targets[0]()
+
+        self.assertEqual([(50, 0, "US"), (50, 50, "US")], spotify.saved_track_requests)
+        cached = content.cache.values["spotify.savedtracks.user"][0]
+        self.assertEqual(75, len(cached["items"]))
+        self.assertTrue(cached["_dynamic_paging_complete"])
 
     def test_prepare_tracks_uses_page_local_relation_checks(self):
         events = RecordingPlayer.events
