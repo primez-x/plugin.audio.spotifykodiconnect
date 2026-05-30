@@ -1,4 +1,3 @@
-import inspect
 import os
 import platform
 import signal
@@ -14,7 +13,11 @@ import xbmcgui
 import xbmcvfs
 from xbmc import LOGDEBUG, LOGINFO, LOGERROR
 
-DEBUG = True
+DEBUG = False
+DEBUG_SETTING_ID = "debug_logging"
+_DEBUG_SETTING_VALUE = None
+_DEBUG_SETTING_CHECKED_AT = 0.0
+_DEBUG_SETTING_TTL = 30.0
 
 ADDON_ID = "plugin.audio.spotifykodiconnect"
 ADDON_DATA_PATH = xbmcvfs.translatePath(f"special://profile/addon_data/{ADDON_ID}")
@@ -32,18 +35,48 @@ KODI_PROPERTY_SPOTIFY_AUTH_TOKEN = "spotifykodiconnect-auth-token"
 KODI_PROPERTY_AUTH_TOKEN_EXPIRES_AT = "spotifykodiconnect-auth-token-expires-at"
 
 
+def _debug_logging_enabled() -> bool:
+    global _DEBUG_SETTING_VALUE, _DEBUG_SETTING_CHECKED_AT
+    if DEBUG:
+        return True
+
+    now = time.monotonic()
+    if _DEBUG_SETTING_VALUE is not None and now - _DEBUG_SETTING_CHECKED_AT < _DEBUG_SETTING_TTL:
+        return _DEBUG_SETTING_VALUE
+
+    try:
+        addon = xbmcaddon.Addon(id=ADDON_ID)
+        _DEBUG_SETTING_VALUE = (addon.getSetting(DEBUG_SETTING_ID) or "").strip().lower() == "true"
+    except Exception:
+        _DEBUG_SETTING_VALUE = False
+    _DEBUG_SETTING_CHECKED_AT = now
+    return _DEBUG_SETTING_VALUE
+
+
+def _get_caller_name(depth: int = 2) -> str:
+    try:
+        frame = sys._getframe(depth)
+        return get_formatted_caller_name(frame.f_code.co_filename, frame.f_code.co_name)
+    except Exception:
+        return ""
+
+
 def log_msg(msg: str, loglevel: int = LOGDEBUG, caller_name: str = "") -> None:
-    if DEBUG and (loglevel == LOGDEBUG):
-        loglevel = LOGINFO
+    if loglevel == LOGDEBUG and not _debug_logging_enabled():
+        return
     if not caller_name:
-        caller_name = get_formatted_caller_name(inspect.stack()[1][1], inspect.stack()[1][3])
+        caller_name = _get_caller_name()
 
     xbmc.log(f"{ADDON_ID}:{caller_name}: {msg}", level=loglevel)
 
 
 def log_exception(exc: Exception, exception_details: str) -> None:
-    the_caller_name = get_formatted_caller_name(inspect.stack()[1][1], inspect.stack()[1][3])
-    log_msg(" ".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), loglevel=LOGERROR, caller_name=the_caller_name)
+    the_caller_name = _get_caller_name()
+    log_msg(
+        " ".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+        loglevel=LOGERROR,
+        caller_name=the_caller_name,
+    )
     log_msg(f"Exception --> {exception_details}.", loglevel=LOGERROR, caller_name=the_caller_name)
 
 

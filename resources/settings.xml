@@ -37,4 +37,26 @@
           <control type="toggle" />
         </setting>
     </category>
+    <category label="11144">
+        <setting
+            id="library_precache_enabled"
+            type="bool"
+            default="false"
+            label="11145"
+            help="11146"
+        >
+          <control type="toggle" />
+        </setting>
+    </category>
+    <category label="11147">
+        <setting
+            id="debug_logging"
+            type="bool"
+            default="false"
+            label="11148"
+            help="11149"
+        >
+          <control type="toggle" />
+        </setting>
+    </category>
 </settings>

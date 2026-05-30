@@ -334,3 +334,27 @@ msgctxt "#11143"
 msgid "Controls which Spotify normalization gain value is applied. Auto uses Spotify's default; Track and Album normalize to the respective gain value; Off disables normalization."
 msgstr ""
 
+msgctxt "#11144"
+msgid "Library"
+msgstr ""
+
+msgctxt "#11145"
+msgid "Background library precache"
+msgstr ""
+
+msgctxt "#11146"
+msgid "Preload a small, bounded set of library data while Kodi is idle. Stops when playback or navigation starts."
+msgstr ""
+
+msgctxt "#11147"
+msgid "Debug"
+msgstr ""
+
+msgctxt "#11148"
+msgid "Debug logging"
+msgstr ""
+
+msgctxt "#11149"
+msgid "Write detailed debug logs. Leave disabled for normal playback performance."
+msgstr ""
+

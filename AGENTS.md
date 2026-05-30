@@ -11,6 +11,9 @@ This repository is a Kodi audio add-on named `plugin.audio.spotifykodiconnect`. 
 ## Coding Style & Naming Conventions
 Use Python 3, 4-space indentation, `snake_case` for functions and variables, `PascalCase` for classes, and `UPPER_CASE` for constants. Keep Kodi-specific calls isolated from reusable helpers where practical. Match existing metadata formatting in `addon.xml` and keep source URLs, provider metadata, and `news` entries synchronized with release bumps.
 
+## UI & UX Guidelines
+Never expose manual "Next page" items, buttons, or list entries in SpotifyKodiConnect browsing flows. If Spotify API pagination is needed, hide it behind dynamic paging, incremental loading, background continuation, or another automatic interaction model. Visible pagination controls are not acceptable UX for this project.
+
 ## Testing Guidelines
 For Python changes, run `compileall` and the focused root test that covers the touched behavior. For metadata-only changes, parse `addon.xml` and run `git diff --check`. Kodi playback changes should be smoke-tested on CoreELEC when practical, especially startup, queueing, and artwork paths.
 

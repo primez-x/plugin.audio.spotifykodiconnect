@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 import types
 import unittest
 
@@ -54,6 +55,14 @@ class ImmediateThread:
 
     def start(self):
         self.target(*self.args)
+
+
+class FakeDownloader:
+    def __init__(self, error=False, aborted=False):
+        self.cond = threading.Condition()
+        self.is_finished = True
+        self.error = error
+        self.aborted = aborted
 
 
 def install_stubs(info_labels):
@@ -189,6 +198,24 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
         main_service._SpotifyOSDPlayerMonitor().onPlayBackStarted()
 
         self.assertEqual("", win.getProperty("Spotify.CurrentTrackId"))
+
+    def test_prebuffer_delay_backs_off_after_error(self):
+        main_service = import_main_service({})
+        service = object.__new__(main_service.MainService)
+
+        service._watch_prebuffer_result(FakeDownloader(error=True), "track-1", 5.0)
+
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        self.assertEqual("7.0", win.getProperty(main_service.PREBUFFER_RELEASE_DELAY_PROP))
+
+    def test_prebuffer_delay_trims_after_success(self):
+        main_service = import_main_service({})
+        service = object.__new__(main_service.MainService)
+
+        service._watch_prebuffer_result(FakeDownloader(error=False), "track-1", 5.0)
+
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        self.assertEqual("4.5", win.getProperty(main_service.PREBUFFER_RELEASE_DELAY_PROP))
 
 
 if __name__ == "__main__":
