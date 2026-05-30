@@ -1765,6 +1765,7 @@ class PluginContent:
         album_details=None,
         include_context_items: bool = True,
         include_artist_fanart: bool = True,
+        known_saved_track_ids: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
         if tracks is None:
             tracks = []
@@ -1826,9 +1827,17 @@ class PluginContent:
             new_tracks.append(track)
 
         if include_context_items:
-            saved_track_ids = self.__get_saved_track_ids_for_page(
-                [t.get("id") for t in new_tracks if t.get("id")]
-            )
+            track_ids_for_context = [t.get("id") for t in new_tracks if t.get("id")]
+            if known_saved_track_ids is None:
+                saved_track_ids = self.__get_saved_track_ids_for_page(track_ids_for_context)
+            else:
+                saved_track_ids = {
+                    track_id
+                    for track_id in track_ids_for_context
+                    if track_id in known_saved_track_ids
+                }
+                for track_id in saved_track_ids:
+                    self.__set_relation_cache("savedtrack", track_id, True)
             followed_artists = self.__get_followed_artist_ids_for_page(
                 [t.get("artistid") for t in new_tracks if t.get("artistid")]
             )
@@ -2484,51 +2493,112 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
-    def __get_saved_track_ids(self) -> List[str]:
-        saved_tracks = self.__spotipy.current_user_saved_tracks(
-            limit=50, offset=0, market=self.__user_country
-        )
-        total = saved_tracks["total"]
-        cache_str = f"spotify.savedtracksids.{self.__userid}"
-        track_ids = self.cache.get(cache_str, checksum=total)
-        if track_ids:
-            cache_log(
-                f'Retrieved {len(track_ids)} cached saved track ids for user "{self.__userid}".'
-            )
-            return track_ids
+    def __saved_tracks_cache_checksum(self, total: int) -> str:
+        generic_checksum = self.__addon.getSetting("cache_checksum")
+        return f"v{CACHE_SCHEMA_VERSION}-savedtracks-{int(total)}-{generic_checksum}"
 
-        track_ids = []
-        count = len(saved_tracks["items"])
-        while total > count:
-            saved_tracks["items"] += self.__spotipy.current_user_saved_tracks(
-                limit=50, offset=count, market=self.__user_country
-            )["items"]
-            count += 50
-        for track in saved_tracks["items"]:
-            if track.get("track") and track["track"].get("id"):
-                track_ids.append(track["track"]["id"])
-        self.cache.set(cache_str, track_ids, checksum=total)
-        cache_log(
-            f'Retrieved {_get_len(track_ids)} UNCACHED saved track ids for user "{self.__userid}".'
+    def __get_saved_tracks_page(
+        self, offset: int = 0, limit: int = DYNAMIC_PAGE_LIMIT
+    ) -> Dict[str, Any]:
+        return self.__spotipy.current_user_saved_tracks(
+            limit=limit, offset=offset, market=self.__user_country
         )
 
-        return track_ids
+    def __prepare_saved_track_items_page(
+        self,
+        raw_items: List[Dict[str, Any]],
+        include_context_items: bool = True,
+        include_artist_fanart: bool = True,
+    ) -> List[Dict[str, Any]]:
+        valid_items = []
+        saved_track_ids: Set[str] = set()
+        for item in raw_items:
+            track = item.get("track") if isinstance(item, dict) else None
+            if not track or not track.get("id"):
+                continue
+            valid_items.append(item)
+            saved_track_ids.add(track["id"])
+
+        return self.__prepare_track_listitems(
+            tracks=valid_items,
+            include_context_items=include_context_items,
+            include_artist_fanart=include_artist_fanart,
+            known_saved_track_ids=saved_track_ids,
+        )
+
+    def __start_saved_tracks_continuation(
+        self,
+        cache_str: str,
+        checksum: str,
+        collection: Dict[str, Any],
+        target_url: str,
+    ) -> None:
+        total = int(collection.get("total") or 0)
+        loaded = int(
+            collection.get(DYNAMIC_PAGING_LOADED_KEY) or len(collection.get("items") or [])
+        )
+        if total <= loaded:
+            return
+
+        def _continue_saved_tracks():
+            monitor = xbmc.Monitor()
+            all_items = list(collection.get("items") or [])
+            offset = loaded
+            current_total = total
+            while current_total > offset:
+                if monitor.abortRequested():
+                    return
+                page = self.__get_saved_tracks_page(offset=offset, limit=DYNAMIC_PAGE_LIMIT)
+                raw_items = page.get("items") or []
+                current_total = int(page.get("total") or current_total)
+                if not raw_items:
+                    break
+                all_items += self.__prepare_saved_track_items_page(raw_items)
+                offset += len(raw_items)
+                collection["items"] = all_items
+                self.__mark_dynamic_collection_state(
+                    collection, offset, current_total, current_total <= offset
+                )
+                self.cache.set(cache_str, collection, checksum=checksum)
+
+            self.__mark_dynamic_collection_state(collection, offset, current_total, True)
+            self.cache.set(cache_str, collection, checksum=checksum)
+            self.__refresh_active_listing(target_url)
+
+        self.__start_dynamic_page_continuation(cache_str, target_url, _continue_saved_tracks)
 
     def __get_saved_tracks(self):
-        track_ids = self.__get_saved_track_ids()
+        first_page = self.__get_saved_tracks_page(offset=0, limit=DYNAMIC_PAGE_LIMIT)
+        total = int(first_page.get("total") or 0)
+        raw_items = first_page.get("items") or []
         cache_str = f"spotify.savedtracks.{self.__userid}"
-        checksum = self.__cache_checksum(len(track_ids))
+        checksum = self.__saved_tracks_cache_checksum(total)
+        target_url = (
+            self.__current_request_url()
+            if self.__action == self.browse_saved_tracks.__name__
+            else ""
+        )
 
-        tracks = self.cache.get(cache_str, checksum=checksum)
-        if isinstance(tracks, list) and (len(tracks) > 0 or len(track_ids) == 0):
-            cache_log(f'Retrieved {len(tracks)} cached saved tracks for user "{self.__userid}".')
-        else:
-            tracks = self.__prepare_track_listitems(track_ids)
-            self.cache.set(cache_str, tracks, checksum=checksum)
-            cache_log(
-                f'Retrieved {_get_len(tracks)} UNCACHED saved tracks for user "{self.__userid}".'
-            )
+        collection = self.cache.get(cache_str, checksum=checksum)
+        if isinstance(collection, dict):
+            tracks = collection.get("items") or []
+            if total == 0 or tracks:
+                cache_log(
+                    f'Retrieved {len(tracks)} cached saved tracks for user "{self.__userid}".'
+                )
+                if not collection.get(DYNAMIC_PAGING_COMPLETE_KEY):
+                    self.__start_saved_tracks_continuation(
+                        cache_str, checksum, collection, target_url
+                    )
+                return tracks
 
+        tracks = self.__prepare_saved_track_items_page(raw_items)
+        collection = {"items": tracks}
+        loaded = len(raw_items)
+        self.__mark_dynamic_collection_state(collection, loaded, total, total <= loaded)
+        self.cache.set(cache_str, collection, checksum=checksum)
+        cache_log(f'Retrieved first {loaded}/{total} saved tracks for user "{self.__userid}".')
+        self.__start_saved_tracks_continuation(cache_str, checksum, collection, target_url)
         return tracks
 
     def browse_saved_tracks(self) -> None:
