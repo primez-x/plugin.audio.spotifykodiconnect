@@ -114,7 +114,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             self.module._PCM_BYTES_PER_SEC * 2,
         )
 
-    def test_from_start_request_has_immediate_silent_preroll(self):
+    def test_from_start_request_primes_real_pcm_before_first_chunk(self):
         streamer = self.module.SpottyAudioStreamer(object())
         streamer.set_track("track-1", 180)
         wav_header, _ = self.module.create_wav_header_for_duration(180)
@@ -128,7 +128,10 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             generator.close()
 
         self.assertGreaterEqual(len(first_chunk), len(wav_header))
-        self.assertEqual([1], downloader.wait_targets)
+        self.assertGreaterEqual(
+            max(downloader.wait_targets),
+            len(wav_header) + self.module.STARTUP_SILENCE_BYTES + 32768,
+        )
 
     def test_downloader_seeds_silence_and_maps_seek_offset_to_real_pcm(self):
         sys.modules.pop("spotty_cache", None)
