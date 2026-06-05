@@ -69,6 +69,15 @@ _artist_fanart_index = 0
 _liked_state_track_id: str = ""
 
 
+def _start_daemon_thread(target, args=(), task_name: str = "background task") -> bool:
+    try:
+        threading.Thread(target=target, args=args, daemon=True).start()
+        return True
+    except RuntimeError as exc:
+        log_msg(f"Could not start {task_name}: {exc}", LOGWARNING)
+        return False
+
+
 class _SpotifyOSDServiceMonitor(xbmc.Monitor):
     """Receives inter-addon notifications so the service can act on skin-triggered events.
 
@@ -82,7 +91,7 @@ class _SpotifyOSDServiceMonitor(xbmc.Monitor):
     def onNotification(self, sender: str, method: str, data: str) -> None:
         if sender == "plugin.audio.spotifykodiconnect" and method == "Other.ToggleLike":
             log_msg("ToggleLike notification received, spawning handler.", LOGDEBUG)
-            threading.Thread(target=self._handle_toggle_like, daemon=True).start()
+            _start_daemon_thread(self._handle_toggle_like, task_name="toggle-like handler")
 
     @staticmethod
     def _handle_toggle_like() -> None:
@@ -242,7 +251,7 @@ def _refresh_playback_hooks(current_track_id: str, delay_ms: int = 0) -> None:
         except Exception as exc:
             log_exception(exc, "refreshing Spotify skin playback hooks failed")
 
-    threading.Thread(target=_run, daemon=True).start()
+    _start_daemon_thread(_run, task_name="playback hook refresh")
 
 
 def abort_app(timeout_in_secs: int) -> bool:
@@ -299,7 +308,7 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
             else:
                 self._clear()
 
-        threading.Thread(target=_check, daemon=True).start()
+        _start_daemon_thread(_check, task_name="Spotify playback metadata check")
 
 
 class MainService:
@@ -437,7 +446,7 @@ class MainService:
                 _artist_fanart_urls.clear()
                 _artist_fanart_index = 0
 
-        threading.Thread(target=_fetch_artist_fanart_urls, daemon=True).start()
+        _start_daemon_thread(_fetch_artist_fanart_urls, task_name="artist fanart refresh")
 
         def _set_liked_state():
             try:
@@ -462,17 +471,17 @@ class MainService:
 
         # Only run the liked state check when the track actually changes.
         if track_changed:
-            threading.Thread(target=_set_liked_state, daemon=True).start()
+            _start_daemon_thread(_set_liked_state, task_name="liked-state refresh")
 
         try:
             current_item, next_item = get_next_playlist_item()
             if not next_item:
                 if SPOTIFY_ADDON.getSetting("spotify_autoplay").lower() == "true":
-                    threading.Thread(
-                        target=self.__queue_autoplay_tracks,
+                    _start_daemon_thread(
+                        self.__queue_autoplay_tracks,
                         args=(track_id,),
-                        daemon=True,
-                    ).start()
+                        task_name="autoplay queue fill",
+                    )
                 return
 
             next_track_id, next_duration = parse_track_url(next_item.get("file") or "")
@@ -585,13 +594,13 @@ class MainService:
                         bitrate=bitrate,
                         normalization_gain_type=norm,
                     )
-                    threading.Thread(
-                        target=self._watch_prebuffer_result,
+                    _start_daemon_thread(
+                        self._watch_prebuffer_result,
                         args=(downloader, next_id_now, release_delay),
-                        daemon=True,
-                    ).start()
+                        task_name="prebuffer result watcher",
+                    )
 
-                threading.Thread(target=_deferred_prebuffer, daemon=True).start()
+                _start_daemon_thread(_deferred_prebuffer, task_name="deferred prebuffer")
 
         except Exception:
             pass

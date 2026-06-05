@@ -108,6 +108,12 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             total_length,
         )
 
+    def test_startup_silence_covers_pa_player_cold_decode_window(self):
+        self.assertGreaterEqual(
+            self.module.STARTUP_SILENCE_BYTES,
+            self.module._PCM_BYTES_PER_SEC * 2,
+        )
+
     def test_from_start_request_has_immediate_silent_preroll(self):
         streamer = self.module.SpottyAudioStreamer(object())
         streamer.set_track("track-1", 180)
