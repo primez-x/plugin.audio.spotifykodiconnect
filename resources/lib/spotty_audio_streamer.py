@@ -22,6 +22,8 @@ _DEFAULT_GAIN_TYPE = "track"
 _PCM_BYTES_PER_SEC = 176400  # 44.1 kHz * 2 ch * 2 bytes/sample
 _WAV_HEADER_SIZE = 44
 STARTUP_SILENCE_BYTES = _PCM_BYTES_PER_SEC * 2
+_STARTUP_REAL_PCM_PREROLL_BYTES = 32768
+_STARTUP_REAL_PCM_WAIT_SECONDS = 8.0
 
 # Maximum bytes of PCM silence to pad at the end of a stream when spotty exits
 # cleanly but short of the WAV-declared length. 10 seconds @ 176400 B/s = 1,764,000.
@@ -136,6 +138,72 @@ class SpottyAudioStreamer:
             parts.append(f"{k}={v}")
         log_msg(" | ".join(parts), LOGDEBUG)
 
+    def _prime_startup_real_pcm(
+        self,
+        downloader,
+        range_begin: int,
+        wav_header: bytes,
+        track_length: int,
+    ) -> None:
+        if range_begin > _WAV_HEADER_SIZE:
+            return
+
+        prefix_end = len(wav_header) + STARTUP_SILENCE_BYTES
+        if downloader.start_byte > prefix_end:
+            return
+
+        target_bytes_in_buf = min(
+            track_length - downloader.start_byte,
+            prefix_end - downloader.start_byte + _STARTUP_REAL_PCM_PREROLL_BYTES,
+        )
+        if target_bytes_in_buf <= 0:
+            return
+
+        with downloader.cond:
+            if (
+                downloader.written_bytes >= target_bytes_in_buf
+                or downloader.is_finished
+                or downloader.error
+                or downloader.aborted
+            ):
+                return
+            written = downloader.written_bytes
+
+        self._log_transfer(
+            "startup-prime-wait",
+            target=target_bytes_in_buf,
+            written=written,
+        )
+        deadline = time.monotonic() + _STARTUP_REAL_PCM_WAIT_SECONDS
+        while not self.__terminated:
+            with downloader.cond:
+                if (
+                    downloader.written_bytes >= target_bytes_in_buf
+                    or downloader.is_finished
+                    or downloader.error
+                    or downloader.aborted
+                ):
+                    break
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            downloader.wait_for_bytes(target_bytes_in_buf, timeout=min(0.25, remaining))
+
+        with downloader.cond:
+            written = downloader.written_bytes
+            finished = downloader.is_finished
+            error = downloader.error
+            aborted = downloader.aborted
+        self._log_transfer(
+            "startup-prime-ready",
+            target=target_bytes_in_buf,
+            written=written,
+            finished=finished,
+            error=error,
+            aborted=aborted,
+        )
+
     def terminate_stream(self) -> bool:
         """Signal the current generator to stop."""
         self.__terminated = True
@@ -221,6 +289,7 @@ class SpottyAudioStreamer:
         buf_offset = range_begin - downloader.start_byte
 
         try:
+            self._prime_startup_real_pcm(downloader, range_begin, wav_header, track_length)
             while bytes_sent < range_len and not self.__terminated:
                 target_bytes_in_buf = buf_offset + bytes_sent + 1
                 downloader.wait_for_bytes(target_bytes_in_buf, timeout=1.0)
