@@ -57,6 +57,16 @@ class ImmediateThread:
         self.target(*self.args)
 
 
+class FailingThread:
+    def __init__(self, target, args=(), daemon=False):
+        self.target = target
+        self.args = args
+        self.daemon = daemon
+
+    def start(self):
+        raise RuntimeError("can't start new thread")
+
+
 class FakeDownloader:
     def __init__(self, error=False, aborted=False):
         self.cond = threading.Condition()
@@ -216,6 +226,16 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
 
         win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
         self.assertEqual("4.5", win.getProperty(main_service.PREBUFFER_RELEASE_DELAY_PROP))
+
+    def test_track_started_keeps_core_state_when_worker_thread_cannot_start(self):
+        main_service = import_main_service({})
+        main_service.threading.Thread = FailingThread
+        service = object.__new__(main_service.MainService)
+
+        service._MainService__on_track_started("track-1", 180)
+
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        self.assertEqual("track-1", win.getProperty("Spotify.CurrentTrackId"))
 
 
 if __name__ == "__main__":
