@@ -368,6 +368,32 @@ class DynamicDaylistSpotify(FakeSpotify):
         }
 
 
+class CategoryPlaylistsSpotify(DynamicDaylistSpotify):
+    def category(self, category_id, country=None, locale=None):
+        return {"id": category_id, "name": "Made For You"}
+
+    def category_playlists(self, category_id, country=None, limit=50, offset=0):
+        return {
+            "playlists": {
+                "total": 2,
+                "items": [spotify_daylist(), spotify_playlist(2)],
+            }
+        }
+
+
+class FeaturedPlaylistsSpotify(FakeSpotify):
+    def featured_playlists(self, country=None, limit=50, offset=0):
+        return {
+            "message": "Featured playlists",
+            "playlists": {"total": 1, "items": [spotify_playlist(1)]},
+        }
+
+
+class UserPlaylistsSpotify(FakeSpotify):
+    def user_playlists(self, userid, limit=50, offset=0):
+        return {"total": 1, "items": [spotify_playlist(1, owner_id=userid)]}
+
+
 class ChecksumSpotify(FakeSpotify):
     def __init__(self, events, saved_track_total=3, saved_album_total=5, followed_total=7):
         super().__init__(events, total=1)
@@ -573,6 +599,51 @@ class PlaylistFastPathTests(unittest.TestCase):
             [("37i9dQZF1EP6YuccBxUcC1", "tracks(total),name,owner(id),id,snapshot_id", "US")],
             spotify.playlist_detail_requests,
         )
+
+    def test_browse_category_uses_category_sublabel_for_all_playlists(self):
+        events = RecordingPlayer.events
+        spotify = CategoryPlaylistsSpotify(events, total=1)
+        content = self.build_content(spotify)
+        content._PluginContent__filter = "made-for-you"
+        rendered = []
+        self.plugin_content.xbmcplugin.addDirectoryItem = (
+            lambda handle, url, listitem, isFolder: rendered.append((url, listitem, isFolder))
+        )
+
+        content.browse_category()
+
+        self.assertEqual(
+            ["synthpop saturday morning", "Playlist 2"], [item[1].label for item in rendered]
+        )
+        self.assertEqual(["Made For You", "Made For You"], [item[1].label2 for item in rendered])
+
+    def test_browse_featured_playlists_uses_featured_message_sublabel(self):
+        events = RecordingPlayer.events
+        spotify = FeaturedPlaylistsSpotify(events, total=1)
+        content = self.build_content(spotify)
+        content._PluginContent__filter = "featured"
+        rendered = []
+        self.plugin_content.xbmcplugin.addDirectoryItem = (
+            lambda handle, url, listitem, isFolder: rendered.append((url, listitem, isFolder))
+        )
+
+        content.browse_playlists()
+
+        self.assertEqual(["Featured playlists"], [item[1].label2 for item in rendered])
+
+    def test_browse_user_playlists_uses_playlists_sublabel(self):
+        events = RecordingPlayer.events
+        spotify = UserPlaylistsSpotify(events, total=1)
+        content = self.build_content(spotify)
+        content._PluginContent__owner_id = "user"
+        rendered = []
+        self.plugin_content.xbmcplugin.addDirectoryItem = (
+            lambda handle, url, listitem, isFolder: rendered.append((url, listitem, isFolder))
+        )
+
+        content.browse_playlists()
+
+        self.assertEqual(["kodi-136"], [item[1].label2 for item in rendered])
 
     def test_add_playlists_refreshes_cached_daylist_metadata_before_rendering(self):
         events = RecordingPlayer.events

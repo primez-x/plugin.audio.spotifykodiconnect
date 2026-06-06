@@ -1238,6 +1238,7 @@ class PluginContent:
         container: Dict[str, Any],
         fetch_page: Callable[[int], List[Dict[str, Any]]],
         target_url: str,
+        group_label: str = "",
     ) -> None:
         collection = container["playlists"]
         total = int(collection.get("total") or 0)
@@ -1257,7 +1258,7 @@ class PluginContent:
                 raw_items = fetch_page(offset)
                 if not raw_items:
                     break
-                all_items += self.__prepare_playlist_listitems(raw_items)
+                all_items += self.__prepare_playlist_listitems(raw_items, group_label=group_label)
                 offset += len(raw_items)
                 collection["items"] = all_items
                 self.__mark_dynamic_collection_state(collection, offset, total, total <= offset)
@@ -1485,12 +1486,13 @@ class PluginContent:
                     offset=offset,
                 )["playlists"]["items"],
                 self.__current_request_url(),
+                group_label=playlists["category"],
             )
             return cached
 
         loaded = len(playlists["playlists"]["items"])
         playlists["playlists"]["items"] = self.__prepare_playlist_listitems(
-            playlists["playlists"]["items"]
+            playlists["playlists"]["items"], group_label=playlists["category"]
         )
         self.__mark_dynamic_collection_state(playlists["playlists"], loaded, total, total <= loaded)
         self.cache.set(cache_str, playlists, checksum=checksum)
@@ -1505,6 +1507,7 @@ class PluginContent:
                 offset=offset,
             )["playlists"]["items"],
             self.__current_request_url(),
+            group_label=playlists["category"],
         )
 
         return playlists
@@ -1512,7 +1515,9 @@ class PluginContent:
     def browse_category(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "files")
         playlists = self.__get_category(self.__filter)
-        self.__add_playlist_listitems(playlists["playlists"]["items"])
+        self.__add_playlist_listitems(
+            playlists["playlists"]["items"], group_label=playlists["category"]
+        )
         xbmcplugin.setProperty(self.__addon_handle, "FolderName", playlists["category"])
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
@@ -1620,12 +1625,13 @@ class PluginContent:
                     offset=offset,
                 )["playlists"]["items"],
                 self.__current_request_url(),
+                group_label=playlists["message"],
             )
             return cached
 
         loaded = len(playlists["playlists"]["items"])
         playlists["playlists"]["items"] = self.__prepare_playlist_listitems(
-            playlists["playlists"]["items"]
+            playlists["playlists"]["items"], group_label=playlists["message"]
         )
         self.__mark_dynamic_collection_state(playlists["playlists"], loaded, total, total <= loaded)
         self.cache.set(cache_str, playlists, checksum=checksum)
@@ -1639,6 +1645,7 @@ class PluginContent:
                 offset=offset,
             )["playlists"]["items"],
             self.__current_request_url(),
+            group_label=playlists["message"],
         )
 
         return playlists
@@ -1662,7 +1669,9 @@ class PluginContent:
             return cached_playlists
 
         loaded = len(playlists["items"])
-        result = self.__prepare_playlist_listitems(playlists["items"])
+        result = self.__prepare_playlist_listitems(
+            playlists["items"], group_label=xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID)
+        )
         payload = {
             "items": result,
             "total": total,
@@ -1697,7 +1706,9 @@ class PluginContent:
                 )["items"]
                 if not page:
                     break
-                all_items += self.__prepare_playlist_listitems(page)
+                all_items += self.__prepare_playlist_listitems(
+                    page, group_label=xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID)
+                )
                 offset += len(page)
                 payload["items"] = all_items
                 payload[DYNAMIC_PAGING_LOADED_KEY] = offset
@@ -1721,18 +1732,20 @@ class PluginContent:
     def browse_playlists(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "files")
         if self.__filter == "featured":
-            playlists = self.__get_featured_playlists()
-            xbmcplugin.setProperty(self.__addon_handle, "FolderName", playlists["message"])
-            playlists = playlists["playlists"]["items"]
+            playlist_container = self.__get_featured_playlists()
+            group_label = playlist_container["message"]
+            xbmcplugin.setProperty(self.__addon_handle, "FolderName", group_label)
+            playlists = playlist_container["playlists"]["items"]
         else:
+            group_label = xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID)
             xbmcplugin.setProperty(
                 self.__addon_handle,
                 "FolderName",
-                xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID),
+                group_label,
             )
             playlists = self.__get_user_playlists(self.__owner_id)
 
-        self.__add_playlist_listitems(playlists)
+        self.__add_playlist_listitems(playlists, group_label=group_label)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
@@ -2328,7 +2341,9 @@ class PluginContent:
                 totalItems=len(artists),
             )
 
-    def __prepare_playlist_listitems(self, playlists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def __prepare_playlist_listitems(
+        self, playlists: List[Dict[str, Any]], group_label: str = ""
+    ) -> List[Dict[str, Any]]:
         playlists2 = []
         followed_playlists = self.__get_followed_playlist_ids_for_page(playlists)
 
@@ -2341,6 +2356,8 @@ class PluginContent:
             else:
                 playlist["thumb"] = "DefaultMusicAlbums.png"
 
+            if group_label:
+                playlist["label2"] = group_label
             self.__apply_daylist_metadata(playlist)
 
             playlist["url"] = self.__build_url(
@@ -2363,7 +2380,8 @@ class PluginContent:
         if not _is_spotify_daylist_playlist(playlist):
             return
 
-        playlist["label2"] = DAYLIST_LABEL
+        if not playlist.get("label2"):
+            playlist["label2"] = DAYLIST_LABEL
         title_bucket = _daylist_title_bucket()
         if playlist.get(DAYLIST_TITLE_BUCKET_KEY) == title_bucket:
             return
@@ -2422,10 +2440,14 @@ class PluginContent:
         )
         return contextitems
 
-    def __add_playlist_listitems(self, playlists: List[Dict[str, Any]]) -> None:
+    def __add_playlist_listitems(
+        self, playlists: List[Dict[str, Any]], group_label: str = ""
+    ) -> None:
         default_playlist_icon = os.path.join(self.__addon_icon_path, MUSIC_PLAYLISTS_ICON)
         addon_fanart = os.path.join(self.__addon_icon_path, "fanart.jpg")
         for item in playlists:
+            if group_label:
+                item["label2"] = group_label
             self.__apply_daylist_metadata(item)
             li = xbmcgui.ListItem(item["name"], path=item["url"], offscreen=True)
             li.setProperty("do_not_analyze", "true")
