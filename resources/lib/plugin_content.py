@@ -51,12 +51,15 @@ PRECACHE_NAVIGATION_TOKEN_PROP = "Spotify.PreCacheNavigationToken"
 PRECACHE_MAX_PLAYLISTS = 10
 PRECACHE_MAX_PLAYLIST_TRACKS = 250
 PRECACHE_MAX_LIBRARY_ITEMS = 250
+DAYLIST_LABEL = "daylist"
+DAYLIST_TITLE_BUCKET_SECONDS = 300
+DAYLIST_TITLE_BUCKET_KEY = "_daylist_title_bucket"
 
 # Bump this when the cached data structure changes (e.g. new fields pulled
 # from the Spotify API, different track/album/artist dict shapes, serialisation
 # format changes).  Any value different from what is already stored will
 # automatically invalidate every cached entry.
-CACHE_SCHEMA_VERSION = "2"
+CACHE_SCHEMA_VERSION = "3"
 
 Playlist = Dict[str, Union[str, Dict[str, List[Any]]]]
 
@@ -113,6 +116,39 @@ def _art_for_track(
     if artist_fanart and base:
         base["artist.fanart"] = artist_fanart
     return base
+
+
+def _is_spotify_daylist_playlist(playlist: Dict[str, Any]) -> bool:
+    owner_id = (playlist.get("owner") or {}).get("id")
+    if owner_id != "spotify":
+        return False
+
+    name = (playlist.get("name") or "").strip().lower()
+    description = (playlist.get("description") or "").strip().lower()
+    images = playlist.get("images") or []
+    image_url = ""
+    if images and isinstance(images[0], dict):
+        image_url = (images[0].get("url") or "").lower()
+
+    return (
+        name == DAYLIST_LABEL
+        or name.startswith(f"{DAYLIST_LABEL} - ")
+        or description == "your day in a playlist."
+        or "daylist.spotifycdn.com" in image_url
+    )
+
+
+def _daylist_display_name(playlist_name: str) -> str:
+    name = (playlist_name or "").strip()
+    lower = name.lower()
+    prefix = f"{DAYLIST_LABEL} - "
+    if lower.startswith(prefix):
+        return name[len(prefix) :].strip() or name
+    return name
+
+
+def _daylist_title_bucket() -> str:
+    return str(int(time.time() // DAYLIST_TITLE_BUCKET_SECONDS))
 
 
 class PluginContent:
@@ -2305,6 +2341,8 @@ class PluginContent:
             else:
                 playlist["thumb"] = "DefaultMusicAlbums.png"
 
+            self.__apply_daylist_metadata(playlist)
+
             playlist["url"] = self.__build_url(
                 {
                     "action": self.browse_playlist.__name__,
@@ -2320,6 +2358,30 @@ class PluginContent:
             playlists2.append(playlist)
 
         return playlists2
+
+    def __apply_daylist_metadata(self, playlist: Dict[str, Any]) -> None:
+        if not _is_spotify_daylist_playlist(playlist):
+            return
+
+        playlist["label2"] = DAYLIST_LABEL
+        title_bucket = _daylist_title_bucket()
+        if playlist.get(DAYLIST_TITLE_BUCKET_KEY) == title_bucket:
+            return
+        playlist[DAYLIST_TITLE_BUCKET_KEY] = title_bucket
+
+        playlist_id = playlist.get("id")
+        if not playlist_id:
+            return
+
+        try:
+            playlist_summary = self.__get_playlist_summary(playlist_id)
+        except Exception as exc:
+            log_exception(exc, "daylist playlist title lookup")
+            return
+
+        display_name = _daylist_display_name(playlist_summary.get("name") or "")
+        if display_name and display_name.lower() != DAYLIST_LABEL:
+            playlist["name"] = display_name
 
     def __get_playlist_context_menu_items(
         self, playlist, followed_playlists: List[str]
@@ -2364,9 +2426,11 @@ class PluginContent:
         default_playlist_icon = os.path.join(self.__addon_icon_path, MUSIC_PLAYLISTS_ICON)
         addon_fanart = os.path.join(self.__addon_icon_path, "fanart.jpg")
         for item in playlists:
+            self.__apply_daylist_metadata(item)
             li = xbmcgui.ListItem(item["name"], path=item["url"], offscreen=True)
             li.setProperty("do_not_analyze", "true")
             li.setProperty("IsPlayable", "false")
+            li.setLabel2(item.get("label2") or "")
             li.addContextMenuItems(item.get("contextitems") or [], True)
             art = _art_for_item(item.get("thumb") or "", default_playlist_icon)
             art["fanart"] = art.get("fanart") or addon_fanart
