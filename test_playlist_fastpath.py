@@ -55,6 +55,9 @@ class FakeListItem:
     def setProperty(self, key, value):
         self.properties[key] = value
 
+    def setLabel2(self, label):
+        self.label2 = label
+
     def setArt(self, art):
         self.art = art
 
@@ -234,8 +237,10 @@ class FakeSpotify:
         self.following_artist_requests = []
         self.playlist_follow_requests = []
         self.track_detail_requests = []
+        self.playlist_detail_requests = []
 
     def playlist(self, playlist_id, fields="", market=None):
+        self.playlist_detail_requests.append((playlist_id, fields, market))
         return {
             "id": playlist_id,
             "name": "Fast Playlist",
@@ -342,6 +347,27 @@ def spotify_playlist(index, owner_id="other-user"):
     }
 
 
+def spotify_daylist():
+    return {
+        "id": "37i9dQZF1EP6YuccBxUcC1",
+        "name": "daylist",
+        "images": [],
+        "owner": {"id": "spotify"},
+    }
+
+
+class DynamicDaylistSpotify(FakeSpotify):
+    def playlist(self, playlist_id, fields="", market=None):
+        self.playlist_detail_requests.append((playlist_id, fields, market))
+        return {
+            "id": playlist_id,
+            "name": "daylist - synthpop saturday morning",
+            "owner": {"id": "spotify"},
+            "snapshot_id": "snapshot-daylist",
+            "tracks": {"total": 50},
+        }
+
+
 class ChecksumSpotify(FakeSpotify):
     def __init__(self, events, saved_track_total=3, saved_album_total=5, followed_total=7):
         super().__init__(events, total=1)
@@ -426,6 +452,7 @@ class PlaylistFastPathTests(unittest.TestCase):
         content._PluginContent__base_url = "plugin://plugin.audio.spotifykodiconnect"
         content._PluginContent__params = {}
         content._PluginContent__cached_checksum = ""
+        content._PluginContent__addon_icon_path = "icons"
         return content
 
     def test_play_playlist_starts_after_first_page_before_fetching_remaining_pages(self):
@@ -533,6 +560,39 @@ class PlaylistFastPathTests(unittest.TestCase):
 
         self.assertEqual([("playlist-1", ("user",))], spotify.playlist_follow_requests)
 
+    def test_prepare_daylist_uses_dynamic_title_and_daylist_subtitle(self):
+        events = RecordingPlayer.events
+        spotify = DynamicDaylistSpotify(events, total=1)
+        content = self.build_content(spotify)
+
+        playlists = content._PluginContent__prepare_playlist_listitems([spotify_daylist()])
+
+        self.assertEqual("synthpop saturday morning", playlists[0]["name"])
+        self.assertEqual("daylist", playlists[0]["label2"])
+        self.assertEqual(
+            [("37i9dQZF1EP6YuccBxUcC1", "tracks(total),name,owner(id),id,snapshot_id", "US")],
+            spotify.playlist_detail_requests,
+        )
+
+    def test_add_playlists_refreshes_cached_daylist_metadata_before_rendering(self):
+        events = RecordingPlayer.events
+        spotify = DynamicDaylistSpotify(events, total=1)
+        content = self.build_content(spotify)
+        rendered = []
+        self.plugin_content.xbmcplugin.addDirectoryItem = (
+            lambda handle, url, listitem, isFolder: rendered.append((url, listitem, isFolder))
+        )
+        cached_daylist = spotify_daylist()
+        cached_daylist["name"] = "yesterday afternoon"
+        cached_daylist["description"] = "Your day in a playlist."
+        cached_daylist["url"] = "plugin://plugin.audio.spotifykodiconnect/?action=browse_playlist"
+
+        content._PluginContent__add_playlist_listitems([cached_daylist])
+
+        self.assertEqual(1, len(rendered))
+        self.assertEqual("synthpop saturday morning", rendered[0][1].label)
+        self.assertEqual("daylist", rendered[0][1].label2)
+
     def test_artist_fanart_fetch_logs_exception_with_exception_first(self):
         events = RecordingPlayer.events
         spotify = FailingFanartSpotify(events, total=1)
@@ -596,7 +656,7 @@ class PlaylistFastPathTests(unittest.TestCase):
 
         checksum = content._PluginContent__cache_checksum()
 
-        self.assertEqual("v2-3-5-7-", checksum)
+        self.assertEqual("v3-3-5-7-", checksum)
         self.assertEqual([(1, 0, "US")], spotify.saved_track_requests)
         self.assertEqual([(1, 0)], spotify.saved_album_requests)
         self.assertEqual([(1, None)], spotify.followed_artist_requests)
@@ -609,8 +669,8 @@ class PlaylistFastPathTests(unittest.TestCase):
         first = content._PluginContent__cache_checksum("playlist-snapshot")
         second = content._PluginContent__cache_checksum("artist-albums")
 
-        self.assertEqual("v2-3-5-7--playlist-snapshot", first)
-        self.assertEqual("v2-3-5-7--artist-albums", second)
+        self.assertEqual("v3-3-5-7--playlist-snapshot", first)
+        self.assertEqual("v3-3-5-7--artist-albums", second)
         self.assertEqual(1, spotify.saved_track_calls)
         self.assertEqual(1, spotify.saved_album_calls)
         self.assertEqual(1, spotify.followed_artist_calls)
