@@ -143,6 +143,7 @@ def install_kodi_stubs():
     xbmc.Player = RecordingPlayer
     xbmc.sleep = lambda millis: None
     xbmc.getLocalizedString = lambda string_id: f"kodi-{string_id}"
+    xbmc.getInfoLabel = lambda label: ""
     xbmc.executebuiltin = lambda command: None
     xbmc.log = lambda message, level=0: None
     sys.modules["xbmc"] = xbmc
@@ -238,6 +239,12 @@ class FakeSpotify:
         self.playlist_follow_requests = []
         self.track_detail_requests = []
         self.playlist_detail_requests = []
+        self.category_requests = []
+        self.category_playlist_requests = []
+        self.featured_playlist_requests = []
+        self.user_playlist_requests = []
+        self.new_release_requests = []
+        self.album_detail_requests = []
 
     def playlist(self, playlist_id, fields="", market=None):
         self.playlist_detail_requests.append((playlist_id, fields, market))
@@ -293,6 +300,10 @@ class FakeSpotify:
     def playlist_is_following(self, playlist_id, user_ids):
         self.playlist_follow_requests.append((playlist_id, tuple(user_ids)))
         return [False]
+
+    def albums(self, album_ids, market=None):
+        self.album_detail_requests.append((tuple(album_ids), market))
+        return {"albums": [spotify_album(str(album_id).split("-")[-1]) for album_id in album_ids]}
 
 
 class FanartSpotify(FakeSpotify):
@@ -370,9 +381,11 @@ class DynamicDaylistSpotify(FakeSpotify):
 
 class CategoryPlaylistsSpotify(DynamicDaylistSpotify):
     def category(self, category_id, country=None, locale=None):
+        self.category_requests.append((category_id, country, locale))
         return {"id": category_id, "name": "Made For You"}
 
     def category_playlists(self, category_id, country=None, limit=50, offset=0):
+        self.category_playlist_requests.append((category_id, country, limit, offset))
         return {
             "playlists": {
                 "total": 2,
@@ -383,6 +396,7 @@ class CategoryPlaylistsSpotify(DynamicDaylistSpotify):
 
 class FeaturedPlaylistsSpotify(FakeSpotify):
     def featured_playlists(self, country=None, limit=50, offset=0):
+        self.featured_playlist_requests.append((country, limit, offset))
         return {
             "message": "Featured playlists",
             "playlists": {"total": 1, "items": [spotify_playlist(1)]},
@@ -404,7 +418,14 @@ class FailingCategoryPlaylistsSpotify(DynamicDaylistSpotify):
 
 class UserPlaylistsSpotify(FakeSpotify):
     def user_playlists(self, userid, limit=50, offset=0):
+        self.user_playlist_requests.append((userid, limit, offset))
         return {"total": 1, "items": [spotify_playlist(1, owner_id=userid)]}
+
+
+class NewReleasesSpotify(FakeSpotify):
+    def new_releases(self, country=None, limit=50, offset=0):
+        self.new_release_requests.append((country, limit, offset))
+        return {"albums": {"total": 1, "items": [spotify_album(1)]}}
 
 
 class ChecksumSpotify(FakeSpotify):
@@ -588,16 +609,34 @@ class PlaylistFastPathTests(unittest.TestCase):
         self.assertEqual(0, spotify.saved_album_calls)
         self.assertEqual([("album-1", "album-2")], spotify.saved_album_contains_requests)
 
-    def test_prepare_playlists_uses_page_local_follow_checks(self):
+    def test_prepare_playlists_does_not_block_on_follow_lookups(self):
         events = RecordingPlayer.events
         spotify = FakeSpotify(events, total=1)
         content = self.build_content(spotify)
 
-        content._PluginContent__prepare_playlist_listitems(
+        playlists = content._PluginContent__prepare_playlist_listitems(
             [spotify_playlist(1), spotify_playlist(2, owner_id="user")]
         )
 
-        self.assertEqual([("playlist-1", ("user",))], spotify.playlist_follow_requests)
+        self.assertEqual([], spotify.playlist_follow_requests)
+        self.assertTrue(
+            any("follow_playlist" in command for _label, command in playlists[0]["contextitems"])
+        )
+
+    def test_prepare_user_playlists_infers_external_items_are_followed_without_lookup(self):
+        events = RecordingPlayer.events
+        spotify = FakeSpotify(events, total=1)
+        content = self.build_content(spotify)
+
+        playlists = content._PluginContent__prepare_playlist_listitems(
+            [spotify_playlist(1), spotify_playlist(2, owner_id="user")],
+            relation_mode="user_collection",
+        )
+
+        self.assertEqual([], spotify.playlist_follow_requests)
+        self.assertTrue(
+            any("unfollow_playlist" in command for _label, command in playlists[0]["contextitems"])
+        )
 
     def test_prepare_daylist_uses_dynamic_title_and_daylist_subtitle(self):
         events = RecordingPlayer.events
@@ -732,6 +771,164 @@ class PlaylistFastPathTests(unittest.TestCase):
 
         self.assertEqual(["kodi-136"], [item[1].label2 for item in rendered])
 
+    def test_browse_user_playlists_uses_route_cache_before_spotify_lookup(self):
+        events = RecordingPlayer.events
+        spotify = UserPlaylistsSpotify(events, total=1)
+        content = self.build_content(spotify)
+        content._PluginContent__owner_id = "user"
+        cached_playlist = spotify_playlist(1, owner_id="user")
+        cached_playlist.update(
+            {
+                "label2": "kodi-136",
+                "thumb": "DefaultMusicAlbums.png",
+                "url": "plugin://plugin.audio.spotifykodiconnect/?action=browse_playlist",
+                "contextitems": [],
+            }
+        )
+        content.cache.set(
+            "spotify.userplaylists.user",
+            {
+                "items": [cached_playlist],
+                "total": 1,
+                self.plugin_content.DYNAMIC_PAGING_LOADED_KEY: 1,
+                self.plugin_content.DYNAMIC_PAGING_COMPLETE_KEY: True,
+            },
+            checksum=content._PluginContent__user_playlists_checksum("user"),
+        )
+        rendered = []
+        self.plugin_content.xbmcplugin.addDirectoryItem = (
+            lambda handle, url, listitem, isFolder: rendered.append((url, listitem, isFolder))
+        )
+
+        content.browse_playlists()
+
+        self.assertEqual([], spotify.user_playlist_requests)
+        self.assertEqual(["Playlist 1"], [item[1].label for item in rendered])
+
+    def test_browse_user_playlists_does_not_use_library_checksum_totals(self):
+        events = RecordingPlayer.events
+        spotify = UserPlaylistsSpotify(events, total=1)
+        content = self.build_content(spotify)
+        content._PluginContent__owner_id = "user"
+
+        content.browse_playlists()
+
+        self.assertEqual(
+            [("user", self.plugin_content.DYNAMIC_PAGE_LIMIT, 0)], spotify.user_playlist_requests
+        )
+        self.assertEqual(0, spotify.saved_track_calls)
+        self.assertEqual(0, spotify.saved_album_calls)
+        self.assertEqual(0, spotify.followed_artist_calls)
+
+    def test_browse_category_uses_current_cache_before_spotify_lookup(self):
+        events = RecordingPlayer.events
+        spotify = CategoryPlaylistsSpotify(events, total=1)
+        content = self.build_content(spotify)
+        content._PluginContent__filter = "made-for-you"
+        cached_playlist = spotify_playlist(1)
+        cached_playlist.update(
+            {
+                "label2": "Made For You",
+                "thumb": "DefaultMusicAlbums.png",
+                "url": "plugin://plugin.audio.spotifykodiconnect/?action=browse_playlist",
+                "contextitems": [],
+            }
+        )
+        content.cache.set(
+            "spotify.categoryplaylists.made-for-you",
+            {
+                "category": "Made For You",
+                "playlists": {
+                    "total": 1,
+                    "items": [cached_playlist],
+                    self.plugin_content.DYNAMIC_PAGING_LOADED_KEY: 1,
+                    self.plugin_content.DYNAMIC_PAGING_COMPLETE_KEY: True,
+                },
+            },
+            checksum=content._PluginContent__playlist_collection_checksum(
+                "category", "made-for-you"
+            ),
+        )
+        rendered = []
+        self.plugin_content.xbmcplugin.addDirectoryItem = (
+            lambda handle, url, listitem, isFolder: rendered.append((url, listitem, isFolder))
+        )
+
+        content.browse_category()
+
+        self.assertEqual([], spotify.category_requests)
+        self.assertEqual([], spotify.category_playlist_requests)
+        self.assertEqual(["Playlist 1"], [item[1].label for item in rendered])
+
+    def test_browse_featured_uses_current_cache_before_spotify_lookup(self):
+        events = RecordingPlayer.events
+        spotify = FeaturedPlaylistsSpotify(events, total=1)
+        content = self.build_content(spotify)
+        content._PluginContent__filter = "featured"
+        cached_playlist = spotify_playlist(1)
+        cached_playlist.update(
+            {
+                "label2": "Featured playlists",
+                "thumb": "DefaultMusicAlbums.png",
+                "url": "plugin://plugin.audio.spotifykodiconnect/?action=browse_playlist",
+                "contextitems": [],
+            }
+        )
+        content.cache.set(
+            "spotify.featuredplaylists",
+            {
+                "message": "Featured playlists",
+                "playlists": {
+                    "total": 1,
+                    "items": [cached_playlist],
+                    self.plugin_content.DYNAMIC_PAGING_LOADED_KEY: 1,
+                    self.plugin_content.DYNAMIC_PAGING_COMPLETE_KEY: True,
+                },
+            },
+            checksum=content._PluginContent__playlist_collection_checksum("featured", "US"),
+        )
+        rendered = []
+        self.plugin_content.xbmcplugin.addDirectoryItem = (
+            lambda handle, url, listitem, isFolder: rendered.append((url, listitem, isFolder))
+        )
+
+        content.browse_playlists()
+
+        self.assertEqual([], spotify.featured_playlist_requests)
+        self.assertEqual(["Playlist 1"], [item[1].label for item in rendered])
+
+    def test_browse_new_releases_uses_release_page_without_album_detail_hydration(self):
+        events = RecordingPlayer.events
+        spotify = NewReleasesSpotify(events, total=1)
+        content = self.build_content(spotify)
+        rendered = []
+        self.plugin_content.xbmcplugin.addDirectoryItem = (
+            lambda handle, url, listitem, isFolder: rendered.append((url, listitem, isFolder))
+        )
+
+        content.browse_new_releases()
+
+        self.assertEqual(
+            [("US", self.plugin_content.DYNAMIC_PAGE_LIMIT, 0)], spotify.new_release_requests
+        )
+        self.assertEqual([], spotify.album_detail_requests)
+        self.assertEqual(["Album 1"], [item[1].label for item in rendered])
+
+    def test_dynamic_refresh_skips_when_active_folder_is_unknown(self):
+        events = RecordingPlayer.events
+        spotify = FakeSpotify(events, total=1)
+        content = self.build_content(spotify)
+        commands = []
+
+        self.plugin_content.xbmc.getInfoLabel = lambda label: ""
+        self.plugin_content.xbmc.executebuiltin = lambda command: commands.append(command)
+
+        content._PluginContent__refresh_active_listing(
+            "plugin://plugin.audio.spotifykodiconnect/?action=browse_playlists"
+        )
+
+        self.assertEqual([], commands)
+
     def test_add_playlists_refreshes_cached_daylist_metadata_before_rendering(self):
         events = RecordingPlayer.events
         spotify = DynamicDaylistSpotify(events, total=1)
@@ -839,7 +1036,7 @@ class PlaylistFastPathTests(unittest.TestCase):
 
         checksum = content._PluginContent__cache_checksum()
 
-        self.assertEqual("v3-3-5-7-", checksum)
+        self.assertEqual("v4-3-5-7-", checksum)
         self.assertEqual([(1, 0, "US")], spotify.saved_track_requests)
         self.assertEqual([(1, 0)], spotify.saved_album_requests)
         self.assertEqual([(1, None)], spotify.followed_artist_requests)
@@ -852,8 +1049,8 @@ class PlaylistFastPathTests(unittest.TestCase):
         first = content._PluginContent__cache_checksum("playlist-snapshot")
         second = content._PluginContent__cache_checksum("artist-albums")
 
-        self.assertEqual("v3-3-5-7--playlist-snapshot", first)
-        self.assertEqual("v3-3-5-7--artist-albums", second)
+        self.assertEqual("v4-3-5-7--playlist-snapshot", first)
+        self.assertEqual("v4-3-5-7--artist-albums", second)
         self.assertEqual(1, spotify.saved_track_calls)
         self.assertEqual(1, spotify.saved_album_calls)
         self.assertEqual(1, spotify.followed_artist_calls)

@@ -46,6 +46,12 @@ DYNAMIC_PAGE_LIMIT = 50
 DYNAMIC_PAGING_COMPLETE_KEY = "_dynamic_paging_complete"
 DYNAMIC_PAGING_LOADED_KEY = "_dynamic_paging_loaded"
 DYNAMIC_PAGING_BUSY_PREFIX = "Spotify.DynamicPaging."
+PLAYLIST_COLLECTION_CACHE_BUCKET_SECONDS = 900
+PLAYLIST_COLLECTION_CACHE_EXPIRATION = datetime.timedelta(
+    seconds=PLAYLIST_COLLECTION_CACHE_BUCKET_SECONDS
+)
+USER_PLAYLIST_CACHE_BUCKET_SECONDS = 300
+USER_PLAYLIST_CACHE_EXPIRATION = datetime.timedelta(seconds=USER_PLAYLIST_CACHE_BUCKET_SECONDS)
 RELATION_CACHE_EXPIRATION = datetime.timedelta(minutes=5)
 PRECACHE_NAVIGATION_TOKEN_PROP = "Spotify.PreCacheNavigationToken"
 PRECACHE_MAX_PLAYLISTS = 10
@@ -59,7 +65,7 @@ DAYLIST_TITLE_BUCKET_KEY = "_daylist_title_bucket"
 # from the Spotify API, different track/album/artist dict shapes, serialisation
 # format changes).  Any value different from what is already stored will
 # automatically invalidate every cached entry.
-CACHE_SCHEMA_VERSION = "3"
+CACHE_SCHEMA_VERSION = "4"
 
 Playlist = Dict[str, Union[str, Dict[str, List[Any]]]]
 
@@ -444,6 +450,28 @@ class PluginContent:
 
         return result
 
+    def __paged_collection_checksum(
+        self,
+        namespace: str,
+        *parts: Any,
+        bucket_seconds: int = PLAYLIST_COLLECTION_CACHE_BUCKET_SECONDS,
+    ) -> str:
+        bucket = int(time.time() // bucket_seconds)
+        suffix = "-".join(str(part) for part in parts if part is not None and part != "")
+        if suffix:
+            suffix = f"-{suffix}"
+        return f"v{CACHE_SCHEMA_VERSION}-{namespace}{suffix}-{bucket}"
+
+    def __playlist_collection_checksum(self, *parts: Any) -> str:
+        return self.__paged_collection_checksum("playlistcollection", *parts)
+
+    def __user_playlists_checksum(self, userid: str) -> str:
+        return self.__paged_collection_checksum(
+            "userplaylists",
+            userid,
+            bucket_seconds=USER_PLAYLIST_CACHE_BUCKET_SECONDS,
+        )
+
     def __build_url(self, query: Dict[str, str]) -> str:
         return (
             self.__base_url
@@ -465,7 +493,10 @@ class PluginContent:
             current_url = ""
             if callable(get_info_label):
                 current_url = get_info_label("Container.FolderPath") or ""
-            if current_url and target_url and current_url != target_url:
+            if not current_url:
+                cache_log(f"Skipping dynamic refresh for {target_url}; active folder is unknown.")
+                return
+            if target_url and current_url != target_url:
                 cache_log(
                     f"Skipping dynamic refresh for {target_url}; active folder is {current_url}."
                 )
@@ -566,8 +597,10 @@ class PluginContent:
             "followedartist", artist_ids, self.__spotipy.current_user_following_artists
         )
 
-    def __get_followed_playlist_ids_for_page(self, playlists: List[Dict[str, Any]]) -> Set[str]:
-        followed: Set[str] = set()
+    def __get_followed_playlist_states_for_page(
+        self, playlists: List[Dict[str, Any]], relation_mode: str = "cache"
+    ) -> Dict[str, Optional[bool]]:
+        states: Dict[str, Optional[bool]] = {}
         for playlist in playlists:
             if not playlist or not playlist.get("id"):
                 continue
@@ -579,9 +612,17 @@ class PluginContent:
                 checksum=CACHE_SCHEMA_VERSION,
             )
             if cached == "1":
-                followed.add(playlist_id)
+                states[playlist_id] = True
                 continue
             if cached == "0":
+                states[playlist_id] = False
+                continue
+            if relation_mode == "user_collection":
+                states[playlist_id] = True
+                self.__set_relation_cache("followedplaylist", playlist_id, True)
+                continue
+            if relation_mode != "lookup":
+                states[playlist_id] = None
                 continue
             try:
                 state = self.__spotipy.playlist_is_following(playlist_id, [self.__userid])
@@ -589,10 +630,13 @@ class PluginContent:
             except Exception as exc:
                 log_exception(exc, "playlist follow relation lookup")
                 is_followed = False
-            if is_followed:
-                followed.add(playlist_id)
+            states[playlist_id] = is_followed
             self.__set_relation_cache("followedplaylist", playlist_id, is_followed)
-        return followed
+        return states
+
+    def __get_followed_playlist_ids_for_page(self, playlists: List[Dict[str, Any]]) -> Set[str]:
+        states = self.__get_followed_playlist_states_for_page(playlists, relation_mode="lookup")
+        return {playlist_id for playlist_id, is_followed in states.items() if is_followed}
 
     def delete_cache_db(self) -> None:
         log_msg("Deleting plugin cache...")
@@ -1244,6 +1288,7 @@ class PluginContent:
         fetch_page: Callable[[int], List[Dict[str, Any]]],
         target_url: str,
         group_label: str = "",
+        relation_mode: str = "cache",
     ) -> None:
         collection = container["playlists"]
         total = int(collection.get("total") or 0)
@@ -1263,14 +1308,26 @@ class PluginContent:
                 raw_items = fetch_page(offset)
                 if not raw_items:
                     break
-                all_items += self.__prepare_playlist_listitems(raw_items, group_label=group_label)
+                all_items += self.__prepare_playlist_listitems(
+                    raw_items, group_label=group_label, relation_mode=relation_mode
+                )
                 offset += len(raw_items)
                 collection["items"] = all_items
                 self.__mark_dynamic_collection_state(collection, offset, total, total <= offset)
-                self.cache.set(cache_str, container, checksum=checksum)
+                self.cache.set(
+                    cache_str,
+                    container,
+                    checksum=checksum,
+                    expiration=PLAYLIST_COLLECTION_CACHE_EXPIRATION,
+                )
 
             self.__mark_dynamic_collection_state(collection, offset, total, True)
-            self.cache.set(cache_str, container, checksum=checksum)
+            self.cache.set(
+                cache_str,
+                container,
+                checksum=checksum,
+                expiration=PLAYLIST_COLLECTION_CACHE_EXPIRATION,
+            )
             self.__refresh_active_listing(target_url)
 
         self.__start_dynamic_page_continuation(cache_str, target_url, _continue_playlist_collection)
@@ -1301,15 +1358,24 @@ class PluginContent:
                 raw_items = fetch_page(offset)
                 if not raw_items:
                     break
-                album_ids = [album["id"] for album in raw_items if album and album.get("id")]
-                all_items += self.__prepare_album_listitems(album_ids)
+                all_items += self.__prepare_album_listitems(albums=raw_items)
                 offset += len(raw_items)
                 collection["items"] = all_items
                 self.__mark_dynamic_collection_state(collection, offset, total, total <= offset)
-                self.cache.set(cache_str, container, checksum=checksum)
+                self.cache.set(
+                    cache_str,
+                    container,
+                    checksum=checksum,
+                    expiration=PLAYLIST_COLLECTION_CACHE_EXPIRATION,
+                )
 
             self.__mark_dynamic_collection_state(collection, offset, total, True)
-            self.cache.set(cache_str, container, checksum=checksum)
+            self.cache.set(
+                cache_str,
+                container,
+                checksum=checksum,
+                expiration=PLAYLIST_COLLECTION_CACHE_EXPIRATION,
+            )
             self.__refresh_active_listing(target_url)
 
         self.__start_dynamic_page_continuation(cache_str, target_url, _continue_album_collection)
@@ -1466,6 +1532,24 @@ class PluginContent:
 
     def __get_category(self, categoryid: str) -> Playlist:
         cache_str = f"spotify.categoryplaylists.{categoryid}"
+        checksum = self.__playlist_collection_checksum("category", categoryid)
+        cached = self.cache.get(cache_str, checksum=checksum)
+        if cached and (cached.get("playlists") or {}).get("items"):
+            self.__start_playlist_collection_continuation(
+                cache_str,
+                checksum,
+                cached,
+                lambda offset: self.__spotipy.category_playlists(
+                    categoryid,
+                    country=self.__user_country,
+                    limit=DYNAMIC_PAGE_LIMIT,
+                    offset=offset,
+                )["playlists"]["items"],
+                self.__current_request_url(),
+                group_label=cached.get("category") or "",
+            )
+            return cached
+
         try:
             category = self.__spotipy.category(
                 categoryid, country=self.__user_country, locale=self.__user_country
@@ -1485,30 +1569,17 @@ class PluginContent:
 
         playlists["category"] = category["name"]
         total = playlists["playlists"]["total"]
-        checksum = f"v{CACHE_SCHEMA_VERSION}-{categoryid}-{total}-{int(time.time() // 900)}"
-        cached = self.cache.get(cache_str, checksum=checksum)
-        if cached and (cached.get("playlists") or {}).get("items"):
-            self.__start_playlist_collection_continuation(
-                cache_str,
-                checksum,
-                cached,
-                lambda offset: self.__spotipy.category_playlists(
-                    categoryid,
-                    country=self.__user_country,
-                    limit=DYNAMIC_PAGE_LIMIT,
-                    offset=offset,
-                )["playlists"]["items"],
-                self.__current_request_url(),
-                group_label=playlists["category"],
-            )
-            return cached
-
         loaded = len(playlists["playlists"]["items"])
         playlists["playlists"]["items"] = self.__prepare_playlist_listitems(
             playlists["playlists"]["items"], group_label=playlists["category"]
         )
         self.__mark_dynamic_collection_state(playlists["playlists"], loaded, total, total <= loaded)
-        self.cache.set(cache_str, playlists, checksum=checksum)
+        self.cache.set(
+            cache_str,
+            playlists,
+            checksum=checksum,
+            expiration=PLAYLIST_COLLECTION_CACHE_EXPIRATION,
+        )
         self.__start_playlist_collection_continuation(
             cache_str,
             checksum,
@@ -1619,21 +1690,7 @@ class PluginContent:
 
     def __get_featured_playlists(self) -> Playlist:
         cache_str = "spotify.featuredplaylists"
-        try:
-            playlists = self.__spotipy.featured_playlists(
-                country=self.__user_country, limit=DYNAMIC_PAGE_LIMIT, offset=0
-            )
-        except Exception as exc:
-            cached = self.cache.get(cache_str)
-            if cached and (cached.get("playlists") or {}).get("items"):
-                log_exception(exc, "featured playlists lookup")
-                return cached
-            raise
-
-        total = playlists["playlists"]["total"]
-        checksum = (
-            f"v{CACHE_SCHEMA_VERSION}-{self.__user_country}-{total}-{int(time.time() // 900)}"
-        )
+        checksum = self.__playlist_collection_checksum("featured", self.__user_country)
         cached = self.cache.get(cache_str, checksum=checksum)
         if cached and (cached.get("playlists") or {}).get("items"):
             self.__start_playlist_collection_continuation(
@@ -1646,16 +1703,33 @@ class PluginContent:
                     offset=offset,
                 )["playlists"]["items"],
                 self.__current_request_url(),
-                group_label=playlists["message"],
+                group_label=cached.get("message") or "",
             )
             return cached
 
+        try:
+            playlists = self.__spotipy.featured_playlists(
+                country=self.__user_country, limit=DYNAMIC_PAGE_LIMIT, offset=0
+            )
+        except Exception as exc:
+            cached = self.cache.get(cache_str)
+            if cached and (cached.get("playlists") or {}).get("items"):
+                log_exception(exc, "featured playlists lookup")
+                return cached
+            raise
+
+        total = playlists["playlists"]["total"]
         loaded = len(playlists["playlists"]["items"])
         playlists["playlists"]["items"] = self.__prepare_playlist_listitems(
             playlists["playlists"]["items"], group_label=playlists["message"]
         )
         self.__mark_dynamic_collection_state(playlists["playlists"], loaded, total, total <= loaded)
-        self.cache.set(cache_str, playlists, checksum=checksum)
+        self.cache.set(
+            cache_str,
+            playlists,
+            checksum=checksum,
+            expiration=PLAYLIST_COLLECTION_CACHE_EXPIRATION,
+        )
         self.__start_playlist_collection_continuation(
             cache_str,
             checksum,
@@ -1672,10 +1746,8 @@ class PluginContent:
         return playlists
 
     def __get_user_playlists(self, userid):
-        playlists = self.__spotipy.user_playlists(userid, limit=DYNAMIC_PAGE_LIMIT, offset=0)
-        total = playlists["total"]
         cache_str = f"spotify.userplaylists.{userid}"
-        checksum = self.__cache_checksum(total)
+        checksum = self.__user_playlists_checksum(userid)
 
         cached_playlists = self.cache.get(cache_str, checksum=checksum)
         if isinstance(cached_playlists, dict):
@@ -1689,9 +1761,13 @@ class PluginContent:
             )
             return cached_playlists
 
+        playlists = self.__spotipy.user_playlists(userid, limit=DYNAMIC_PAGE_LIMIT, offset=0)
+        total = playlists["total"]
         loaded = len(playlists["items"])
         result = self.__prepare_playlist_listitems(
-            playlists["items"], group_label=xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID)
+            playlists["items"],
+            group_label=xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID),
+            relation_mode="user_collection",
         )
         payload = {
             "items": result,
@@ -1699,7 +1775,9 @@ class PluginContent:
             DYNAMIC_PAGING_LOADED_KEY: loaded,
             DYNAMIC_PAGING_COMPLETE_KEY: total <= loaded,
         }
-        self.cache.set(cache_str, payload, checksum=checksum)
+        self.cache.set(
+            cache_str, payload, checksum=checksum, expiration=USER_PLAYLIST_CACHE_EXPIRATION
+        )
         cache_log(
             f'Retrieved first {_get_len(result)}/{total} playlists for user "{self.__userid}".'
         )
@@ -1728,17 +1806,26 @@ class PluginContent:
                 if not page:
                     break
                 all_items += self.__prepare_playlist_listitems(
-                    page, group_label=xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID)
+                    page,
+                    group_label=xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID),
+                    relation_mode="user_collection",
                 )
                 offset += len(page)
                 payload["items"] = all_items
                 payload[DYNAMIC_PAGING_LOADED_KEY] = offset
                 payload[DYNAMIC_PAGING_COMPLETE_KEY] = total <= offset
-                self.cache.set(cache_str, payload, checksum=checksum)
+                self.cache.set(
+                    cache_str,
+                    payload,
+                    checksum=checksum,
+                    expiration=USER_PLAYLIST_CACHE_EXPIRATION,
+                )
 
             payload[DYNAMIC_PAGING_LOADED_KEY] = offset
             payload[DYNAMIC_PAGING_COMPLETE_KEY] = True
-            self.cache.set(cache_str, payload, checksum=checksum)
+            self.cache.set(
+                cache_str, payload, checksum=checksum, expiration=USER_PLAYLIST_CACHE_EXPIRATION
+            )
             target_url = (
                 self.__current_request_url()
                 if self.__action == self.browse_playlists.__name__
@@ -1771,14 +1858,8 @@ class PluginContent:
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
     def __get_new_releases(self):
-        albums = self.__spotipy.new_releases(
-            country=self.__user_country, limit=DYNAMIC_PAGE_LIMIT, offset=0
-        )
-        total = albums["albums"]["total"]
         cache_str = "spotify.newreleases"
-        checksum = (
-            f"v{CACHE_SCHEMA_VERSION}-{self.__user_country}-{total}-{int(time.time() // 900)}"
-        )
+        checksum = self.__paged_collection_checksum("newreleases", self.__user_country)
         cached = self.cache.get(cache_str, checksum=checksum)
         if cached and (cached.get("albums") or {}).get("items"):
             self.__start_album_collection_continuation(
@@ -1794,13 +1875,19 @@ class PluginContent:
             )
             return cached["albums"]["items"]
 
-        album_ids = []
-        for album in albums["albums"]["items"]:
-            album_ids.append(album["id"])
-        loaded = len(album_ids)
-        albums["albums"]["items"] = self.__prepare_album_listitems(album_ids)
+        albums = self.__spotipy.new_releases(
+            country=self.__user_country, limit=DYNAMIC_PAGE_LIMIT, offset=0
+        )
+        total = albums["albums"]["total"]
+        loaded = len(albums["albums"]["items"])
+        albums["albums"]["items"] = self.__prepare_album_listitems(albums=albums["albums"]["items"])
         self.__mark_dynamic_collection_state(albums["albums"], loaded, total, total <= loaded)
-        self.cache.set(cache_str, albums, checksum=checksum)
+        self.cache.set(
+            cache_str,
+            albums,
+            checksum=checksum,
+            expiration=PLAYLIST_COLLECTION_CACHE_EXPIRATION,
+        )
         self.__start_album_collection_continuation(
             cache_str,
             checksum,
@@ -2363,10 +2450,15 @@ class PluginContent:
             )
 
     def __prepare_playlist_listitems(
-        self, playlists: List[Dict[str, Any]], group_label: str = ""
+        self,
+        playlists: List[Dict[str, Any]],
+        group_label: str = "",
+        relation_mode: str = "cache",
     ) -> List[Dict[str, Any]]:
         playlists2 = []
-        followed_playlists = self.__get_followed_playlist_ids_for_page(playlists)
+        followed_playlist_states = self.__get_followed_playlist_states_for_page(
+            playlists, relation_mode=relation_mode
+        )
 
         for playlist in playlists:
             if not playlist:
@@ -2390,7 +2482,7 @@ class PluginContent:
             )
 
             playlist["contextitems"] = self.__get_playlist_context_menu_items(
-                playlist, followed_playlists
+                playlist, followed_playlist_states.get(playlist["id"])
             )
 
             playlists2.append(playlist)
@@ -2425,7 +2517,7 @@ class PluginContent:
             playlist[DAYLIST_TITLE_BUCKET_KEY] = title_bucket
 
     def __get_playlist_context_menu_items(
-        self, playlist, followed_playlists: List[str]
+        self, playlist, is_followed: Optional[bool] = None
     ) -> List[Tuple[str, str]]:
         contextitems = [
             (
@@ -2436,7 +2528,7 @@ class PluginContent:
             ),
         ]
 
-        if playlist["owner"]["id"] != self.__userid and playlist["id"] in followed_playlists:
+        if playlist["owner"]["id"] != self.__userid and is_followed is True:
             contextitems.append(
                 (
                     self.__addon.getLocalizedString(UNFOLLOW_PLAYLIST_STR_ID),
