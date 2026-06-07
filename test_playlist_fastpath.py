@@ -389,6 +389,19 @@ class FeaturedPlaylistsSpotify(FakeSpotify):
         }
 
 
+class FailingFeaturedPlaylistsSpotify(FakeSpotify):
+    def featured_playlists(self, country=None, limit=50, offset=0):
+        raise RuntimeError("featured playlists unavailable")
+
+
+class FailingCategoryPlaylistsSpotify(DynamicDaylistSpotify):
+    def category(self, category_id, country=None, locale=None):
+        raise RuntimeError("category unavailable")
+
+    def category_playlists(self, category_id, country=None, limit=50, offset=0):
+        raise RuntimeError("category playlists unavailable")
+
+
 class UserPlaylistsSpotify(FakeSpotify):
     def user_playlists(self, userid, limit=50, offset=0):
         return {"total": 1, "items": [spotify_playlist(1, owner_id=userid)]}
@@ -631,6 +644,80 @@ class PlaylistFastPathTests(unittest.TestCase):
 
         self.assertEqual(["Featured playlists"], [item[1].label2 for item in rendered])
 
+    def test_browse_featured_playlists_falls_back_to_cached_rows_when_spotify_fails(self):
+        events = RecordingPlayer.events
+        spotify = FailingFeaturedPlaylistsSpotify(events, total=1)
+        content = self.build_content(spotify)
+        content._PluginContent__filter = "featured"
+        cached_playlist = spotify_playlist(1)
+        cached_playlist.update(
+            {
+                "label2": "Featured playlists",
+                "thumb": "DefaultMusicAlbums.png",
+                "url": "plugin://plugin.audio.spotifykodiconnect/?action=browse_playlist",
+                "contextitems": [],
+            }
+        )
+        content.cache.set(
+            "spotify.featuredplaylists",
+            {
+                "message": "Featured playlists",
+                "playlists": {
+                    "total": 1,
+                    "items": [cached_playlist],
+                    self.plugin_content.DYNAMIC_PAGING_LOADED_KEY: 1,
+                    self.plugin_content.DYNAMIC_PAGING_COMPLETE_KEY: True,
+                },
+            },
+            checksum="older-featured-checksum",
+        )
+        rendered = []
+        self.plugin_content.xbmcplugin.addDirectoryItem = (
+            lambda handle, url, listitem, isFolder: rendered.append((url, listitem, isFolder))
+        )
+
+        content.browse_playlists()
+
+        self.assertEqual(["Playlist 1"], [item[1].label for item in rendered])
+        self.assertEqual(["Featured playlists"], [item[1].label2 for item in rendered])
+
+    def test_browse_category_falls_back_to_cached_rows_when_spotify_fails(self):
+        events = RecordingPlayer.events
+        spotify = FailingCategoryPlaylistsSpotify(events, total=1)
+        content = self.build_content(spotify)
+        content._PluginContent__filter = "made-for-you"
+        cached_playlist = spotify_playlist(1)
+        cached_playlist.update(
+            {
+                "label2": "Made For You",
+                "thumb": "DefaultMusicAlbums.png",
+                "url": "plugin://plugin.audio.spotifykodiconnect/?action=browse_playlist",
+                "contextitems": [],
+            }
+        )
+        content.cache.set(
+            "spotify.categoryplaylists.made-for-you",
+            {
+                "category": "Made For You",
+                "playlists": {
+                    "total": 1,
+                    "items": [cached_playlist],
+                    self.plugin_content.DYNAMIC_PAGING_LOADED_KEY: 1,
+                    self.plugin_content.DYNAMIC_PAGING_COMPLETE_KEY: True,
+                },
+            },
+            checksum="older-category-checksum",
+        )
+        rendered = []
+        self.plugin_content.xbmcplugin.addDirectoryItem = (
+            lambda handle, url, listitem, isFolder: rendered.append((url, listitem, isFolder))
+        )
+
+        content.browse_category()
+
+        self.assertEqual(["Playlist 1"], [item[1].label for item in rendered])
+        self.assertEqual(["Made For You"], [item[1].label2 for item in rendered])
+
     def test_browse_user_playlists_uses_playlists_sublabel(self):
         events = RecordingPlayer.events
         spotify = UserPlaylistsSpotify(events, total=1)
@@ -663,6 +750,31 @@ class PlaylistFastPathTests(unittest.TestCase):
         self.assertEqual(1, len(rendered))
         self.assertEqual("synthpop saturday morning", rendered[0][1].label)
         self.assertEqual("daylist", rendered[0][1].label2)
+
+    def test_add_playlists_refreshes_bucketed_canonical_daylist_before_rendering(self):
+        events = RecordingPlayer.events
+        spotify = DynamicDaylistSpotify(events, total=1)
+        content = self.build_content(spotify)
+        rendered = []
+        self.plugin_content.xbmcplugin.addDirectoryItem = (
+            lambda handle, url, listitem, isFolder: rendered.append((url, listitem, isFolder))
+        )
+        cached_daylist = spotify_daylist()
+        cached_daylist["description"] = "Your day in a playlist."
+        cached_daylist["url"] = "plugin://plugin.audio.spotifykodiconnect/?action=browse_playlist"
+        cached_daylist[self.plugin_content.DAYLIST_TITLE_BUCKET_KEY] = (
+            self.plugin_content._daylist_title_bucket()
+        )
+
+        content._PluginContent__add_playlist_listitems([cached_daylist], group_label="Made For You")
+
+        self.assertEqual(1, len(rendered))
+        self.assertEqual("synthpop saturday morning", rendered[0][1].label)
+        self.assertEqual("Made For You", rendered[0][1].label2)
+        self.assertEqual(
+            [("37i9dQZF1EP6YuccBxUcC1", "tracks(total),name,owner(id),id,snapshot_id", "US")],
+            spotify.playlist_detail_requests,
+        )
 
     def test_artist_fanart_fetch_logs_exception_with_exception_first(self):
         events = RecordingPlayer.events
