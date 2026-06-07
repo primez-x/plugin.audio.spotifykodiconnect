@@ -147,6 +147,11 @@ def _daylist_display_name(playlist_name: str) -> str:
     return name
 
 
+def _has_dynamic_daylist_name(playlist_name: str) -> bool:
+    display_name = _daylist_display_name(playlist_name)
+    return bool(display_name) and display_name.lower() != DAYLIST_LABEL
+
+
 def _daylist_title_bucket() -> str:
     return str(int(time.time() // DAYLIST_TITLE_BUCKET_SECONDS))
 
@@ -1460,18 +1465,26 @@ class PluginContent:
             t.start()
 
     def __get_category(self, categoryid: str) -> Playlist:
-        category = self.__spotipy.category(
-            categoryid, country=self.__user_country, locale=self.__user_country
-        )
-        playlists = self.__spotipy.category_playlists(
-            categoryid,
-            country=self.__user_country,
-            limit=DYNAMIC_PAGE_LIMIT,
-            offset=0,
-        )
+        cache_str = f"spotify.categoryplaylists.{categoryid}"
+        try:
+            category = self.__spotipy.category(
+                categoryid, country=self.__user_country, locale=self.__user_country
+            )
+            playlists = self.__spotipy.category_playlists(
+                categoryid,
+                country=self.__user_country,
+                limit=DYNAMIC_PAGE_LIMIT,
+                offset=0,
+            )
+        except Exception as exc:
+            cached = self.cache.get(cache_str)
+            if cached and (cached.get("playlists") or {}).get("items"):
+                log_exception(exc, f"category playlists lookup {categoryid}")
+                return cached
+            raise
+
         playlists["category"] = category["name"]
         total = playlists["playlists"]["total"]
-        cache_str = f"spotify.categoryplaylists.{categoryid}"
         checksum = f"v{CACHE_SCHEMA_VERSION}-{categoryid}-{total}-{int(time.time() // 900)}"
         cached = self.cache.get(cache_str, checksum=checksum)
         if cached and (cached.get("playlists") or {}).get("items"):
@@ -1605,11 +1618,19 @@ class PluginContent:
         self.refresh_listing()
 
     def __get_featured_playlists(self) -> Playlist:
-        playlists = self.__spotipy.featured_playlists(
-            country=self.__user_country, limit=DYNAMIC_PAGE_LIMIT, offset=0
-        )
-        total = playlists["playlists"]["total"]
         cache_str = "spotify.featuredplaylists"
+        try:
+            playlists = self.__spotipy.featured_playlists(
+                country=self.__user_country, limit=DYNAMIC_PAGE_LIMIT, offset=0
+            )
+        except Exception as exc:
+            cached = self.cache.get(cache_str)
+            if cached and (cached.get("playlists") or {}).get("items"):
+                log_exception(exc, "featured playlists lookup")
+                return cached
+            raise
+
+        total = playlists["playlists"]["total"]
         checksum = (
             f"v{CACHE_SCHEMA_VERSION}-{self.__user_country}-{total}-{int(time.time() // 900)}"
         )
@@ -2383,9 +2404,10 @@ class PluginContent:
         if not playlist.get("label2"):
             playlist["label2"] = DAYLIST_LABEL
         title_bucket = _daylist_title_bucket()
-        if playlist.get(DAYLIST_TITLE_BUCKET_KEY) == title_bucket:
+        if playlist.get(DAYLIST_TITLE_BUCKET_KEY) == title_bucket and _has_dynamic_daylist_name(
+            playlist.get("name") or ""
+        ):
             return
-        playlist[DAYLIST_TITLE_BUCKET_KEY] = title_bucket
 
         playlist_id = playlist.get("id")
         if not playlist_id:
@@ -2400,6 +2422,7 @@ class PluginContent:
         display_name = _daylist_display_name(playlist_summary.get("name") or "")
         if display_name and display_name.lower() != DAYLIST_LABEL:
             playlist["name"] = display_name
+            playlist[DAYLIST_TITLE_BUCKET_KEY] = title_bucket
 
     def __get_playlist_context_menu_items(
         self, playlist, followed_playlists: List[str]
