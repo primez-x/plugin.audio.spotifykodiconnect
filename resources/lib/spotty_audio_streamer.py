@@ -22,8 +22,8 @@ _DEFAULT_GAIN_TYPE = "track"
 _PCM_BYTES_PER_SEC = 176400  # 44.1 kHz * 2 ch * 2 bytes/sample
 _WAV_HEADER_SIZE = 44
 STARTUP_SILENCE_BYTES = _PCM_BYTES_PER_SEC * 2
-_STARTUP_REAL_PCM_PREROLL_BYTES = 32768
-_STARTUP_REAL_PCM_WAIT_SECONDS = 8.0
+_STARTUP_REAL_PCM_PREROLL_BYTES = 2097152
+_STARTUP_REAL_PCM_WAIT_SECONDS = 15.0
 
 # Maximum bytes of PCM silence to pad at the end of a stream when spotty exits
 # cleanly but short of the WAV-declared length. 10 seconds @ 176400 B/s = 1,764,000.
