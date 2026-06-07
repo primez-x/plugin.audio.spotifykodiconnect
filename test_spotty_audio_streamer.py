@@ -130,7 +130,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         self.assertGreaterEqual(len(first_chunk), len(wav_header))
         self.assertGreaterEqual(
             max(downloader.wait_targets),
-            len(wav_header) + self.module.STARTUP_SILENCE_BYTES + 32768,
+            len(wav_header) + self.module.STARTUP_SILENCE_BYTES + 2097152,
         )
 
     def test_downloader_seeds_silence_and_maps_seek_offset_to_real_pcm(self):
