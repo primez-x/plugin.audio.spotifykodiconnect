@@ -379,6 +379,24 @@ class DynamicDaylistSpotify(FakeSpotify):
         }
 
 
+class GenericDaylistSpotify(FakeSpotify):
+    def playlist(self, playlist_id, fields="", market=None):
+        self.playlist_detail_requests.append((playlist_id, fields, market))
+        return {
+            "id": playlist_id,
+            "name": "daylist",
+            "description": "Your day in a playlist.",
+            "images": [
+                {
+                    "url": "https://daylist.spotifycdn.com/playlist-covers-mix/en/afternoon_default.jpg"
+                }
+            ],
+            "owner": {"id": "spotify"},
+            "snapshot_id": "snapshot-daylist",
+            "tracks": {"total": 50},
+        }
+
+
 class CategoryPlaylistsSpotify(DynamicDaylistSpotify):
     def category(self, category_id, country=None, locale=None):
         self.category_requests.append((category_id, country, locale))
@@ -648,7 +666,38 @@ class PlaylistFastPathTests(unittest.TestCase):
         self.assertEqual("synthpop saturday morning", playlists[0]["name"])
         self.assertEqual("daylist", playlists[0]["label2"])
         self.assertEqual(
-            [("37i9dQZF1EP6YuccBxUcC1", "tracks(total),name,owner(id),id,snapshot_id", "US")],
+            [
+                (
+                    "37i9dQZF1EP6YuccBxUcC1",
+                    "tracks(total),name,description,images,owner(id),id,snapshot_id",
+                    "US",
+                )
+            ],
+            spotify.playlist_detail_requests,
+        )
+
+    def test_prepare_daylist_uses_period_title_when_spotify_title_is_generic(self):
+        events = RecordingPlayer.events
+        spotify = GenericDaylistSpotify(events, total=1)
+        content = self.build_content(spotify)
+        playlist = spotify_daylist()
+        playlist["description"] = "Your day in a playlist."
+        playlist["images"] = [
+            {"url": "https://daylist.spotifycdn.com/playlist-covers-mix/en/afternoon_default.jpg"}
+        ]
+
+        playlists = content._PluginContent__prepare_playlist_listitems([playlist])
+
+        self.assertEqual("Afternoon Daylist", playlists[0]["name"])
+        self.assertEqual("daylist", playlists[0]["label2"])
+        self.assertEqual(
+            [
+                (
+                    "37i9dQZF1EP6YuccBxUcC1",
+                    "tracks(total),name,description,images,owner(id),id,snapshot_id",
+                    "US",
+                )
+            ],
             spotify.playlist_detail_requests,
         )
 
@@ -969,7 +1018,13 @@ class PlaylistFastPathTests(unittest.TestCase):
         self.assertEqual("synthpop saturday morning", rendered[0][1].label)
         self.assertEqual("Made For You", rendered[0][1].label2)
         self.assertEqual(
-            [("37i9dQZF1EP6YuccBxUcC1", "tracks(total),name,owner(id),id,snapshot_id", "US")],
+            [
+                (
+                    "37i9dQZF1EP6YuccBxUcC1",
+                    "tracks(total),name,description,images,owner(id),id,snapshot_id",
+                    "US",
+                )
+            ],
             spotify.playlist_detail_requests,
         )
 
