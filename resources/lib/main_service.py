@@ -265,6 +265,10 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
     fire whenever Kodi's internal buffer fills (mid-song), not only at true end-of-track.
     """
 
+    def __init__(self, on_spotify_started=None):
+        xbmc.Player.__init__(self)
+        self._on_spotify_started = on_spotify_started or (lambda _track_id: None)
+
     def _clear(self) -> None:
         global _liked_state_track_id
         _liked_state_track_id = ""
@@ -294,6 +298,10 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
                 if is_spotify:
                     if track_id:
                         win.setProperty("Spotify.CurrentTrackId", track_id)
+                        try:
+                            self._on_spotify_started(track_id)
+                        except Exception as exc:
+                            log_exception(exc, "Spotify playback-start callback failed")
                     return
                 if has_player_file:
                     self._clear()
@@ -346,10 +354,12 @@ class MainService:
         self.__http_spotty_streamer.set_notify_track_finished(self.__on_track_finished)
 
         # Keep a strong reference so Kodi doesn't GC the player monitor.
-        self.__osd_player_monitor = _SpotifyOSDPlayerMonitor()
+        self.__osd_player_monitor = _SpotifyOSDPlayerMonitor(
+            on_spotify_started=self.__on_spotify_playback_started
+        )
 
-        # Cancellation token for _deferred_prebuffer threads.  Incremented each
-        # time __on_track_started fires so only the latest thread proceeds to call
+        # Cancellation token for _deferred_prebuffer threads.  Incremented after
+        # Kodi confirms playback so only the latest thread proceeds to call
         # get_or_start.  Prevents cascade-mode threads from all firing at once and
         # evicting each other's buffers.
         self._prebuffer_token = 0
@@ -400,8 +410,8 @@ class MainService:
         except Exception as exc:
             log_exception(exc, "watching prebuffer result failed")
 
-    def __on_track_started(self, track_id: str, duration_sec: float) -> None:
-        """Set OSD properties for Spotify track; pre-buffer next; broadcast to service.nexttrack."""
+    def __on_track_started(self, track_id: str, _duration_sec: float) -> None:
+        """Set OSD properties for a Spotify HTTP stream request."""
         global _artist_fanart_urls, _artist_fanart_index, _liked_state_track_id
         win = xbmcgui.Window(ADDON_WINDOW_ID)
         win.setProperty("Spotify.CurrentTrackId", track_id or "")
@@ -473,8 +483,9 @@ class MainService:
         if track_changed:
             _start_daemon_thread(_set_liked_state, task_name="liked-state refresh")
 
+    def __on_spotify_playback_started(self, track_id: str) -> None:
         try:
-            current_item, next_item = get_next_playlist_item()
+            _current_item, next_item = get_next_playlist_item()
             if not next_item:
                 if SPOTIFY_ADDON.getSetting("spotify_autoplay").lower() == "true":
                     _start_daemon_thread(
@@ -489,118 +500,86 @@ class MainService:
                 return
 
             prebuffer_enabled = SPOTIFY_ADDON.getSetting("prebuffer_enabled").lower() == "true"
-            # Prebuffer collects PCM bytes for the next track. Pass current
-            # settings so prebuffer uses them without addon restart.
-            # IMPORTANT: Delay prebuffer start so the main track's spotty process
-            # has time to connect to Spotify first. Spotty uses a single Spotify
-            # connection per account — starting the prebuffer's spotty immediately
-            # causes it to compete with the main spotty, making both fail.
-            if prebuffer_enabled:
+            if not prebuffer_enabled:
+                return
+
+            with self._prebuffer_token_lock:
+                self._prebuffer_token += 1
+                my_token = self._prebuffer_token
+
+            def _deferred_prebuffer():
+                from spotty_cache import SpottyCacheManager
+
+                time.sleep(2.0)
+
                 with self._prebuffer_token_lock:
-                    self._prebuffer_token += 1
-                    my_token = self._prebuffer_token
-
-                def _deferred_prebuffer():
-                    # Wait for the main stream to finish downloading to the disk cache.
-                    # librespot only supports one stream per account; starting prebuffer
-                    # while the main track is still downloading kicks the main stream.
-                    from spotty_cache import SpottyCacheManager
-
-                    # Wait for the main downloader to register and start.
-                    time.sleep(2.0)
-
-                    # During a cascade, many _deferred_prebuffer threads are spawned
-                    # in quick succession (one per skipped track).  Only the most
-                    # recent one should proceed — older threads would call get_or_start
-                    # with stale track IDs, rapidly filling _recent_tracks past its
-                    # 3-entry limit and evicting the freshly prebuffered track's buffer.
-                    with self._prebuffer_token_lock:
-                        if self._prebuffer_token != my_token:
-                            log_msg(
-                                f"_deferred_prebuffer: cancelled (stale, track={track_id})",
-                                LOGDEBUG,
-                            )
-                            return
-
-                    # Wait on the condition variable instead of polling every 1s;
-                    # wakes up immediately when the download finishes.
-                    dl = SpottyCacheManager.find_best_downloader(track_id, 0)
-                    if dl is not None and not dl.is_finished:
-                        with dl.cond:
-                            while not dl.is_finished and not dl.error and not dl.aborted:
-                                dl.cond.wait(timeout=30.0)
-
-                    log_msg(
-                        f"Main track {track_id} finished downloading. Safe to start prebuffer for next track.",
-                        LOGDEBUG,
-                    )
-
-                    # Brief adaptive pause so Spotify's backend releases the
-                    # previous session before the prebuffer spotty connects.
-                    # The watcher below backs off after failed prebuffers and
-                    # trims the delay after clean ones.
-                    release_delay = self._get_prebuffer_release_delay()
-                    log_msg(
-                        f"_deferred_prebuffer: waiting {release_delay:.1f}s for session release.",
-                        LOGDEBUG,
-                    )
-                    time.sleep(release_delay)
-
-                    # Final stale-check after the session-release sleep.
-                    with self._prebuffer_token_lock:
-                        if self._prebuffer_token != my_token:
-                            log_msg(
-                                f"_deferred_prebuffer: cancelled after sleep (track={track_id})",
-                                LOGDEBUG,
-                            )
-                            return
-
-                    # Re-query the playlist here instead of using the value
-                    # captured at __on_track_started time.  When the HTTP
-                    # stream starts, Kodi's player position has often not
-                    # advanced yet, so the captured "next" is wrong (it is
-                    # the current track or even the previous one).
-                    try:
-                        _, next_item_now = get_next_playlist_item()
-                    except Exception:
-                        return
-                    if not next_item_now:
-                        return
-                    next_id_now, next_dur_now = parse_track_url(next_item_now.get("file") or "")
-                    if not next_id_now or next_dur_now is None:
-                        return
-                    # Guard: never prebuffer the track that triggered this
-                    # deferred prebuffer — that means the playlist position
-                    # is still stale and we would download the current track.
-                    if next_id_now == track_id:
+                    if self._prebuffer_token != my_token:
                         log_msg(
-                            f"_deferred_prebuffer: next track same as triggering track"
-                            f" ({track_id}), skipping.",
+                            f"_deferred_prebuffer: cancelled (stale, track={track_id})",
                             LOGDEBUG,
                         )
                         return
 
-                    bitrate = self._get_bitrate_setting()
-                    norm = (
-                        (SPOTIFY_ADDON.getSetting("spotify_normalization") or "auto")
-                        .strip()
-                        .lower()
-                    )
-                    if norm not in ("off", "auto", "track", "album"):
-                        norm = "auto"
-                    downloader = self.__prebuffer_manager.start_prebuffer(
-                        next_id_now,
-                        next_dur_now,
-                        bitrate=bitrate,
-                        normalization_gain_type=norm,
-                    )
-                    _start_daemon_thread(
-                        self._watch_prebuffer_result,
-                        args=(downloader, next_id_now, release_delay),
-                        task_name="prebuffer result watcher",
-                    )
+                dl = SpottyCacheManager.find_best_downloader(track_id, 0)
+                if dl is not None and not dl.is_finished:
+                    with dl.cond:
+                        while not dl.is_finished and not dl.error and not dl.aborted:
+                            dl.cond.wait(timeout=30.0)
 
-                _start_daemon_thread(_deferred_prebuffer, task_name="deferred prebuffer")
+                log_msg(
+                    f"Main track {track_id} finished downloading. Safe to start prebuffer for next track.",
+                    LOGDEBUG,
+                )
+
+                release_delay = self._get_prebuffer_release_delay()
+                log_msg(
+                    f"_deferred_prebuffer: waiting {release_delay:.1f}s for session release.",
+                    LOGDEBUG,
+                )
+                time.sleep(release_delay)
+
+                with self._prebuffer_token_lock:
+                    if self._prebuffer_token != my_token:
+                        log_msg(
+                            f"_deferred_prebuffer: cancelled after sleep (track={track_id})",
+                            LOGDEBUG,
+                        )
+                        return
+
+                try:
+                    _, next_item_now = get_next_playlist_item()
+                except Exception:
+                    return
+                if not next_item_now:
+                    return
+                next_id_now, next_dur_now = parse_track_url(next_item_now.get("file") or "")
+                if not next_id_now or next_dur_now is None:
+                    return
+                if next_id_now == track_id:
+                    log_msg(
+                        f"_deferred_prebuffer: next track same as triggering track"
+                        f" ({track_id}), skipping.",
+                        LOGDEBUG,
+                    )
+                    return
+
+                bitrate = self._get_bitrate_setting()
+                norm = (SPOTIFY_ADDON.getSetting("spotify_normalization") or "auto").strip().lower()
+                if norm not in ("off", "auto", "track", "album"):
+                    norm = "auto"
+                downloader = self.__prebuffer_manager.start_prebuffer(
+                    next_id_now,
+                    next_dur_now,
+                    bitrate=bitrate,
+                    normalization_gain_type=norm,
+                )
+                _start_daemon_thread(
+                    self._watch_prebuffer_result,
+                    args=(downloader, next_id_now, release_delay),
+                    task_name="prebuffer result watcher",
+                )
+
+            _start_daemon_thread(_deferred_prebuffer, task_name="deferred prebuffer")
 
         except Exception:
             pass

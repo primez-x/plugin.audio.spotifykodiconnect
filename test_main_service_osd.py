@@ -8,6 +8,9 @@ REPO_ROOT = os.path.dirname(__file__)
 LIB_DIR = os.path.join(REPO_ROOT, "resources", "lib")
 
 
+FAKE_SETTINGS = {}
+
+
 class FakeAddon:
     def getAddonInfo(self, key):
         if key == "version":
@@ -15,7 +18,7 @@ class FakeAddon:
         return "SpotifyKodiConnect"
 
     def getSetting(self, key):
-        return ""
+        return FAKE_SETTINGS.get(key, "")
 
 
 class FakeWindow:
@@ -75,7 +78,10 @@ class FakeDownloader:
         self.aborted = aborted
 
 
-def install_stubs(info_labels):
+def install_stubs(info_labels, settings=None):
+    FAKE_SETTINGS.clear()
+    FAKE_SETTINGS.update(settings or {})
+
     xbmc = types.ModuleType("xbmc")
     xbmc.LOGDEBUG = 0
     xbmc.LOGWARNING = 2
@@ -136,8 +142,8 @@ def install_stubs(info_labels):
     sys.modules["string_ids"] = string_ids
 
 
-def import_main_service(info_labels):
-    install_stubs(info_labels)
+def import_main_service(info_labels, settings=None):
+    install_stubs(info_labels, settings=settings)
     if LIB_DIR not in sys.path:
         sys.path.insert(0, LIB_DIR)
     for module_name in ("main_service", "playlist_next"):
@@ -198,6 +204,18 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
 
         self.assertEqual("music-property-track", win.getProperty("Spotify.CurrentTrackId"))
 
+    def test_playback_started_invokes_callback_after_spotify_metadata_settles(self):
+        main_service = import_main_service(
+            {"Player.FileNameAndPath": "http://127.0.0.1:52309/track/stream-track/180.wav"}
+        )
+        started_tracks = []
+
+        main_service._SpotifyOSDPlayerMonitor(
+            on_spotify_started=lambda track_id: started_tracks.append(track_id)
+        ).onPlayBackStarted()
+
+        self.assertEqual(["stream-track"], started_tracks)
+
     def test_playback_started_clears_stale_spotify_state_for_non_spotify_audio(self):
         main_service = import_main_service(
             {"Player.FileNameAndPath": "smb://media/music/example.flac"}
@@ -236,6 +254,21 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
 
         win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
         self.assertEqual("track-1", win.getProperty("Spotify.CurrentTrackId"))
+
+    def test_track_started_does_not_prebuffer_before_kodi_playback_confirms(self):
+        main_service = import_main_service({}, {"prebuffer_enabled": "true"})
+        main_service.threading.Thread = FailingThread
+        main_service.get_next_playlist_item = lambda: (
+            {"file": "http://127.0.0.1:52309/track/track-1/180.wav"},
+            {"file": "http://127.0.0.1:52309/track/track-2/180.wav"},
+        )
+        service = object.__new__(main_service.MainService)
+        service._prebuffer_token = 0
+        service._prebuffer_token_lock = threading.Lock()
+
+        service._MainService__on_track_started("track-1", 180)
+
+        self.assertEqual(0, service._prebuffer_token)
 
 
 if __name__ == "__main__":
