@@ -290,6 +290,20 @@ class SpottyAudioStreamer:
 
         try:
             self._prime_startup_real_pcm(downloader, range_begin, wav_header, track_length)
+            prefix_end = len(wav_header) + STARTUP_SILENCE_BYTES
+            with downloader.cond:
+                silence_only_error = (
+                    downloader.error
+                    and range_begin < prefix_end
+                    and downloader.written_bytes <= max(0, prefix_end - downloader.start_byte)
+                )
+            if silence_only_error:
+                self._log_transfer(
+                    "error",
+                    msg="Background downloader hit an error before real PCM",
+                )
+                return
+
             while bytes_sent < range_len and not self.__terminated:
                 target_bytes_in_buf = buf_offset + bytes_sent + 1
                 downloader.wait_for_bytes(target_bytes_in_buf, timeout=1.0)

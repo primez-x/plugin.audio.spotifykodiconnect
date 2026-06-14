@@ -133,6 +133,25 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             len(wav_header) + self.module.STARTUP_SILENCE_BYTES + 2097152,
         )
 
+    def test_from_start_request_does_not_release_silence_only_after_downloader_error(self):
+        streamer = self.module.SpottyAudioStreamer(object())
+        streamer.set_track("track-1", 180)
+        wav_header, _ = self.module.create_wav_header_for_duration(180)
+        downloader = FakeDownloader(wav_header, bytes(self.module.STARTUP_SILENCE_BYTES))
+        downloader.error = True
+        downloader.is_finished = True
+        FakeSpottyCacheManager.downloader = downloader
+
+        generator = streamer.send_part_audio_stream(
+            len(wav_header) + self.module.STARTUP_SILENCE_BYTES,
+            0,
+        )
+        try:
+            with self.assertRaises(StopIteration):
+                next(generator)
+        finally:
+            generator.close()
+
     def test_downloader_seeds_silence_and_maps_seek_offset_to_real_pcm(self):
         sys.modules.pop("spotty_cache", None)
         import spotty_cache
