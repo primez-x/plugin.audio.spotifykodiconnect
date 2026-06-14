@@ -60,12 +60,14 @@ PRECACHE_MAX_LIBRARY_ITEMS = 250
 DAYLIST_LABEL = "daylist"
 DAYLIST_TITLE_BUCKET_SECONDS = 300
 DAYLIST_TITLE_BUCKET_KEY = "_daylist_title_bucket"
+DAYLIST_TITLE_RETRY_DELAYS_MS = (1000, 2500, 5000)
+LEGACY_CATEGORY_ALIASES = {"made-for-you": "Made For You"}
 
 # Bump this when the cached data structure changes (e.g. new fields pulled
 # from the Spotify API, different track/album/artist dict shapes, serialisation
 # format changes).  Any value different from what is already stored will
 # automatically invalidate every cached entry.
-CACHE_SCHEMA_VERSION = "4"
+CACHE_SCHEMA_VERSION = "5"
 
 Playlist = Dict[str, Union[str, Dict[str, List[Any]]]]
 
@@ -162,26 +164,8 @@ def _daylist_title_bucket() -> str:
     return str(int(time.time() // DAYLIST_TITLE_BUCKET_SECONDS))
 
 
-def _daylist_image_url(playlist: Dict[str, Any]) -> str:
-    images = playlist.get("images") or []
-    if images and isinstance(images[0], dict):
-        return images[0].get("url") or ""
-    return playlist.get("thumb") or ""
-
-
-def _daylist_period_from_image_url(image_url: str) -> str:
-    url = (image_url or "").lower()
-    for period in ("morning", "afternoon", "evening", "night"):
-        if f"{period}_" in url or f"/{period}" in url:
-            return period
-    return ""
-
-
-def _daylist_fallback_display_name(playlist: Dict[str, Any]) -> str:
-    period = _daylist_period_from_image_url(_daylist_image_url(playlist))
-    if period:
-        return f"{period.title()} Daylist"
-    return DAYLIST_LABEL.title()
+def _normalized_lookup_label(value: str) -> str:
+    return "".join(ch for ch in (value or "").lower() if ch.isalnum())
 
 
 class PluginContent:
@@ -1553,6 +1537,7 @@ class PluginContent:
             t.start()
 
     def __get_category(self, categoryid: str) -> Playlist:
+        categoryid = self.__resolve_category_id(categoryid)
         cache_str = f"spotify.categoryplaylists.{categoryid}"
         checksum = self.__playlist_collection_checksum("category", categoryid)
         cached = self.cache.get(cache_str, checksum=checksum)
@@ -1617,6 +1602,39 @@ class PluginContent:
         )
 
         return playlists
+
+    def __resolve_category_id(self, categoryid: str) -> str:
+        alias_name = LEGACY_CATEGORY_ALIASES.get(categoryid)
+        if not alias_name:
+            return categoryid
+
+        target_label = _normalized_lookup_label(alias_name)
+        try:
+            categories = self.__spotipy.categories(
+                country=self.__user_country, limit=50, locale=self.__user_country
+            )
+            offset = 0
+            while True:
+                category_page = categories.get("categories") or {}
+                items = category_page.get("items") or []
+                for item in items:
+                    if _normalized_lookup_label(item.get("name") or "") == target_label:
+                        return item["id"]
+
+                offset += len(items)
+                total = int(category_page.get("total") or offset)
+                if offset >= total or not items:
+                    break
+                categories = self.__spotipy.categories(
+                    country=self.__user_country,
+                    limit=50,
+                    offset=offset,
+                    locale=self.__user_country,
+                )
+        except Exception as exc:
+            cache_log(f"Could not resolve legacy category alias {categoryid}: {exc}")
+
+        return categoryid
 
     def browse_category(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "files")
@@ -2518,9 +2536,10 @@ class PluginContent:
         if not playlist.get("label2"):
             playlist["label2"] = DAYLIST_LABEL
         title_bucket = _daylist_title_bucket()
-        if playlist.get(DAYLIST_TITLE_BUCKET_KEY) == title_bucket and _has_dynamic_daylist_name(
-            playlist.get("name") or ""
-        ):
+        current_name = playlist.get("name") or ""
+        current_display_name = _daylist_display_name(current_name)
+        current_name_is_dynamic = _has_dynamic_daylist_name(current_name)
+        if playlist.get(DAYLIST_TITLE_BUCKET_KEY) == title_bucket and current_name_is_dynamic:
             return
 
         playlist_id = playlist.get("id")
@@ -2534,14 +2553,43 @@ class PluginContent:
             return
 
         display_name = _daylist_display_name(playlist_summary.get("name") or "")
-        if not display_name or display_name.lower() == DAYLIST_LABEL:
-            fallback_source = playlist_summary
-            if not _daylist_image_url(fallback_source):
-                fallback_source = playlist
-            display_name = _daylist_fallback_display_name(fallback_source)
-        if display_name:
+        if _has_dynamic_daylist_name(display_name):
             playlist["name"] = display_name
             playlist[DAYLIST_TITLE_BUCKET_KEY] = title_bucket
+            return
+
+        if current_name_is_dynamic:
+            playlist["name"] = current_display_name
+        elif display_name:
+            playlist["name"] = display_name
+        else:
+            playlist["name"] = DAYLIST_LABEL
+
+        self.__schedule_daylist_title_retry(playlist_id)
+
+    def __schedule_daylist_title_retry(self, playlist_id: str) -> None:
+        target_url = self.__current_request_url()
+        if not playlist_id or not target_url:
+            return
+
+        def _retry_daylist_title():
+            monitor = xbmc.Monitor()
+            for delay_ms in DAYLIST_TITLE_RETRY_DELAYS_MS:
+                if monitor.abortRequested():
+                    return
+                xbmc.sleep(delay_ms)
+                try:
+                    playlist_summary = self.__get_playlist_summary(playlist_id)
+                except Exception as exc:
+                    log_exception(exc, "daylist playlist title retry")
+                    continue
+                display_name = _daylist_display_name(playlist_summary.get("name") or "")
+                if _has_dynamic_daylist_name(display_name):
+                    self.__refresh_active_listing(target_url)
+                    return
+
+        busy_key = f"daylisttitle.{playlist_id}.{abs(hash(target_url))}"
+        self.__start_dynamic_page_continuation(busy_key, target_url, _retry_daylist_title)
 
     def __get_playlist_context_menu_items(
         self, playlist, is_followed: Optional[bool] = None

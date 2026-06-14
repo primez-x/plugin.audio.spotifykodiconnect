@@ -397,6 +397,33 @@ class GenericDaylistSpotify(FakeSpotify):
         }
 
 
+class EventuallyDynamicDaylistSpotify(FakeSpotify):
+    def __init__(self, events, total=1):
+        super().__init__(events, total=total)
+        self.playlist_names = ["daylist", "daylist - jazz rap funky hip hop sunday afternoon"]
+
+    def playlist(self, playlist_id, fields="", market=None):
+        self.playlist_detail_requests.append((playlist_id, fields, market))
+        name = (
+            self.playlist_names.pop(0)
+            if self.playlist_names
+            else "daylist - jazz rap funky hip hop sunday afternoon"
+        )
+        return {
+            "id": playlist_id,
+            "name": name,
+            "description": "Your day in a playlist.",
+            "images": [
+                {
+                    "url": "https://daylist.spotifycdn.com/playlist-covers-mix/en/afternoon_default.jpg"
+                }
+            ],
+            "owner": {"id": "spotify"},
+            "snapshot_id": "snapshot-daylist",
+            "tracks": {"total": 50},
+        }
+
+
 class CategoryPlaylistsSpotify(DynamicDaylistSpotify):
     def category(self, category_id, country=None, locale=None):
         self.category_requests.append((category_id, country, locale))
@@ -410,6 +437,29 @@ class CategoryPlaylistsSpotify(DynamicDaylistSpotify):
                 "items": [spotify_daylist(), spotify_playlist(2)],
             }
         }
+
+
+class LegacyMadeForYouCategorySpotify(CategoryPlaylistsSpotify):
+    current_made_for_you_id = "0JQ5DAt0tbjZptfcdMSKl3"
+
+    def categories(self, country=None, locale=None, limit=50, offset=0):
+        return {
+            "categories": {
+                "total": 1,
+                "items": [
+                    {
+                        "id": self.current_made_for_you_id,
+                        "name": "Made For You",
+                        "icons": [],
+                    }
+                ],
+            }
+        }
+
+    def category(self, category_id, country=None, locale=None):
+        if category_id == "made-for-you":
+            raise RuntimeError("legacy category slug unavailable")
+        return super().category(category_id, country=country, locale=locale)
 
 
 class FeaturedPlaylistsSpotify(FakeSpotify):
@@ -676,10 +726,11 @@ class PlaylistFastPathTests(unittest.TestCase):
             spotify.playlist_detail_requests,
         )
 
-    def test_prepare_daylist_uses_period_title_when_spotify_title_is_generic(self):
+    def test_prepare_daylist_keeps_generic_title_retryable_when_spotify_title_is_generic(self):
         events = RecordingPlayer.events
         spotify = GenericDaylistSpotify(events, total=1)
         content = self.build_content(spotify)
+        content._PluginContent__params = {"action": ["browse_playlists"], "ownerid": ["user"]}
         playlist = spotify_daylist()
         playlist["description"] = "Your day in a playlist."
         playlist["images"] = [
@@ -688,8 +739,10 @@ class PlaylistFastPathTests(unittest.TestCase):
 
         playlists = content._PluginContent__prepare_playlist_listitems([playlist])
 
-        self.assertEqual("Afternoon Daylist", playlists[0]["name"])
+        self.assertEqual("daylist", playlists[0]["name"])
         self.assertEqual("daylist", playlists[0]["label2"])
+        self.assertNotIn(self.plugin_content.DAYLIST_TITLE_BUCKET_KEY, playlists[0])
+        self.assertEqual(1, len(DeferredThread.started_targets))
         self.assertEqual(
             [
                 (
@@ -700,6 +753,39 @@ class PlaylistFastPathTests(unittest.TestCase):
             ],
             spotify.playlist_detail_requests,
         )
+
+    def test_daylist_generic_title_retry_refreshes_active_listing_when_dynamic_title_appears(self):
+        events = RecordingPlayer.events
+        spotify = EventuallyDynamicDaylistSpotify(events, total=1)
+        content = self.build_content(spotify)
+        content._PluginContent__params = {"action": ["browse_playlists"], "ownerid": ["user"]}
+        target_url = content._PluginContent__current_request_url()
+        commands = []
+        self.plugin_content.xbmc.getInfoLabel = lambda label: target_url
+        self.plugin_content.xbmc.executebuiltin = lambda command: commands.append(command)
+
+        playlists = content._PluginContent__prepare_playlist_listitems([spotify_daylist()])
+        DeferredThread.started_targets[0]()
+
+        self.assertEqual("daylist", playlists[0]["name"])
+        self.assertEqual(["Container.Refresh"], commands)
+        self.assertEqual(2, len(spotify.playlist_detail_requests))
+
+    def test_prepare_daylist_does_not_downgrade_dynamic_source_title_when_summary_is_generic(self):
+        events = RecordingPlayer.events
+        spotify = GenericDaylistSpotify(events, total=1)
+        content = self.build_content(spotify)
+        playlist = spotify_daylist()
+        playlist["name"] = "jazz rap funky hip hop sunday afternoon"
+        playlist["description"] = "Here's some jazz rap inspired by your listening."
+        playlist["images"] = [
+            {"url": "https://daylist.spotifycdn.com/playlist-covers-mix/en/afternoon_default.jpg"}
+        ]
+
+        playlists = content._PluginContent__prepare_playlist_listitems([playlist])
+
+        self.assertEqual("jazz rap funky hip hop sunday afternoon", playlists[0]["name"])
+        self.assertNotIn(self.plugin_content.DAYLIST_TITLE_BUCKET_KEY, playlists[0])
 
     def test_browse_category_uses_category_sublabel_for_all_playlists(self):
         events = RecordingPlayer.events
@@ -717,6 +803,43 @@ class PlaylistFastPathTests(unittest.TestCase):
             ["synthpop saturday morning", "Playlist 2"], [item[1].label for item in rendered]
         )
         self.assertEqual(["Made For You", "Made For You"], [item[1].label2 for item in rendered])
+
+    def test_browse_category_resolves_legacy_made_for_you_slug(self):
+        events = RecordingPlayer.events
+        spotify = LegacyMadeForYouCategorySpotify(events, total=1)
+        content = self.build_content(spotify)
+        content._PluginContent__filter = "made-for-you"
+        rendered = []
+        self.plugin_content.xbmcplugin.addDirectoryItem = (
+            lambda handle, url, listitem, isFolder: rendered.append((url, listitem, isFolder))
+        )
+
+        content.browse_category()
+
+        self.assertEqual(
+            [
+                (
+                    LegacyMadeForYouCategorySpotify.current_made_for_you_id,
+                    "US",
+                    self.plugin_content.DYNAMIC_PAGE_LIMIT,
+                    0,
+                )
+            ],
+            spotify.category_playlist_requests,
+        )
+        self.assertEqual(
+            [
+                (
+                    LegacyMadeForYouCategorySpotify.current_made_for_you_id,
+                    "US",
+                    "US",
+                )
+            ],
+            spotify.category_requests,
+        )
+        self.assertEqual(
+            ["synthpop saturday morning", "Playlist 2"], [item[1].label for item in rendered]
+        )
 
     def test_browse_featured_playlists_uses_featured_message_sublabel(self):
         events = RecordingPlayer.events
@@ -1091,7 +1214,7 @@ class PlaylistFastPathTests(unittest.TestCase):
 
         checksum = content._PluginContent__cache_checksum()
 
-        self.assertEqual("v4-3-5-7-", checksum)
+        self.assertEqual(f"v{self.plugin_content.CACHE_SCHEMA_VERSION}-3-5-7-", checksum)
         self.assertEqual([(1, 0, "US")], spotify.saved_track_requests)
         self.assertEqual([(1, 0)], spotify.saved_album_requests)
         self.assertEqual([(1, None)], spotify.followed_artist_requests)
@@ -1104,8 +1227,12 @@ class PlaylistFastPathTests(unittest.TestCase):
         first = content._PluginContent__cache_checksum("playlist-snapshot")
         second = content._PluginContent__cache_checksum("artist-albums")
 
-        self.assertEqual("v4-3-5-7--playlist-snapshot", first)
-        self.assertEqual("v4-3-5-7--artist-albums", second)
+        self.assertEqual(
+            f"v{self.plugin_content.CACHE_SCHEMA_VERSION}-3-5-7--playlist-snapshot", first
+        )
+        self.assertEqual(
+            f"v{self.plugin_content.CACHE_SCHEMA_VERSION}-3-5-7--artist-albums", second
+        )
         self.assertEqual(1, spotify.saved_track_calls)
         self.assertEqual(1, spotify.saved_album_calls)
         self.assertEqual(1, spotify.followed_artist_calls)
