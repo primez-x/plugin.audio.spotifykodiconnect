@@ -162,6 +162,28 @@ def _daylist_title_bucket() -> str:
     return str(int(time.time() // DAYLIST_TITLE_BUCKET_SECONDS))
 
 
+def _daylist_image_url(playlist: Dict[str, Any]) -> str:
+    images = playlist.get("images") or []
+    if images and isinstance(images[0], dict):
+        return images[0].get("url") or ""
+    return playlist.get("thumb") or ""
+
+
+def _daylist_period_from_image_url(image_url: str) -> str:
+    url = (image_url or "").lower()
+    for period in ("morning", "afternoon", "evening", "night"):
+        if f"{period}_" in url or f"/{period}" in url:
+            return period
+    return ""
+
+
+def _daylist_fallback_display_name(playlist: Dict[str, Any]) -> str:
+    period = _daylist_period_from_image_url(_daylist_image_url(playlist))
+    if period:
+        return f"{period.title()} Daylist"
+    return DAYLIST_LABEL.title()
+
+
 class PluginContent:
     __addon: xbmcaddon.Addon = xbmcaddon.Addon(id=ADDON_ID)
     __win: xbmcgui.Window = xbmcgui.Window(utils.ADDON_WINDOW_ID)
@@ -1211,7 +1233,7 @@ class PluginContent:
     def __get_playlist_summary(self, playlist_id: str) -> Playlist:
         return self.__spotipy.playlist(
             playlist_id,
-            fields="tracks(total),name,owner(id),id,snapshot_id",
+            fields="tracks(total),name,description,images,owner(id),id,snapshot_id",
             market=self.__user_country,
         )
 
@@ -2512,7 +2534,12 @@ class PluginContent:
             return
 
         display_name = _daylist_display_name(playlist_summary.get("name") or "")
-        if display_name and display_name.lower() != DAYLIST_LABEL:
+        if not display_name or display_name.lower() == DAYLIST_LABEL:
+            fallback_source = playlist_summary
+            if not _daylist_image_url(fallback_source):
+                fallback_source = playlist
+            display_name = _daylist_fallback_display_name(fallback_source)
+        if display_name:
             playlist["name"] = display_name
             playlist[DAYLIST_TITLE_BUCKET_KEY] = title_bucket
 
