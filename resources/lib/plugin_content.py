@@ -63,6 +63,9 @@ DAYLIST_TITLE_BUCKET_KEY = "_daylist_title_bucket"
 DAYLIST_TITLE_RETRY_DELAYS_MS = (1000, 2500, 5000)
 LEGACY_CATEGORY_ALIASES = {"made-for-you": "Made For You"}
 
+# Spotify DJ playlist ID - not supported by third-party clients (librespot issue #1604)
+DJ_PLAYLIST_ID = "37i9dQZF1EYkqdzj48dyYq"
+
 # Bump this when the cached data structure changes (e.g. new fields pulled
 # from the Spotify API, different track/album/artist dict shapes, serialisation
 # format changes).  Any value different from what is already stored will
@@ -2502,6 +2505,10 @@ class PluginContent:
 
         for playlist in playlists:
             if not playlist:
+                continue
+
+            # Filter out Spotify DJ playlist - unsupported in third-party clients
+            if playlist.get("id") == DJ_PLAYLIST_ID:
                 continue
 
             if playlist.get("images"):
