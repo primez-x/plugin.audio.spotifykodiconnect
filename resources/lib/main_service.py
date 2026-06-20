@@ -265,9 +265,10 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
     fire whenever Kodi's internal buffer fills (mid-song), not only at true end-of-track.
     """
 
-    def __init__(self, on_spotify_started=None):
+    def __init__(self, on_spotify_started=None, on_external_playback=None):
         xbmc.Player.__init__(self)
         self._on_spotify_started = on_spotify_started or (lambda _track_id: None)
+        self._on_external_playback = on_external_playback or (lambda: None)
 
     def _clear(self) -> None:
         global _liked_state_track_id
@@ -304,6 +305,15 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
                             log_exception(exc, "Spotify playback-start callback failed")
                     return
                 if has_player_file:
+                    # A non-Spotify player (e.g. PlexKodiConnect movie) is starting.
+                    # Tear down ALL Spotify audio resources immediately to prevent
+                    # Amlogic audio driver deadlocks when the AML SPDIF/HDMI codec
+                    # reconfigures from stereo PCM (Spotify) to multi-channel AC3
+                    # pass-through (movie) while spotty/HTTP streams are still active.
+                    try:
+                        self._on_external_playback()
+                    except Exception as exc:
+                        log_exception(exc, "External playback teardown callback failed")
                     self._clear()
                     return
                 xbmc.sleep(SPOTIFY_PLAYER_METADATA_POLL_MS)
@@ -355,7 +365,8 @@ class MainService:
 
         # Keep a strong reference so Kodi doesn't GC the player monitor.
         self.__osd_player_monitor = _SpotifyOSDPlayerMonitor(
-            on_spotify_started=self.__on_spotify_playback_started
+            on_spotify_started=self.__on_spotify_playback_started,
+            on_external_playback=self._teardown_for_external_playback,
         )
 
         # Cancellation token for _deferred_prebuffer threads.  Incremented after
@@ -409,6 +420,42 @@ class MainService:
                 )
         except Exception as exc:
             log_exception(exc, "watching prebuffer result failed")
+
+    def _teardown_for_external_playback(self) -> None:
+        """Tear down all Spotify audio resources when a non-Spotify player starts.
+
+        Called from _SpotifyOSDPlayerMonitor.onPlayBackStarted the instant a
+        non-Spotify file is detected (e.g. a PlexKodiConnect movie).  Prevents
+        Amlogic audio driver deadlocks by killing spotty subprocesses, aborting
+        cache downloads, cancelling prebuffer, and terminating the active HTTP
+        stream — before VideoPlayer reconfigures the AML audio codec.
+        """
+        from spotty_cache import SpottyCacheManager
+
+        # Guard: only tear down if Spotify audio resources are actually active.
+        win = xbmcgui.Window(ADDON_WINDOW_ID)
+        if not win.getProperty("Spotify.CurrentTrackId"):
+            return
+
+        log_msg("External playback detected — tearing down Spotify audio resources.")
+
+        # Cancel any deferred prebuffer threads.
+        with self._prebuffer_token_lock:
+            self._prebuffer_token += 1
+
+        # Cancel prebuffer state.
+        self.__prebuffer_manager.cancel_prebuffer()
+
+        # Abort all background downloaders and kill their spotty subprocesses.
+        SpottyCacheManager.cleanup_all()
+
+        # Terminate the active HTTP stream generator and clear streaming state.
+        self.__http_spotty_streamer.teardown_for_external_playback()
+
+        # Kill any remaining spotty processes not tracked by the cache manager.
+        self.__spotty_helper.kill_all_spotties()
+
+        log_msg("Spotify audio resources torn down for external playback.")
 
     def __on_track_started(self, track_id: str, _duration_sec: float) -> None:
         """Set OSD properties for a Spotify HTTP stream request."""

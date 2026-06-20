@@ -136,6 +136,30 @@ class HTTPSpottyAudioStreamer:
         else:
             log_msg("No running audio streamer. Nothing to stop.", LOGDEBUG)
 
+    def teardown_for_external_playback(self) -> None:
+        """Tear down ALL streaming state when a non-Spotify player takes over.
+
+        Clears internal streaming flags so the next Spotify request starts fresh,
+        and terminates any active stream generator.  Combined with
+        SpottyCacheManager.cleanup_all() and kill_all_spotties() from the service,
+        this releases every audio resource before VideoPlayer reconfigures the
+        AML audio codec (e.g. stereo PCM → multi-channel AC3 pass-through),
+        preventing Amlogic audio driver deadlocks.
+        """
+        log_msg("External playback detected — tearing down Spotify audio stream.", LOGDEBUG)
+        with self.__stream_lock:
+            was_streaming = self.__is_streaming
+            self.__is_streaming = False
+            self.__current_track_id = None
+            self.__current_request_id = ""
+            self.__init_in_progress = False
+            try:
+                self.__init_event.set()
+            except Exception:
+                pass
+        if was_streaming:
+            self.__terminate_streaming()
+
     def __terminate_streaming(self) -> None:
         if self.__spotty_streamer.terminate_stream():
             log_msg("Terminated running streamer.", LOGDEBUG)
