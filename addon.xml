@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<addon id="plugin.audio.spotifykodiconnect" version="1.0.15" name="SpotifyKodiConnect" provider-name="primez-x">
+<addon id="plugin.audio.spotifykodiconnect" version="1.0.16" name="SpotifyKodiConnect" provider-name="primez-x">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
         <import addon="xbmc.addon" version="18.9.701" />
@@ -19,7 +19,10 @@
         <description lang="en_GB">Unofficial Spotify music plugin for Kodi. Improves on the original Spotify addon with consistent album/artist art in all views (including playlists), correct metadata tags, and background loading so navigation and playback feel smooth. Requires Spotify Premium.</description>
         <disclaimer lang="en_GB">This product uses the SPOTIFY WEB API but is not endorsed, certified or otherwise approved in any way by Spotify. Spotify is the registered trademark of Spotify AB.</disclaimer>
         <source>https://github.com/primez-x/plugin.audio.spotifykodiconnect</source>
-        <news>v1.0.15
+        <news>v1.0.16
+- Tear down all Spotify audio resources (spotty processes, HTTP streams, prebuffer, cache downloads) the instant a non-Spotify player starts, preventing Amlogic audio driver deadlocks when switching from Spotify to a movie (e.g. via PlexKodiConnect).
+
+v1.0.15
 - Keep Spotify's real dynamic Daylist title authoritative: generic responses now stay as "daylist" and retry until the personalized title is available, instead of using a forced period fallback.
 - Resolve older Made For You hub category routes to Spotify's current category id so startup/restored hubs do not 404 on the stale made-for-you slug.
 

@@ -227,6 +227,18 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
 
         self.assertEqual("", win.getProperty("Spotify.CurrentTrackId"))
 
+    def test_playback_started_invokes_external_playback_callback_for_non_spotify(self):
+        main_service = import_main_service(
+            {"Player.FileNameAndPath": "smb://media/movies/example.mkv"}
+        )
+        teardown_called = []
+
+        main_service._SpotifyOSDPlayerMonitor(
+            on_external_playback=lambda: teardown_called.append(True)
+        ).onPlayBackStarted()
+
+        self.assertEqual(1, len(teardown_called))
+
     def test_prebuffer_delay_backs_off_after_error(self):
         main_service = import_main_service({})
         service = object.__new__(main_service.MainService)
