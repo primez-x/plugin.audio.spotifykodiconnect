@@ -287,8 +287,14 @@ class SpottyAudioStreamer:
         self._log_transfer("start", range_begin=range_begin)
 
         buf_offset = range_begin - downloader.start_byte
+        consumer_id = None
 
         try:
+            with downloader.cond:
+                consumer_id = downloader._next_consumer_id
+                downloader._next_consumer_id += 1
+                downloader._consumer_positions[consumer_id] = max(0, buf_offset)
+
             self._prime_startup_real_pcm(downloader, range_begin, wav_header, track_length)
             prefix_end = len(wav_header) + STARTUP_SILENCE_BYTES
             with downloader.cond:
@@ -334,6 +340,12 @@ class SpottyAudioStreamer:
                         downloader._consumed_pos = max(
                             downloader._consumed_pos, read_start + to_read
                         )
+                        if consumer_id in downloader._consumer_positions:
+                            downloader._consumer_positions[consumer_id] = max(
+                                downloader._consumer_positions[consumer_id],
+                                read_start + to_read,
+                            )
+                        downloader._trim_head_locked()
 
                 if chunk:
                     yield chunk
@@ -393,6 +405,10 @@ class SpottyAudioStreamer:
             self._log_transfer("exception", range_begin=range_begin, bytes_sent=bytes_sent, ex=ex)
             log_exception(ex, "send_part_audio_stream")
         finally:
+            if consumer_id is not None:
+                with downloader.cond:
+                    downloader._consumer_positions.pop(consumer_id, None)
+                    downloader._trim_head_locked()
             self.__terminated = False
 
 

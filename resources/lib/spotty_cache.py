@@ -64,6 +64,8 @@ class SpottyDownloader:
         self._buffer = bytearray()
         self._consumed_pos = 0  # furthest byte any consumer has read (abs, rel start_byte)
         self._trim_offset = 0  # absolute pos of buffer head (rel start_byte)
+        self._consumer_positions = {}
+        self._next_consumer_id = 0
 
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
@@ -280,14 +282,19 @@ class SpottyDownloader:
         slices to amortize the bytearray memmove.  The unread-tail cap is a
         safety valve for stalled-consumer scenarios.
         """
-        reclaimable = self._consumed_pos - self._trim_offset
+        safe_consumed_pos = (
+            min(self._consumer_positions.values())
+            if self._consumer_positions
+            else self._consumed_pos
+        )
+        reclaimable = safe_consumed_pos - self._trim_offset
         if reclaimable >= self._TRIM_BATCH_BYTES:
             reclaim = reclaimable - (reclaimable % 4)
             if reclaim > 0:
                 del self._buffer[:reclaim]
                 self._trim_offset += reclaim
         overflow = len(self._buffer) - self._MAX_UNREAD_TAIL_BYTES
-        if overflow > 0:
+        if overflow > 0 and not self._consumer_positions:
             drop = overflow - (overflow % 4)
             if drop > 0:
                 del self._buffer[:drop]
@@ -299,6 +306,7 @@ class SpottyDownloader:
             self._buffer.clear()
             self._consumed_pos = 0
             self._trim_offset = 0
+            self._consumer_positions.clear()
 
     def wait_for_bytes(self, target_bytes: int, timeout: float = None) -> bool:
         with self.cond:
