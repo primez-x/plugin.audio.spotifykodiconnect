@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<addon id="plugin.audio.spotifykodiconnect" version="1.0.20" name="SpotifyKodiConnect" provider-name="primez-x">
+<addon id="plugin.audio.spotifykodiconnect" version="1.0.21" name="SpotifyKodiConnect" provider-name="primez-x">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
         <import addon="xbmc.addon" version="18.9.701" />
@@ -19,7 +19,11 @@
         <description lang="en_GB">Unofficial Spotify music plugin for Kodi. Improves on the original Spotify addon with consistent album/artist art in all views (including playlists), correct metadata tags, and background loading so navigation and playback feel smooth. Requires Spotify Premium.</description>
         <disclaimer lang="en_GB">This product uses the SPOTIFY WEB API but is not endorsed, certified or otherwise approved in any way by Spotify. Spotify is the registered trademark of Spotify AB.</disclaimer>
         <source>https://github.com/primez-x/plugin.audio.spotifykodiconnect</source>
-        <news>v1.0.20
+        <news>v1.0.21
+- Fix silent "blank track" playback after short Spotty reads: large short downloads now retry from the buffered byte offset and fail cleanly after retries instead of padding minutes of fake silence while Kodi's OSD advances.
+- Restore bounded short-tail padding only for small duration mismatches, preserving Kodi cache stability without masking real stream truncation.
+
+v1.0.20
 - Fix daylist/multi-page playlist autoplay firing mid-load: new plugin-owned play-queue session coordinates the plugin (paging tracks in) with the service (deciding when to fire autoplay), so autoplay only fires after the original playlist is fully loaded — no more destroyed queues.
 - Autoplay now APPENDS recommendations instead of clearing the playlist; deduped against existing queue contents.
 - Fix playback stalls when spotty delivers a short track: pad silence to the declared WAV length so Kodi's CFileCache doesn't enter an infinite reconnect loop (spinner/lockup on track transitions).

@@ -6,6 +6,7 @@ from utils import log_exception, log_msg
 from xbmc import LOGDEBUG, LOGERROR, LOGWARNING
 
 PCM_BYTES_PER_SEC = 176400
+_SHORT_FINISH_PADDING_MAX_BYTES = PCM_BYTES_PER_SEC * 10
 
 
 def _clamp_volume(value: int) -> int:
@@ -61,8 +62,8 @@ class SpottyDownloader:
         self.startup_silence_bytes -= self.startup_silence_bytes % 4
 
         self._buffer = bytearray()
-        self._consumed_pos = 0      # furthest byte any consumer has read (abs, rel start_byte)
-        self._trim_offset = 0       # absolute pos of buffer head (rel start_byte)
+        self._consumed_pos = 0  # furthest byte any consumer has read (abs, rel start_byte)
+        self._trim_offset = 0  # absolute pos of buffer head (rel start_byte)
 
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
@@ -97,10 +98,11 @@ class SpottyDownloader:
             self.thread = threading.Thread(target=self._download_loop, daemon=True)
             self.thread.start()
 
-    def _build_args(self):
+    def _build_args(self, start_byte=None):
         # Calculate start position in seconds. 176400 bytes per second (44.1kHz, 16-bit, stereo)
+        target_start_byte = self.start_byte if start_byte is None else int(start_byte)
         header_len = len(self.wav_header)
-        pcm_target_offset = max(0, self.start_byte - header_len - self.startup_silence_bytes)
+        pcm_target_offset = max(0, target_start_byte - header_len - self.startup_silence_bytes)
         start_sec_wav = pcm_target_offset // PCM_BYTES_PER_SEC if pcm_target_offset > 0 else 0
 
         args = [
@@ -122,11 +124,9 @@ class SpottyDownloader:
             args += ["--start-position", str(start_sec_wav)]
         return args, (pcm_target_offset % PCM_BYTES_PER_SEC)
 
-    # Session-conflict retry: when spotty exits cleanly (rc=0) but produces
-    # 0 PCM bytes, Spotify's backend hasn't released the previous session yet.
-    # The new spotty process gets kicked immediately.  Retry after a delay so
-    # the HTTP generator keeps the response open (is_finished stays False) and
-    # Kodi doesn't see a partial-file error.
+    # Session/transient retry: when spotty exits before enough real PCM arrives,
+    # keep the HTTP generator open and retry from the byte offset already buffered.
+    # Small tail mismatches can be padded, but large gaps are stream failures.
     _MAX_SESSION_RETRIES = 3
     _RETRY_DELAYS = [1.0, 3.0, 5.0]
 
@@ -140,7 +140,8 @@ class SpottyDownloader:
             process = None
             pcm_bytes_read = 0
             try:
-                args, pcm_skip = self._build_args()
+                attempt_start_byte = self.start_byte + self.written_bytes
+                args, pcm_skip = self._build_args(attempt_start_byte)
                 process = self.spotty.run_spotty(args)
 
                 with self.cond:
@@ -187,15 +188,25 @@ class SpottyDownloader:
             if self.aborted:
                 return
 
-            # Detect session conflict or transient error: spotty produced no audio.
-            # Retry regardless of exit code when 0 PCM bytes were received — a non-zero
-            # exit with 0 bytes is equally unplayable (network blip, auth hiccup, etc.).
             rc = process.returncode if process else -1
-            if pcm_bytes_read == 0 and attempt < self._MAX_SESSION_RETRIES:
+            with self.cond:
+                remaining = max(0, (self.track_length - self.start_byte) - self.written_bytes)
+
+            large_short_finish = remaining > _SHORT_FINISH_PADDING_MAX_BYTES
+            retryable_finish = remaining > 0 and (
+                pcm_bytes_read == 0 or large_short_finish or rc != 0
+            )
+            if retryable_finish and attempt < self._MAX_SESSION_RETRIES:
                 delay = self._RETRY_DELAYS[min(attempt, len(self._RETRY_DELAYS) - 1)]
+                if pcm_bytes_read == 0:
+                    reason = "produced 0 PCM bytes"
+                elif large_short_finish:
+                    reason = f"finished {remaining} bytes short"
+                else:
+                    reason = f"exited with code {rc}"
                 log_msg(
-                    f"Spotty produced 0 PCM bytes for {self.track_id} "
-                    f"(rc={rc}, session conflict or transient error). "
+                    f"Spotty {reason} for {self.track_id} "
+                    f"(rc={rc}, transient stream failure). "
                     f"Retry {attempt + 1}/{self._MAX_SESSION_RETRIES} after {delay}s.",
                     LOGWARNING,
                 )
@@ -212,7 +223,8 @@ class SpottyDownloader:
             # Normal finish or final retry failure.
             with self.cond:
                 if not self.aborted:
-                    if pcm_bytes_read == 0:
+                    remaining = max(0, (self.track_length - self.start_byte) - self.written_bytes)
+                    if pcm_bytes_read == 0 and remaining > 0:
                         log_msg(
                             f"Spotty produced 0 PCM bytes after "
                             f"{self._MAX_SESSION_RETRIES} retries for "
@@ -220,20 +232,23 @@ class SpottyDownloader:
                             LOGWARNING,
                         )
                         self.error = True
-                    elif rc == 0:
-                        remaining = (self.track_length - self.start_byte) - self.written_bytes
-                        if remaining > 0:
-                            # Always pad when spotty exits cleanly but short.
-                            # The HTTP generator also pads, but doing it here
-                            # keeps the buffer consistent for range requests
-                            # and avoids Kodi's CFileCache infinite-retry loop.
+                    elif remaining > 0:
+                        if rc == 0 and remaining <= _SHORT_FINISH_PADDING_MAX_BYTES:
                             log_msg(
                                 f"Padding {remaining} bytes to end of {self.track_id}"
                                 f" (spotty exited cleanly but short)",
                             )
                             self._buffer.extend(bytes(remaining))
                             self.written_bytes += remaining
-                    else:
+                        else:
+                            log_msg(
+                                f"Spotty ended {remaining} bytes short for {self.track_id}"
+                                f" after {self._MAX_SESSION_RETRIES} retries (rc={rc})."
+                                f" Marking downloader as errored.",
+                                LOGWARNING,
+                            )
+                            self.error = True
+                    elif rc != 0:
                         log_msg(
                             f"Spotty exited with code {rc} for {self.track_id},"
                             f" marking downloader as errored.",
