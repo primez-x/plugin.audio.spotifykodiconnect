@@ -222,8 +222,15 @@ class SpottyDownloader:
                         self.error = True
                     elif rc == 0:
                         remaining = (self.track_length - self.start_byte) - self.written_bytes
-                        if 0 < remaining <= PCM_BYTES_PER_SEC * 10:
-                            log_msg(f"Padding {remaining} bytes to end of {self.track_id}")
+                        if remaining > 0:
+                            # Always pad when spotty exits cleanly but short.
+                            # The HTTP generator also pads, but doing it here
+                            # keeps the buffer consistent for range requests
+                            # and avoids Kodi's CFileCache infinite-retry loop.
+                            log_msg(
+                                f"Padding {remaining} bytes to end of {self.track_id}"
+                                f" (spotty exited cleanly but short)",
+                            )
                             self._buffer.extend(bytes(remaining))
                             self.written_bytes += remaining
                     else:

@@ -283,5 +283,155 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
         self.assertEqual(0, service._prebuffer_token)
 
 
+class SpotifyAutoplayGatingTests(unittest.TestCase):
+    """Regression coverage for the daylist autoplay-destroys-queue bug.
+
+    The plugin's play_playlist opens a play-queue session and pages the rest
+    of the original playlist in the background. The service's
+    __on_spotify_playback_started must NOT fire autoplay while that paging
+    is in progress, even when Kodi reports "no next item" mid-load.
+    """
+
+    def tearDown(self):
+        FakeWindow.windows.clear()
+        for module_name in (
+            "main_service",
+            "playlist_next",
+            "play_queue",
+            "xbmc",
+            "xbmcaddon",
+            "xbmcgui",
+            "bottle_manager",
+            "spotipy",
+            "spotty",
+            "http_spotty_audio_streamer",
+            "prebuffer",
+            "spotty_auth",
+            "spotty_helper",
+            "utils",
+            "string_ids",
+        ):
+            sys.modules.pop(module_name, None)
+
+    def _build_service(self, main_service, autoplay_enabled=True):
+        """Create a minimal MainService shell with autoplay-relevant state.
+
+        Returns (service, fired_list) where fired_list is appended to each
+        time _start_daemon_thread would have fired the autoplay task.
+        """
+        # Simulate "no next item" — this is the branch where autoplay is
+        # considered. The plugin process is still paging, Kodi's playlist
+        # is briefly empty at the playback-order tail, etc.
+        main_service.get_next_playlist_item = lambda: ({"file": ""}, None)
+
+        fired = []
+
+        def _capture_start(target, args=(), task_name=""):
+            # Only the autoplay task interests us; other deferred workers
+            # (prebuffer, liked-state refresh) aren't fired from this branch.
+            if "autoplay" in task_name:
+                fired.append((task_name, args))
+
+        main_service._start_daemon_thread = _capture_start
+
+        service = object.__new__(main_service.MainService)
+        # __on_spotify_playback_started passes self.__queue_autoplay_tracks
+        # to _start_daemon_thread; provide a no-op so the captured callable
+        # can be invoked without exploding if a test actually runs it.
+        service._MainService__queue_autoplay_tracks = lambda seed: None
+        return service, fired
+
+    def test_autoplay_does_not_fire_while_original_playlist_is_loading(self):
+        main_service = import_main_service(
+            {"Player.FileNameAndPath": "http://127.0.0.1:52309/track/seed/180.wav"},
+            {"spotify_autoplay": "true"},
+        )
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        # Plugin has opened a session but paging isn't finished.
+        win.setProperty("Spotify.PlayQueue.SessionId", "test-session")
+        win.setProperty("Spotify.PlayQueue.OriginalComplete", "false")
+
+        service, fired = self._build_service(main_service)
+        service._MainService__on_spotify_playback_started("seed")
+
+        self.assertEqual([], fired, "Autoplay must not fire while original is still loading")
+
+    def test_autoplay_fires_when_original_playlist_marked_complete(self):
+        main_service = import_main_service(
+            {"Player.FileNameAndPath": "http://127.0.0.1:52309/track/seed/180.wav"},
+            {"spotify_autoplay": "true"},
+        )
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        win.setProperty("Spotify.PlayQueue.SessionId", "test-session")
+        win.setProperty("Spotify.PlayQueue.OriginalComplete", "true")
+        win.setProperty("Spotify.PlayQueue.AutoplayFetched", "false")
+
+        service, fired = self._build_service(main_service)
+        service._MainService__on_spotify_playback_started("seed")
+
+        self.assertEqual(1, len(fired), "Autoplay should fire once original is complete")
+        self.assertEqual(("seed",), fired[0][1])
+
+    def test_autoplay_does_not_fire_twice_for_same_session(self):
+        """Multiple onPlayBackStarted callbacks (e.g. Kodi re-buffering) must
+        not trigger multiple autoplay fetches for the same session."""
+        main_service = import_main_service(
+            {"Player.FileNameAndPath": "http://127.0.0.1:52309/track/seed/180.wav"},
+            {"spotify_autoplay": "true"},
+        )
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        win.setProperty("Spotify.PlayQueue.SessionId", "test-session")
+        win.setProperty("Spotify.PlayQueue.OriginalComplete", "true")
+
+        service, fired = self._build_service(main_service)
+        for _ in range(4):
+            service._MainService__on_spotify_playback_started("seed")
+
+        self.assertEqual(1, len(fired), "Subsequent callbacks must see the claimed slot")
+
+    def test_autoplay_fires_when_no_session_active(self):
+        """Single-track playback (no play_playlist call) opens no session.
+        The legacy autoplay path must still work — fall back to firing."""
+        main_service = import_main_service(
+            {"Player.FileNameAndPath": "http://127.0.0.1:52309/track/seed/180.wav"},
+            {"spotify_autoplay": "true"},
+        )
+
+        service, fired = self._build_service(main_service)
+        service._MainService__on_spotify_playback_started("seed")
+
+        self.assertEqual(1, len(fired), "No session → legacy autoplay fires")
+
+    def test_autoplay_respects_disabled_setting_even_when_complete(self):
+        main_service = import_main_service(
+            {"Player.FileNameAndPath": "http://127.0.0.1:52309/track/seed/180.wav"},
+            {"spotify_autoplay": "false"},
+        )
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        win.setProperty("Spotify.PlayQueue.SessionId", "test-session")
+        win.setProperty("Spotify.PlayQueue.OriginalComplete", "true")
+
+        service, fired = self._build_service(main_service)
+        service._MainService__on_spotify_playback_started("seed")
+
+        self.assertEqual([], fired, "User-disabled autoplay must never fire")
+
+    def test_osd_clear_wipes_play_queue_session_state(self):
+        """When playback stops, _SpotifyOSDPlayerMonitor._clear() must drop
+        the play-queue session so a stale 'loading' state doesn't suppress
+        autoplay for the next play."""
+        main_service = import_main_service({})
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        win.setProperty("Spotify.PlayQueue.SessionId", "stale-session")
+        win.setProperty("Spotify.PlayQueue.OriginalComplete", "false")
+        win.setProperty("Spotify.PlayQueue.AutoplayFetched", "true")
+
+        main_service._SpotifyOSDPlayerMonitor()._clear()
+
+        self.assertEqual("", win.getProperty("Spotify.PlayQueue.SessionId"))
+        self.assertEqual("", win.getProperty("Spotify.PlayQueue.OriginalComplete"))
+        self.assertEqual("", win.getProperty("Spotify.PlayQueue.AutoplayFetched"))
+
+
 if __name__ == "__main__":
     unittest.main()

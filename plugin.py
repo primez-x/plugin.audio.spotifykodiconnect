@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-    plugin.audio.spotify
-    Unofficial Spotify client for Kodi
+plugin.audio.spotify
+Unofficial Spotify client for Kodi
 """
 
 from resources.lib.plugin_content import PluginContent

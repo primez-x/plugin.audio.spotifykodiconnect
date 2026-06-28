@@ -20,6 +20,11 @@ import xbmcvfs
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import *
+from play_queue import (
+    mark_original_complete as play_queue_mark_original_complete,
+    report_loaded as play_queue_report_loaded,
+    start_session as play_queue_start_session,
+)
 from utils import (
     ADDON_ID,
     ADDON_WINDOW_ID,
@@ -1475,9 +1480,22 @@ class PluginContent:
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
     def play_playlist(self) -> None:
-        """Play entire playlist: start first page immediately, queue rest in background."""
+        """Play entire playlist: start first page immediately, queue rest in background.
+
+        Opens a play-queue session (see ``play_queue``) so the service knows
+        when the original playlist is fully loaded and only then considers
+        firing autoplay. Without this coordination the service used to see
+        a transient "no next item" gap during background paging and fire
+        autoplay destructively mid-load.
+        """
         playlist_details = self.__get_playlist_summary(self.__playlist_id)
-        total = playlist_details.get("tracks", {}).get("total") or 0
+        total = int(playlist_details.get("tracks", {}).get("total") or 0)
+        # Start session BEFORE we touch Kodi's playlist so the service sees
+        # original_complete=false the moment it receives the first
+        # onPlayBackStarted callback. If the playlist fits in one page we
+        # mark complete at session start (handled inside start_session when
+        # total <= 0, otherwise mark_original_complete below after paging).
+        play_queue_start_session(total)
         page_limit = 50
         raw_items = self.__get_playlist_items_page(
             playlist_details["id"], offset=0, limit=page_limit
@@ -1495,20 +1513,28 @@ class PluginContent:
         kodi_playlist = xbmc.PlayList(0)
         kodi_playlist.clear()
 
+        loaded_count = 0
         for track in items:
             item = self.__get_track_item(track, True)
             if item is not None:
                 url, li = item
                 kodi_playlist.add(url, li)
+                loaded_count += 1
+        play_queue_report_loaded(loaded_count)
 
         xbmc.Player().play(kodi_playlist)
 
         next_offset = len(raw_items)
-        if total > next_offset:
+        # Fit-in-one-page path: nothing more to page, original is complete.
+        if total <= next_offset:
+            play_queue_mark_original_complete()
+            return
 
-            def add_remaining():
-                monitor = xbmc.Monitor()
-                offset = next_offset
+        def add_remaining():
+            monitor = xbmc.Monitor()
+            offset = next_offset
+            nonlocal_loaded = loaded_count
+            try:
                 while total > offset:
                     if monitor.abortRequested():
                         return
@@ -1523,6 +1549,7 @@ class PluginContent:
                         include_context_items=False,
                         include_artist_fanart=False,
                     )
+                    page_added = 0
                     for track in tracks:
                         if monitor.abortRequested():
                             return
@@ -1531,13 +1558,22 @@ class PluginContent:
                             if item is not None:
                                 u, listitem = item
                                 kodi_playlist.add(u, listitem)
+                                page_added += 1
                         except Exception:
                             pass
                         xbmc.sleep(2)
                     offset += len(raw_page)
+                    nonlocal_loaded += page_added
+                    play_queue_report_loaded(nonlocal_loaded)
+            finally:
+                # Always mark complete when the paging loop exits, whether it
+                # finished naturally, hit abort, or got an empty page. Without
+                # this, an early exit leaves the service stuck thinking the
+                # original is still loading and autoplay never fires.
+                play_queue_mark_original_complete()
 
-            t = threading.Thread(target=add_remaining, daemon=True)
-            t.start()
+        t = threading.Thread(target=add_remaining, daemon=True)
+        t.start()
 
     def __get_category(self, categoryid: str) -> Playlist:
         categoryid = self.__resolve_category_id(categoryid)

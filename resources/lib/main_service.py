@@ -16,7 +16,9 @@ import xbmc
 import xbmcaddon
 import xbmcgui
 from http_spotty_audio_streamer import HTTPSpottyAudioStreamer
-from playlist_next import get_next_playlist_item, parse_track_url
+from play_queue import clear as play_queue_clear
+from play_queue import should_fire_autoplay as play_queue_should_fire_autoplay
+from playlist_next import get_next_playlist_item, get_playlist_track_ids, parse_track_url
 from prebuffer import PrebufferManager
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
@@ -278,6 +280,9 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
         win.clearProperty("Spotify.CurrentTrackId")
         win.clearProperty("Spotify.CurrentTrackLiked")
         _clear_playback_hooks()
+        # Drop any active play-queue session so a stale "loading" state from
+        # a previous play doesn't suppress autoplay for the next one.
+        play_queue_clear()
 
     def onPlayBackStopped(self) -> None:
         self._clear()
@@ -535,11 +540,18 @@ class MainService:
             _current_item, next_item = get_next_playlist_item()
             if not next_item:
                 if SPOTIFY_ADDON.getSetting("spotify_autoplay").lower() == "true":
-                    _start_daemon_thread(
-                        self.__queue_autoplay_tracks,
-                        args=(track_id,),
-                        task_name="autoplay queue fill",
-                    )
+                    # Consult the play-queue session before firing. The plugin
+                    # opens a session at the start of play_playlist and marks
+                    # original_complete when its paging thread finishes; until
+                    # then a "no next item" signal is a paging gap, not true
+                    # exhaustion, and firing autoplay here would destroy the
+                    # in-flight queue (the daylist bug).
+                    if play_queue_should_fire_autoplay():
+                        _start_daemon_thread(
+                            self.__queue_autoplay_tracks,
+                            args=(track_id,),
+                            task_name="autoplay queue fill",
+                        )
                 return
 
             next_track_id, next_duration = parse_track_url(next_item.get("file") or "")
@@ -632,7 +644,13 @@ class MainService:
             pass
 
     def __queue_autoplay_tracks(self, seed_track_id: str) -> None:
-        """Fetch recommended tracks and append them to Kodi's music playlist."""
+        """Fetch recommended tracks and APPEND them to Kodi's music playlist.
+
+        Does NOT clear the existing playlist — the seed track is already
+        there and currently playing. Recommendations are deduped against
+        both the seed and any track already in the playlist so we don't
+        replay something the user just heard.
+        """
         try:
             token = get_cached_auth_token()
             if not token:
@@ -641,7 +659,6 @@ class MainService:
 
             sp = spotipy.Spotify(auth=token)
 
-            # Fetch a larger set of recommendations to fill the autoplay playlist.
             RECOMMEND_LIMIT = 49
             result = sp.recommendations(seed_tracks=[seed_track_id], limit=RECOMMEND_LIMIT)
             rec_tracks = (result or {}).get("tracks") or []
@@ -649,93 +666,36 @@ class MainService:
                 log_msg("Autoplay: no recommendations returned.", LOGDEBUG)
                 return
 
-            # Build a new playlist: put the current (seed) track first, then the recommendations.
             playlist = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
-            try:
-                playlist.clear()
-            except Exception:
-                # Some Kodi versions may not support clear(); fall back to creating and replacing.
-                pass
 
-            added = 0
+            # Dedup against the seed AND the existing playlist contents.
+            # Before the play-queue migration this used playlist.clear()
+            # which made dedup moot; now that we append, we need it.
+            seen_ids = get_playlist_track_ids()
+            seen_ids.add(seed_track_id)
 
-            # Add the current/seed track as the first item (fetch its metadata if possible).
-            try:
-                seed_info = sp.track(seed_track_id)
-                seed_name = (seed_info or {}).get("name") or ""
-                seed_duration_ms = (seed_info or {}).get("duration_ms") or 0
-                seed_artists = (seed_info or {}).get("artists") or []
-                seed_artist_name = seed_artists[0].get("name") or "" if seed_artists else ""
-                seed_album = (seed_info or {}).get("album") or {}
-                seed_album_name = seed_album.get("name") or ""
-                seed_images = seed_album.get("images") or []
-                seed_art_url = seed_images[0].get("url") if seed_images else ""
-                seed_duration_sec = math.ceil(seed_duration_ms / 1000) if seed_duration_ms else 1
-                seed_url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{seed_track_id}/{seed_duration_sec}.wav"
-                li = xbmcgui.ListItem(label=seed_name or seed_track_id)
-                li.setProperty("IsPlayable", "true")
-                li.setProperty("spotifytrackid", seed_track_id)
-                # Set rich music info and artwork so Kodi shows titles, artist and cover art.
-                li.setInfo(
-                    "music",
-                    {
-                        "title": seed_name,
-                        "artist": seed_artist_name,
-                        "album": seed_album_name,
-                        "duration": seed_duration_sec,
-                    },
-                )
-                if seed_art_url:
-                    try:
-                        li.setArt(
-                            {
-                                "thumb": seed_art_url,
-                                "icon": seed_art_url,
-                                "fanart": seed_art_url,
-                            }
-                        )
-                    except Exception:
-                        pass
-                playlist.add(seed_url, li)
-                added += 1
-            except Exception:
-                # If fetching metadata fails, still add a minimal entry for the seed track.
-                try:
-                    seed_url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{seed_track_id}/1.wav"
-                    li = xbmcgui.ListItem(label=seed_track_id)
-                    li.setProperty("IsPlayable", "true")
-                    li.setProperty("spotifytrackid", seed_track_id)
-                    playlist.add(seed_url, li)
-                    added += 1
-                except Exception:
-                    pass
-
-            # Helper to avoid duplicates (seed may appear in recommendations).
-            seen_ids = {seed_track_id}
-
-            # Fetch recommended tracks in batches to reduce API calls and follow the
-            # same batched-fetch pattern used elsewhere in the addon.
             rec_ids = [t.get("id") for t in rec_tracks if t.get("id")]
-            # Keep original recommendation order but remove duplicates and already seen IDs.
             rec_ids = [rid for rid in rec_ids if rid and rid not in seen_ids]
 
             from utils import get_chunks
 
+            added = 0
             for chunk in get_chunks(rec_ids, 20):
+                if added >= RECOMMEND_LIMIT:
+                    break
                 try:
                     batch = sp.tracks(chunk, market=None).get("tracks") or []
                 except Exception:
-                    # On error, fall back to per-track calls for this chunk
+                    # Fall back to per-track calls for this chunk.
                     batch = []
                     for tid in chunk:
                         try:
-                            t = sp.track(tid)
-                            batch.append(t)
+                            batch.append(sp.track(tid))
                         except Exception:
                             continue
 
                 for full in batch:
-                    if added >= (RECOMMEND_LIMIT + 1):
+                    if added >= RECOMMEND_LIMIT:
                         break
                     try:
                         tid = full.get("id") or ""
@@ -781,12 +741,12 @@ class MainService:
                         pass
 
             log_msg(
-                f"Autoplay: built new playlist with {added} items (seed={seed_track_id}).",
+                f"Autoplay: appended {added} recommendations (seed={seed_track_id}).",
                 LOGDEBUG,
             )
 
         except Exception as exc:
-            log_msg(f"Autoplay: failed to build autoplay playlist: {exc}", LOGWARNING)
+            log_msg(f"Autoplay: failed to append autoplay tracks: {exc}", LOGWARNING)
 
     def __on_track_finished(self, track_id: str) -> None:
         """Mark HTTP streamer as ended so the next request is treated as a new track.

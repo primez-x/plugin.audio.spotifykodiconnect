@@ -7,6 +7,7 @@ This module intentionally contains **no** integration with the external
 It only provides utilities to inspect Kodi's music playlist to determine
 the current and next queued track and to parse our stream URLs.
 """
+
 from __future__ import absolute_import, unicode_literals
 
 import json
@@ -119,3 +120,29 @@ def get_next_playlist_item():
     next_item = items[1] if len(items) > 1 else None
     return current_item, next_item
 
+
+def get_playlist_track_ids():
+    """
+    Return the set of Spotify track IDs currently in Kodi's music playlist.
+
+    Used by autoplay to avoid appending recommendations that are already in
+    the playlist (now that autoplay appends instead of clearing). Returns an
+    empty set on any error so callers fail open.
+    """
+    result = _jsonrpc(
+        method="Playlist.GetItems",
+        params={
+            "playlistid": PLAYLIST_MUSIC,
+            "properties": ["file"],
+        },
+    )
+    if not result or "result" not in result:
+        return set()
+    items = result.get("result", {}).get("items") or []
+    ids = set()
+    for item in items:
+        file_url = item.get("file") or ""
+        track_id, _ = parse_track_url(file_url)
+        if track_id:
+            ids.add(track_id)
+    return ids

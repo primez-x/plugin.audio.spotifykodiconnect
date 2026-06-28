@@ -7,13 +7,17 @@ cache_path = r"C:\Users\Matt\AppData\Roaming\Kodi\userdata\addon_data\plugin.aud
 
 args = [
     spotty_path,
-    "--cache", cache_path,
+    "--cache",
+    cache_path,
     "--disable-audio-cache",
     "--disable-discovery",
-    "--bitrate", "320",
+    "--bitrate",
+    "320",
     "--enable-volume-normalisation",
-    "--normalisation-gain-type", "track",
-    "--single-track", "spotify:track:11dFghVXANMlKmJXsNCbNl"
+    "--normalisation-gain-type",
+    "track",
+    "--single-track",
+    "spotify:track:11dFghVXANMlKmJXsNCbNl",
 ]
 
 print("Running:", " ".join(args))
@@ -29,7 +33,7 @@ while True:
     total_bytes += len(data)
     elapsed = time.time() - t0
     # Print progress every MB
-    if total_bytes % (1024*1024) < 524288:
+    if total_bytes % (1024 * 1024) < 524288:
         print(f"Read {total_bytes} bytes in {elapsed:.2f} seconds")
 
 print(f"Finished: {total_bytes} bytes in {time.time()-t0:.2f} seconds")

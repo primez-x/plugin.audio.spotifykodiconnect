@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-    plugin.audio.spotify
-    Spotify player for Kodi
-    Main service entry point
+plugin.audio.spotify
+Spotify player for Kodi
+Main service entry point
 """
 
 if __name__ == "__main__":

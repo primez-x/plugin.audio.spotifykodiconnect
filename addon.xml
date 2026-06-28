@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<addon id="plugin.audio.spotifykodiconnect" version="1.0.19" name="SpotifyKodiConnect" provider-name="primez-x">
+<addon id="plugin.audio.spotifykodiconnect" version="1.0.20" name="SpotifyKodiConnect" provider-name="primez-x">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
         <import addon="xbmc.addon" version="18.9.701" />
@@ -19,7 +19,13 @@
         <description lang="en_GB">Unofficial Spotify music plugin for Kodi. Improves on the original Spotify addon with consistent album/artist art in all views (including playlists), correct metadata tags, and background loading so navigation and playback feel smooth. Requires Spotify Premium.</description>
         <disclaimer lang="en_GB">This product uses the SPOTIFY WEB API but is not endorsed, certified or otherwise approved in any way by Spotify. Spotify is the registered trademark of Spotify AB.</disclaimer>
         <source>https://github.com/primez-x/plugin.audio.spotifykodiconnect</source>
-        <news>v1.0.16
+        <news>v1.0.20
+- Fix daylist/multi-page playlist autoplay firing mid-load: new plugin-owned play-queue session coordinates the plugin (paging tracks in) with the service (deciding when to fire autoplay), so autoplay only fires after the original playlist is fully loaded — no more destroyed queues.
+- Autoplay now APPENDS recommendations instead of clearing the playlist; deduped against existing queue contents.
+- Fix playback stalls when spotty delivers a short track: pad silence to the declared WAV length so Kodi's CFileCache doesn't enter an infinite reconnect loop (spinner/lockup on track transitions).
+- Remove the 10-second cap on spotty short-track padding.
+
+v1.0.16
 - Tear down all Spotify audio resources (spotty processes, HTTP streams, prebuffer, cache downloads) the instant a non-Spotify player starts, preventing Amlogic audio driver deadlocks when switching from Spotify to a movie (e.g. via PlexKodiConnect).
 
 v1.0.15
