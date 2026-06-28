@@ -353,12 +353,9 @@ class SpottyAudioStreamer:
                 elif is_finished:
                     break
 
-            # Pad silence if the downloader finished short of the declared
-            # Content-Length.  Without this, Kodi's CFileCache sees a truncated
-            # response (Content-Length promised more bytes than the generator
-            # yielded) and enters an infinite reconnect loop — the spinner/stall
-            # the user experiences.  Padding lets the response complete cleanly
-            # so Kodi advances to the next track instead of hanging.
+            # Pad only small tail mismatches. Large gaps mean spotty delivered an
+            # incomplete track; padding those turns a failed stream into minutes
+            # of fake silence while Kodi's OSD keeps advancing.
             remaining = range_len - bytes_sent
             if remaining > 0 and not self.__terminated:
                 with downloader.cond:
@@ -366,18 +363,26 @@ class SpottyAudioStreamer:
                     dl_error = downloader.error
                     dl_aborted = downloader.aborted
                 if dl_finished and not dl_error and not dl_aborted:
-                    log_msg(
-                        f"Padding {remaining} bytes of silence for {track_id}"
-                        f" (downloader finished short of declared length,"
-                        f" sent={bytes_sent}, expected={range_len})",
-                        LOGWARNING,
-                    )
-                    silence_chunk = bytes(min(self.chunk_size, 1048576))
-                    while remaining > 0 and not self.__terminated:
-                        to_yield = min(len(silence_chunk), remaining)
-                        yield silence_chunk[:to_yield]
-                        bytes_sent += to_yield
-                        remaining -= to_yield
+                    if remaining <= _SILENCE_PADDING_MAX_BYTES:
+                        log_msg(
+                            f"Padding {remaining} bytes of silence for {track_id}"
+                            f" (downloader finished short of declared length,"
+                            f" sent={bytes_sent}, expected={range_len})",
+                            LOGWARNING,
+                        )
+                        silence_chunk = bytes(min(self.chunk_size, 1048576))
+                        while remaining > 0 and not self.__terminated:
+                            to_yield = min(len(silence_chunk), remaining)
+                            yield silence_chunk[:to_yield]
+                            bytes_sent += to_yield
+                            remaining -= to_yield
+                    else:
+                        log_msg(
+                            f"Not padding {remaining} bytes of silence for {track_id}"
+                            f" (downloader finished far short of declared length,"
+                            f" sent={bytes_sent}, expected={range_len})",
+                            LOGWARNING,
+                        )
 
             end_of_range = range_begin + bytes_sent
             if track_length > 0 and end_of_range >= track_length:
