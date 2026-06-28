@@ -19,6 +19,14 @@ def _clamp_volume(value: int) -> int:
 class SpottyDownloader:
     """Downloads a single track from spotty into an in-memory buffer in the background."""
 
+    # Maximum bytes the writer will buffer AHEAD of the consumer's furthest read
+    # position.  When ``written_bytes - _consumed_pos`` exceeds this, the writer
+    # pauses (backpressure) until the consumer drains.  Bounds memory without
+    # trimming the buffer head, so multiple concurrent range requests on the same
+    # downloader (Kodi pre-fetch + main read) can read any byte already written.
+    # 8 MB ≈ 45 s of PCM at 176 400 B/s — comfortably ahead of realtime playback.
+    _MAX_AHEAD_BYTES = 8 * 1024 * 1024
+
     def __init__(
         self,
         spotty: Spotty,
@@ -45,6 +53,7 @@ class SpottyDownloader:
         self.startup_silence_bytes -= self.startup_silence_bytes % 4
 
         self._buffer = bytearray()
+        self._consumed_pos = 0      # furthest byte position any consumer has read
 
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
@@ -146,6 +155,18 @@ class SpottyDownloader:
                     with self.cond:
                         self._buffer.extend(chunk)
                         self.written_bytes += len(chunk)
+                        # Backpressure: pause when the writer has buffered too far
+                        # ahead of the consumer.  Bounds memory to ~_MAX_AHEAD_BYTES
+                        # per downloader without trimming, so any byte already
+                        # written remains readable by concurrent range requests.
+                        while (
+                            self.written_bytes - self._consumed_pos > self._MAX_AHEAD_BYTES
+                            and not self.aborted
+                            and not self.error
+                        ):
+                            self.cond.wait(timeout=2.0)
+                            if self.aborted:
+                                return
                         self.cond.notify_all()
 
                 if process.poll() is None and not self.aborted:
@@ -235,6 +256,7 @@ class SpottyDownloader:
         self.abort()
         with self.cond:
             self._buffer.clear()
+            self._consumed_pos = 0
 
     def wait_for_bytes(self, target_bytes: int, timeout: float = None) -> bool:
         with self.cond:
