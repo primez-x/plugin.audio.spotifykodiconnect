@@ -47,6 +47,8 @@ class FakeDownloader:
         self.auto_fill = auto_fill
         self._consumed_pos = 0
         self._trim_offset = 0
+        self._consumer_positions = {}
+        self._next_consumer_id = 0
         self.is_finished = False
         self.error = False
         self.aborted = False
@@ -59,6 +61,9 @@ class FakeDownloader:
             self._buffer.extend(bytes(target_bytes - self.written_bytes))
             self.written_bytes = target_bytes
         return True
+
+    def _trim_head_locked(self):
+        return None
 
 
 class FakeStdout:
@@ -329,6 +334,69 @@ class SpottyAudioStreamerTests(unittest.TestCase):
 
         self.assertEqual(dl._trim_offset, 0)
         self.assertEqual(len(dl._buffer), len(wav_header) + 3 * 1024 * 1024)
+
+    def test_trim_head_uses_slowest_active_consumer(self):
+        """One fast range reader must not trim bytes a slower reader still needs."""
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+
+        wav_header, track_length = self.module.create_wav_header_for_duration(180)
+        dl = spotty_cache.SpottyDownloader(
+            spotty=object(),
+            track_id="t1",
+            duration_sec=180,
+            start_byte=0,
+            bitrate="320",
+            normalization="off",
+            volume=35,
+            wav_header=wav_header,
+            track_length=track_length,
+            startup_silence_bytes=0,
+        )
+        dl._download_loop = lambda: None
+        dl.start()
+
+        slow_reader_pos = 1536 * 1024
+        fast_reader_pos = 3 * 1024 * 1024
+        with dl.cond:
+            dl._buffer.extend(bytes(4 * 1024 * 1024))
+            dl.written_bytes += 4 * 1024 * 1024
+            dl._consumer_positions = {1: slow_reader_pos, 2: fast_reader_pos}
+            dl._consumed_pos = fast_reader_pos
+            dl._trim_head_locked()
+
+        self.assertEqual(slow_reader_pos, dl._trim_offset)
+
+    def test_trim_head_does_not_overflow_drop_active_reader_bytes(self):
+        """The unread-tail cap must not discard bytes from an active reader."""
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+
+        wav_header, track_length = self.module.create_wav_header_for_duration(180)
+        dl = spotty_cache.SpottyDownloader(
+            spotty=object(),
+            track_id="t1",
+            duration_sec=180,
+            start_byte=0,
+            bitrate="320",
+            normalization="off",
+            volume=35,
+            wav_header=wav_header,
+            track_length=track_length,
+            startup_silence_bytes=0,
+        )
+        dl._download_loop = lambda: None
+        dl.start()
+
+        with dl.cond:
+            dl._buffer.extend(bytes(dl._MAX_UNREAD_TAIL_BYTES + 1024 * 1024))
+            dl.written_bytes += dl._MAX_UNREAD_TAIL_BYTES + 1024 * 1024
+            before = len(dl._buffer)
+            dl._consumer_positions = {1: 0}
+            dl._trim_head_locked()
+
+        self.assertEqual(0, dl._trim_offset)
+        self.assertEqual(before, len(dl._buffer))
 
     def test_find_best_downloader_skips_trimmed_positions(self):
         """A downloader that has trimmed past request_byte is not selected."""
