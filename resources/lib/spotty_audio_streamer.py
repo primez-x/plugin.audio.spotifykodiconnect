@@ -322,14 +322,6 @@ class SpottyAudioStreamer:
                         to_read = min(self.chunk_size, available, range_len - bytes_sent)
                         read_start = buf_offset + bytes_sent
                         chunk = bytes(downloader._buffer[read_start : read_start + to_read])
-                        # Track the furthest byte any consumer has read, so the
-                        # writer's backpressure (written_bytes - _consumed_pos)
-                        # can pause when too far ahead.  No trimming — every byte
-                        # written stays readable for concurrent range requests.
-                        downloader._consumed_pos = max(
-                            downloader._consumed_pos, read_start + to_read
-                        )
-                        downloader.cond.notify_all()
 
                 if chunk:
                     yield chunk
