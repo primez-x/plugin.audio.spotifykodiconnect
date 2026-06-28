@@ -22,8 +22,21 @@ class FakeAddon:
 
 
 class FakeWindow:
-    def __init__(self, window_id=None):
-        self.properties = {}
+    """Singleton-per-window-id, matching real Kodi semantics.
+
+    Real Kodi returns the same Window object for the same id, so plugin
+    writes (PluginContent.__win) and play_queue reads (_window()) land on
+    the same property store. Per-call instances would silently drop state.
+    """
+
+    windows = {}
+
+    def __new__(cls, window_id=None):
+        if window_id not in cls.windows:
+            instance = super().__new__(cls)
+            instance.properties = {}
+            cls.windows[window_id] = instance
+        return cls.windows[window_id]
 
     def getProperty(self, key):
         return self.properties.get(key, "")
@@ -567,6 +580,7 @@ class PlaylistFastPathTests(unittest.TestCase):
         RecordingPlaylist.instances.clear()
         RecordingPlayer.events.clear()
         DeferredThread.started_targets.clear()
+        FakeWindow.windows.clear()
 
     def build_content(self, spotify):
         content = object.__new__(self.plugin_content.PluginContent)
@@ -605,6 +619,83 @@ class PlaylistFastPathTests(unittest.TestCase):
         self.assertEqual(0, spotify.saved_album_calls)
         self.assertEqual(0, spotify.followed_artist_calls)
         self.assertEqual(0, spotify.artist_calls)
+
+    # --- play-queue session coordination --------------------------------------
+
+    def _play_queue_window(self):
+        """Grab the singleton FakeWindow play_queue writes to."""
+        return self.plugin_content.xbmcgui.Window(self.plugin_content.utils.ADDON_WINDOW_ID)
+
+    def test_play_playlist_opens_loading_session_for_multi_page_playlist(self):
+        """Multi-page playlist must start a play-queue session in "loading"
+        state so the service suppresses autoplay until paging completes."""
+        spotify = FakeSpotify(RecordingPlayer.events, total=75)
+        content = self.build_content(spotify)
+
+        content.play_playlist()
+
+        win = self._play_queue_window()
+        self.assertTrue(win.getProperty("Spotify.PlayQueue.SessionId"))
+        self.assertEqual("75", win.getProperty("Spotify.PlayQueue.OriginalTotal"))
+        self.assertEqual("50", win.getProperty("Spotify.PlayQueue.OriginalLoaded"))
+        self.assertEqual("false", win.getProperty("Spotify.PlayQueue.OriginalComplete"))
+        self.assertEqual("false", win.getProperty("Spotify.PlayQueue.AutoplayFetched"))
+
+    def test_play_playlist_marks_complete_immediately_for_single_page_playlist(self):
+        """Single-page playlist fits in one fetch — no paging thread needed,
+        original_complete must be true right away so the service can fire
+        autoplay when this playlist genuinely runs out."""
+        spotify = FakeSpotify(RecordingPlayer.events, total=1)
+        content = self.build_content(spotify)
+
+        content.play_playlist()
+
+        win = self._play_queue_window()
+        self.assertEqual("true", win.getProperty("Spotify.PlayQueue.OriginalComplete"))
+        # No paging thread should have been scheduled.
+        self.assertEqual(0, len(DeferredThread.started_targets))
+
+    def test_play_playlist_paging_thread_marks_complete_when_done(self):
+        """The deferred add_remaining thread must mark the original as
+        complete when it finishes paging, so the service can proceed."""
+        spotify = FakeSpotify(RecordingPlayer.events, total=75)
+        content = self.build_content(spotify)
+
+        content.play_playlist()
+        # Simulate the background thread actually running to completion.
+        DeferredThread.started_targets[0]()
+
+        win = self._play_queue_window()
+        self.assertEqual("true", win.getProperty("Spotify.PlayQueue.OriginalComplete"))
+        self.assertEqual("75", win.getProperty("Spotify.PlayQueue.OriginalLoaded"))
+
+    def test_play_playlist_paging_thread_marks_complete_even_on_empty_page(self):
+        """If paging exits early (e.g. Spotify returns an empty page mid-way),
+        the finally block must still mark original_complete. Without this,
+        a transient API hiccup would leave the session stuck in 'loading'
+        and autoplay would never fire."""
+        spotify = FakeSpotify(RecordingPlayer.events, total=75)
+        spotify._empty_after_offset = 50  # type: ignore[attr-defined]
+
+        def maybe_empty(playlist_id, market=None, fields="", limit=50, offset=0):
+            if offset >= 50:
+                return {"items": []}
+            return spotify.__class__.playlist_items(
+                spotify, playlist_id, market=market, fields=fields, limit=limit, offset=offset
+            )
+
+        spotify.playlist_items = maybe_empty
+        content = self.build_content(spotify)
+
+        content.play_playlist()
+        DeferredThread.started_targets[0]()
+
+        win = self._play_queue_window()
+        self.assertEqual(
+            "true",
+            win.getProperty("Spotify.PlayQueue.OriginalComplete"),
+            "finally block must mark complete even when paging exits early",
+        )
 
     def test_browse_playlist_uses_first_page_and_hidden_continuation(self):
         events = RecordingPlayer.events

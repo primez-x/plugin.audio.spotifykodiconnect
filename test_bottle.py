@@ -2,10 +2,14 @@ import threading
 import time
 import requests
 import sys
-sys.path.append(r"c:\Git repos\Kodi addons\Custom addons\plugin.audio.spotifykodiconnect\resources\lib\deps")
+
+sys.path.append(
+    r"c:\Git repos\Kodi addons\Custom addons\plugin.audio.spotifykodiconnect\resources\lib\deps"
+)
 import bottle
 
 app = bottle.Bottle()
+
 
 @app.route("/test")
 def test():
@@ -15,11 +19,13 @@ def test():
 
     def generate():
         yield b"hello" * 1000
-    
+
     return bottle.Response(generate())
+
 
 def run_server():
     bottle.run(app=app, port=52319, quiet=True)
+
 
 threading.Thread(target=run_server, daemon=True).start()
 time.sleep(1)

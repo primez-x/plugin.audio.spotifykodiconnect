@@ -353,6 +353,32 @@ class SpottyAudioStreamer:
                 elif is_finished:
                     break
 
+            # Pad silence if the downloader finished short of the declared
+            # Content-Length.  Without this, Kodi's CFileCache sees a truncated
+            # response (Content-Length promised more bytes than the generator
+            # yielded) and enters an infinite reconnect loop — the spinner/stall
+            # the user experiences.  Padding lets the response complete cleanly
+            # so Kodi advances to the next track instead of hanging.
+            remaining = range_len - bytes_sent
+            if remaining > 0 and not self.__terminated:
+                with downloader.cond:
+                    dl_finished = downloader.is_finished
+                    dl_error = downloader.error
+                    dl_aborted = downloader.aborted
+                if dl_finished and not dl_error and not dl_aborted:
+                    log_msg(
+                        f"Padding {remaining} bytes of silence for {track_id}"
+                        f" (downloader finished short of declared length,"
+                        f" sent={bytes_sent}, expected={range_len})",
+                        LOGWARNING,
+                    )
+                    silence_chunk = bytes(min(self.chunk_size, 1048576))
+                    while remaining > 0 and not self.__terminated:
+                        to_yield = min(len(silence_chunk), remaining)
+                        yield silence_chunk[:to_yield]
+                        bytes_sent += to_yield
+                        remaining -= to_yield
+
             end_of_range = range_begin + bytes_sent
             if track_length > 0 and end_of_range >= track_length:
                 self.__notify_track_finished(track_id)
