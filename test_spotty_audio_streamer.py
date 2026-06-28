@@ -44,6 +44,8 @@ class FakeDownloader:
         self._buffer = bytearray(wav_header)
         self._buffer.extend(initial_pcm)
         self.written_bytes = len(self._buffer)
+        self._consumed_pos = 0
+        self._trim_offset = 0
         self.is_finished = False
         self.error = False
         self.aborted = False
@@ -204,6 +206,111 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         self.assertIn("--start-position", args)
         self.assertEqual("1", args[args.index("--start-position") + 1])
         self.assertEqual(123, pcm_skip)
+
+    def test_trim_head_reclaims_consumed_bytes_without_blocking(self):
+        """_trim_head_locked releases consumed bytes; writer never stalls."""
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+
+        wav_header, track_length = self.module.create_wav_header_for_duration(180)
+        dl = spotty_cache.SpottyDownloader(
+            spotty=object(),
+            track_id="t1",
+            duration_sec=180,
+            start_byte=0,
+            bitrate="320",
+            normalization="off",
+            volume=35,
+            wav_header=wav_header,
+            track_length=track_length,
+            startup_silence_bytes=0,
+        )
+        dl._download_loop = lambda: None
+        dl.start()
+
+        pcm = bytes(2 * 1024 * 1024)
+        with dl.cond:
+            dl._buffer.extend(pcm)
+            dl.written_bytes += len(pcm)
+
+        full_len = len(dl._buffer)
+        self.assertGreater(full_len, 2 * 1024 * 1024)
+
+        with dl.cond:
+            dl._consumed_pos = dl.written_bytes
+            dl._trim_head_locked()
+
+        self.assertEqual(dl._trim_offset, dl.written_bytes)
+        self.assertLess(len(dl._buffer), dl._TRIM_BATCH_BYTES)
+
+    def test_trim_head_preserves_unconsumed_bytes(self):
+        """_trim_head_locked must not drop bytes the consumer hasn't read."""
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+
+        wav_header, track_length = self.module.create_wav_header_for_duration(180)
+        dl = spotty_cache.SpottyDownloader(
+            spotty=object(),
+            track_id="t1",
+            duration_sec=180,
+            start_byte=0,
+            bitrate="320",
+            normalization="off",
+            volume=35,
+            wav_header=wav_header,
+            track_length=track_length,
+            startup_silence_bytes=0,
+        )
+        dl._download_loop = lambda: None
+        dl.start()
+
+        pcm = bytes(3 * 1024 * 1024)
+        with dl.cond:
+            dl._buffer.extend(pcm)
+            dl.written_bytes += len(pcm)
+            dl._trim_head_locked()
+
+        self.assertEqual(dl._trim_offset, 0)
+        self.assertEqual(len(dl._buffer), len(wav_header) + 3 * 1024 * 1024)
+
+    def test_find_best_downloader_skips_trimmed_positions(self):
+        """A downloader that has trimmed past request_byte is not selected."""
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+
+        wav_header, track_length = self.module.create_wav_header_for_duration(180)
+        dl = spotty_cache.SpottyDownloader(
+            spotty=object(),
+            track_id="t1",
+            duration_sec=180,
+            start_byte=0,
+            bitrate="320",
+            normalization="off",
+            volume=35,
+            wav_header=wav_header,
+            track_length=track_length,
+            startup_silence_bytes=0,
+        )
+        dl._download_loop = lambda: None
+        dl.start()
+
+        with dl.cond:
+            dl._buffer.extend(bytes(2 * 1024 * 1024))
+            dl.written_bytes += 2 * 1024 * 1024
+            dl._consumed_pos = dl.written_bytes
+            dl._trim_head_locked()
+
+        self.assertGreater(dl._trim_offset, 0)
+
+        mgr = spotty_cache.SpottyCacheManager
+        mgr._instances[("t1", 0)] = dl
+        mgr._recent_tracks = ["t1"]
+        try:
+            self.assertIsNone(mgr.find_best_downloader("t1", 0))
+            self.assertIsNone(mgr.find_best_downloader("t1", 100))
+        finally:
+            mgr._instances.clear()
+            mgr._recent_tracks.clear()
 
 
 if __name__ == "__main__":

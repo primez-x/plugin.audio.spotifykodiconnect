@@ -321,7 +321,19 @@ class SpottyAudioStreamer:
                     if available > 0:
                         to_read = min(self.chunk_size, available, range_len - bytes_sent)
                         read_start = buf_offset + bytes_sent
-                        chunk = bytes(downloader._buffer[read_start : read_start + to_read])
+                        buf_idx = read_start - downloader._trim_offset
+                        if buf_idx < 0:
+                            self._log_transfer(
+                                "trimmed",
+                                msg="Requested byte trimmed from buffer head",
+                                read_start=read_start,
+                                trim_offset=downloader._trim_offset,
+                            )
+                            break
+                        chunk = bytes(downloader._buffer[buf_idx : buf_idx + to_read])
+                        downloader._consumed_pos = max(
+                            downloader._consumed_pos, read_start + to_read
+                        )
 
                 if chunk:
                     yield chunk

@@ -19,6 +19,22 @@ def _clamp_volume(value: int) -> int:
 class SpottyDownloader:
     """Downloads a single track from spotty into an in-memory buffer in the background."""
 
+    # Reclaim consumed bytes from the buffer head to bound memory WITHOUT ever
+    # stalling the spotty stdout drain.  The v1.0.17 backpressure cap blocked
+    # the writer via cond.wait, which stalled librespot's 64 KB stdout pipe and
+    # truncated streams (spotty session killed mid-track → partial-file skip).
+    # Head-trimming instead releases bytes the consumer has already read; the
+    # writer always pulls from spotty immediately.
+    #
+    # _TRIM_BATCH_BYTES: only reclaim ≥1 MB at a time to amortize the O(n)
+    # bytearray memmove.
+    # _MAX_UNREAD_TAIL_BYTES: safety valve — if the writer drifts >~2 min of
+    # PCM ahead of every consumer (stalled consumer / pathological burst), the
+    # oldest unread bytes are dropped.  Late range requests for dropped bytes
+    # fall through to get_or_start (the existing seek path).
+    _TRIM_BATCH_BYTES = 1024 * 1024
+    _MAX_UNREAD_TAIL_BYTES = 24 * 1024 * 1024
+
     def __init__(
         self,
         spotty: Spotty,
@@ -45,6 +61,8 @@ class SpottyDownloader:
         self.startup_silence_bytes -= self.startup_silence_bytes % 4
 
         self._buffer = bytearray()
+        self._consumed_pos = 0      # furthest byte any consumer has read (abs, rel start_byte)
+        self._trim_offset = 0       # absolute pos of buffer head (rel start_byte)
 
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
@@ -146,6 +164,7 @@ class SpottyDownloader:
                     with self.cond:
                         self._buffer.extend(chunk)
                         self.written_bytes += len(chunk)
+                        self._trim_head_locked()
                         self.cond.notify_all()
 
                 if process.poll() is None and not self.aborted:
@@ -231,10 +250,33 @@ class SpottyDownloader:
             except:
                 pass
 
+    def _trim_head_locked(self):
+        """Drop consumed/surplus bytes from the buffer head.  Caller holds self.cond.
+
+        Never blocks — the writer always drains spotty stdout immediately.
+        Reclaims bytes every consumer has already read, in batched frame-aligned
+        slices to amortize the bytearray memmove.  The unread-tail cap is a
+        safety valve for stalled-consumer scenarios.
+        """
+        reclaimable = self._consumed_pos - self._trim_offset
+        if reclaimable >= self._TRIM_BATCH_BYTES:
+            reclaim = reclaimable - (reclaimable % 4)
+            if reclaim > 0:
+                del self._buffer[:reclaim]
+                self._trim_offset += reclaim
+        overflow = len(self._buffer) - self._MAX_UNREAD_TAIL_BYTES
+        if overflow > 0:
+            drop = overflow - (overflow % 4)
+            if drop > 0:
+                del self._buffer[:drop]
+                self._trim_offset += drop
+
     def cleanup(self):
         self.abort()
         with self.cond:
             self._buffer.clear()
+            self._consumed_pos = 0
+            self._trim_offset = 0
 
     def wait_for_bytes(self, target_bytes: int, timeout: float = None) -> bool:
         with self.cond:
@@ -333,8 +375,10 @@ class SpottyCacheManager:
             for k, inst in cls._instances.items():
                 if k[0] == track_id and not inst.aborted and not inst.error:
                     if inst.start_byte <= request_byte:
-                        if best is None or inst.start_byte > best.start_byte:
-                            best = inst
+                        # Skip downloaders that have trimmed past the requested byte.
+                        if inst.start_byte + inst._trim_offset <= request_byte:
+                            if best is None or inst.start_byte > best.start_byte:
+                                best = inst
             return best
 
     @classmethod
