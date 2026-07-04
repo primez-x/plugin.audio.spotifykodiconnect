@@ -207,6 +207,40 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
         self.assertEqual(503, FakeBottleState.response.status)
         self.assertEqual("", result)
 
+    def test_early_player_metadata_does_not_override_unfinished_handoff(self):
+        module = import_http_streamer()
+        module.PRELOAD_HANDOFF_WAIT_SECONDS = 0.0
+        module.xbmc.getInfoLabel = lambda label: (
+            "queued-track"
+            if label
+            in (
+                "MusicPlayer.Property(spotifytrackid)",
+                "MusicPlayer.(1).Property(spotifytrackid)",
+            )
+            else "http://127.0.0.1:52309/track/queued-track/180.wav"
+        )
+        spotty_cache = types.ModuleType("spotty_cache")
+        spotty_cache.SpottyCacheManager = FakeSpottyCacheManager
+        sys.modules["spotty_cache"] = spotty_cache
+
+        streamer = module.HTTPSpottyAudioStreamer(object())
+        streamer._HTTPSpottyAudioStreamer__is_streaming = True
+        streamer._HTTPSpottyAudioStreamer__current_track_id = "current-track"
+        streamer._HTTPSpottyAudioStreamer__current_request_id = "current-request"
+
+        result = streamer.spotty_stream_audio_track("queued-track", "180.wav")
+
+        self.assertEqual(
+            0,
+            streamer._HTTPSpottyAudioStreamer__spotty_streamer.terminate_calls,
+        )
+        self.assertEqual(
+            "current-track",
+            streamer._HTTPSpottyAudioStreamer__current_track_id,
+        )
+        self.assertEqual(503, FakeBottleState.response.status)
+        self.assertEqual("", result)
+
 
 if __name__ == "__main__":
     unittest.main()

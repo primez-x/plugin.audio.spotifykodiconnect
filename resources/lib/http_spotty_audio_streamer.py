@@ -24,26 +24,7 @@ _settings_cache = {
 }
 _settings_cache_lock = threading.Lock()
 _SETTINGS_CACHE_TTL = 1.0  # Cache for 1 second
-PRELOAD_HANDOFF_WAIT_SECONDS = 20.0
-SPOTIFY_PLAYER_TRACK_LABELS = (
-    "MusicPlayer.Property(spotifytrackid)",
-    "MusicPlayer.(1).Property(spotifytrackid)",
-)
-PLAYER_FILE_LABELS = (
-    "Player.FileNameAndPath",
-    "MusicPlayer.FileNameAndPath",
-)
-
-
-def _parse_track_id_from_stream_url(file_path: str) -> str:
-    marker = "/track/"
-    try:
-        if not file_path or marker not in file_path:
-            return ""
-        tail = file_path.split(marker, 1)[1]
-        return tail.split("/", 1)[0]
-    except Exception:
-        return ""
+PRELOAD_HANDOFF_WAIT_SECONDS = 60.0
 
 
 def _get_current_stream_settings():
@@ -185,19 +166,6 @@ class HTTPSpottyAudioStreamer:
             log_msg("Terminated running streamer.", LOGDEBUG)
         else:
             log_msg("No running streamer. Nothing to terminate.", LOGDEBUG)
-
-    @staticmethod
-    def _is_requested_track_active_player(track_id: str) -> bool:
-        for label in SPOTIFY_PLAYER_TRACK_LABELS:
-            if (xbmc.getInfoLabel(label) or "").strip() == track_id:
-                return True
-
-        for label in PLAYER_FILE_LABELS:
-            file_path = (xbmc.getInfoLabel(label) or "").strip()
-            if _parse_track_id_from_stream_url(file_path) == track_id:
-                return True
-
-        return False
 
     def _restore_previous_stream_state(
         self,
@@ -378,18 +346,12 @@ class HTTPSpottyAudioStreamer:
             # ~5 seconds short; let it drain naturally instead.  send_part_audio_stream()
             # captures its track-specific state at entry, so two generators running briefly
             # in parallel read from independent cache entries without interfering.
-            # If this is only a preload and the previous download is still in progress,
-            # fail the preload cleanly instead of killing the active audible stream.
-            # If Kodi has confirmed this requested track as active, it is a real transition.
+            # New-track requests may arrive before the next decoder is actually ready
+            # (QueueNextFileEx can update player metadata early). Never let them kill
+            # the active stream until the previous downloader is safely complete.
             _skip_terminate = False
             if _previous_track_id and _previous_track_id != track_id and _previous_was_streaming:
-                if self._is_requested_track_active_player(track_id):
-                    log_msg(
-                        f"Active player switched to {track_id}; terminating previous "
-                        f"stream {_previous_track_id}.",
-                        LOGDEBUG,
-                    )
-                elif self._previous_downloader_finished_for_handoff(
+                if self._previous_downloader_finished_for_handoff(
                     _previous_track_id,
                     track_id,
                 ):
