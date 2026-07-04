@@ -144,6 +144,12 @@ class FakeSpottyCacheManager:
         return None
 
 
+class MissingSpottyCacheManager:
+    @classmethod
+    def find_best_downloader(cls, track_id, request_byte):
+        return None
+
+
 def import_http_streamer():
     install_stubs()
     if LIB_DIR not in sys.path:
@@ -256,6 +262,31 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
         )
         self.assertEqual(503, FakeBottleState.response.status)
         self.assertEqual("", result)
+
+    def test_natural_end_handoff_allows_next_track_when_downloader_was_evicted(self):
+        module = import_http_streamer()
+        spotty_cache = types.ModuleType("spotty_cache")
+        spotty_cache.SpottyCacheManager = MissingSpottyCacheManager
+        sys.modules["spotty_cache"] = spotty_cache
+        module.xbmc.getInfoLabel = lambda label: {
+            "Player.Filenameandpath": ("http://127.0.0.1:52309/track/current-track/180.wav"),
+            "MusicPlayer.Time": "02:55",
+            "MusicPlayer.Duration": "03:00",
+        }.get(label, "")
+
+        streamer = module.HTTPSpottyAudioStreamer(object())
+        streamer._HTTPSpottyAudioStreamer__is_streaming = True
+        streamer._HTTPSpottyAudioStreamer__current_track_id = "current-track"
+        streamer._HTTPSpottyAudioStreamer__current_request_id = "current-request"
+
+        result = streamer.spotty_stream_audio_track("queued-track", "180.wav")
+
+        self.assertNotEqual(503, FakeBottleState.response.status)
+        self.assertEqual(
+            [("queued-track", 180.0)],
+            streamer._HTTPSpottyAudioStreamer__spotty_streamer.set_track_calls,
+        )
+        result.close()
 
     def test_new_track_preflight_failure_returns_503_before_generator(self):
         module = import_http_streamer()

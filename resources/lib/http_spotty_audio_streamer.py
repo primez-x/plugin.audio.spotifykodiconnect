@@ -25,6 +25,7 @@ _settings_cache = {
 _settings_cache_lock = threading.Lock()
 _SETTINGS_CACHE_TTL = 1.0  # Cache for 1 second
 PRELOAD_HANDOFF_WAIT_SECONDS = 60.0
+NATURAL_HANDOFF_REMAINING_SECONDS = 8.0
 
 
 def _get_current_stream_settings():
@@ -53,6 +54,20 @@ def _get_current_stream_settings():
             return bitrate, norm
         except Exception:
             return _settings_cache["bitrate"], _settings_cache["normalization"]
+
+
+def _parse_time_label(value: str) -> Optional[int]:
+    parts = [part.strip() for part in (value or "").split(":") if part.strip()]
+    if len(parts) < 2:
+        return None
+
+    try:
+        seconds = 0
+        for part in parts:
+            seconds = seconds * 60 + int(part)
+        return seconds
+    except ValueError:
+        return None
 
 
 # No debounce: serve every range request immediately so Kodi's seek bar and
@@ -190,6 +205,15 @@ class HTTPSpottyAudioStreamer:
     ) -> bool:
         from spotty_cache import SpottyCacheManager
 
+        if self._player_near_natural_handoff(previous_track_id):
+            log_msg(
+                f"QueueNextFileEx natural handoff allowed: Kodi is near the end of "
+                f"{previous_track_id}, so {next_track_id} may start even if the "
+                f"previous cache downloader already drained.",
+                LOGDEBUG,
+            )
+            return True
+
         downloader = SpottyCacheManager.find_best_downloader(previous_track_id, 0)
         if downloader is None:
             log_msg(
@@ -211,6 +235,14 @@ class HTTPSpottyAudioStreamer:
                 downloader.is_finished and not downloader.error and not downloader.aborted
             )
 
+        if not finished_cleanly and self._player_near_natural_handoff(previous_track_id):
+            log_msg(
+                f"QueueNextFileEx natural handoff allowed after wait: Kodi is near "
+                f"the end of {previous_track_id}, so {next_track_id} may start.",
+                LOGDEBUG,
+            )
+            return True
+
         if finished_cleanly:
             log_msg(
                 f"QueueNextFileEx detected: {previous_track_id} download complete, "
@@ -225,6 +257,22 @@ class HTTPSpottyAudioStreamer:
                 LOGDEBUG,
             )
         return finished_cleanly
+
+    def _player_near_natural_handoff(self, previous_track_id: str) -> bool:
+        try:
+            file_url = xbmc.getInfoLabel("Player.Filenameandpath") or ""
+            if f"/track/{previous_track_id}/" not in file_url:
+                return False
+
+            elapsed = _parse_time_label(xbmc.getInfoLabel("MusicPlayer.Time"))
+            duration = _parse_time_label(xbmc.getInfoLabel("MusicPlayer.Duration"))
+            if elapsed is None or duration is None or duration <= 0:
+                return False
+
+            remaining = duration - elapsed
+            return remaining <= NATURAL_HANDOFF_REMAINING_SECONDS
+        except Exception:
+            return False
 
     def _busy_with_current_track_response(
         self,
