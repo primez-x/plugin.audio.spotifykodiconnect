@@ -397,7 +397,11 @@ class SpottyAudioStreamer:
                         )
 
             end_of_range = range_begin + bytes_sent
-            if track_length > 0 and end_of_range >= track_length:
+            if (
+                track_length > 0
+                and range_begin <= _WAV_HEADER_SIZE
+                and end_of_range >= track_length
+            ):
                 self.__notify_track_finished(track_id)
             self._log_transfer("finished", range_begin=range_begin, bytes_sent=bytes_sent)
 
