@@ -231,6 +231,24 @@ def _read_active_spotify_player_state(win) -> tuple[bool, str, bool]:
     return False, "", has_player_file
 
 
+def _read_confirmed_spotify_track_duration(track_id: str) -> float:
+    try:
+        current_item, _next_item = get_next_playlist_item()
+        current_id, current_duration = parse_track_url((current_item or {}).get("file") or "")
+        if current_id == track_id and current_duration is not None:
+            return current_duration
+    except Exception:
+        pass
+
+    for label in PLAYER_FILE_LABELS:
+        file_path = (xbmc.getInfoLabel(label) or "").strip()
+        current_id, current_duration = parse_track_url(file_path)
+        if current_id == track_id and current_duration is not None:
+            return current_duration
+
+    return 0
+
+
 def _refresh_playback_hooks(current_track_id: str, delay_ms: int = 0) -> None:
     def _run():
         if delay_ms:
@@ -463,7 +481,7 @@ class MainService:
         log_msg("Spotify audio resources torn down for external playback.")
 
     def __on_track_started(self, track_id: str, _duration_sec: float) -> None:
-        """Set OSD properties for a Spotify HTTP stream request."""
+        """Set OSD properties for Kodi-confirmed Spotify playback."""
         global _artist_fanart_urls, _artist_fanart_index, _liked_state_track_id
         win = xbmcgui.Window(ADDON_WINDOW_ID)
         win.setProperty("Spotify.CurrentTrackId", track_id or "")
@@ -537,6 +555,8 @@ class MainService:
 
     def __on_spotify_playback_started(self, track_id: str) -> None:
         try:
+            self.__on_track_started(track_id, _read_confirmed_spotify_track_duration(track_id))
+
             _current_item, next_item = get_next_playlist_item()
             if not next_item:
                 if SPOTIFY_ADDON.getSetting("spotify_autoplay").lower() == "true":

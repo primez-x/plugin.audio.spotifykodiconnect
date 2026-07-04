@@ -282,6 +282,25 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
 
         self.assertEqual(0, service._prebuffer_token)
 
+    def test_confirmed_spotify_playback_publishes_current_track_hook(self):
+        main_service = import_main_service(
+            {"Player.FileNameAndPath": "http://127.0.0.1:52309/track/track-1/180.wav"},
+            {"prebuffer_enabled": "false", "spotify_autoplay": "false"},
+        )
+        main_service.get_next_playlist_item = lambda: (
+            {"file": "http://127.0.0.1:52309/track/track-1/180.wav"},
+            None,
+        )
+        service = object.__new__(main_service.MainService)
+        published = []
+        service._MainService__on_track_started = lambda track_id, duration: published.append(
+            (track_id, duration)
+        )
+
+        service._MainService__on_spotify_playback_started("track-1")
+
+        self.assertEqual([("track-1", 180)], published)
+
 
 class SpotifyAutoplayGatingTests(unittest.TestCase):
     """Regression coverage for the daylist autoplay-destroys-queue bug.
