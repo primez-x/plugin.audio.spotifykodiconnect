@@ -345,6 +345,7 @@ class SpottyCacheManager:
         wav_header: bytes,
         track_length: int,
         startup_silence_bytes: int = 0,
+        allow_abort_others: bool = True,
     ) -> SpottyDownloader:
         with cls._lock:
             if track_id in cls._recent_tracks:
@@ -360,6 +361,17 @@ class SpottyCacheManager:
                     inst.abort()
                     del cls._instances[key]
 
+            if not allow_abort_others:
+                for k, other in list(cls._instances.items()):
+                    if k != key and not other.is_finished and not other.aborted and not other.error:
+                        log_msg(
+                            f"Deferring download for {track_id}: active downloader "
+                            f"{k[0]} is still running.",
+                            LOGDEBUG,
+                        )
+                        cls._recent_tracks = [t for t in cls._recent_tracks if t != track_id]
+                        return None
+
             inst = SpottyDownloader(
                 spotty,
                 track_id,
@@ -374,13 +386,14 @@ class SpottyCacheManager:
             )
             cls._instances[key] = inst
 
-            # Abort all other still-running downloads before starting this one.
-            # librespot only allows one active Spotify stream per account; a second
-            # spotty process connecting kicks the first (and vice-versa), causing a
-            # mutual-kick loop that leaves every track with only the 44-byte WAV header.
-            for k, other in list(cls._instances.items()):
-                if k != key and not other.is_finished and not other.aborted:
-                    other.abort()
+            if allow_abort_others:
+                # Abort all other still-running downloads before starting this one.
+                # librespot only allows one active Spotify stream per account; a second
+                # spotty process connecting kicks the first (and vice-versa), causing a
+                # mutual-kick loop that leaves every track with only the 44-byte WAV header.
+                for k, other in list(cls._instances.items()):
+                    if k != key and not other.is_finished and not other.aborted:
+                        other.abort()
 
             inst.start()
 

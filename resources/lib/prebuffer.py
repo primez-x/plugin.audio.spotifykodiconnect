@@ -63,7 +63,7 @@ class PrebufferManager:
         log_msg(f"Triggering prebuffer background download for {track_id}", LOGDEBUG)
         wav_header, track_length = create_wav_header_for_duration(duration_sec)
 
-        return SpottyCacheManager.get_or_start(
+        downloader = SpottyCacheManager.get_or_start(
             self.__spotty,
             track_id,
             duration_sec,
@@ -74,7 +74,14 @@ class PrebufferManager:
             wav_header,
             track_length,
             STARTUP_SILENCE_BYTES,
+            allow_abort_others=False,
         )
+        if downloader is None:
+            with self.__lock:
+                if self.__prebuffer_track_id == track_id:
+                    self.__prebuffer_track_id = None
+            log_msg(f"Prebuffer for {track_id} deferred; active stream still owns cache", LOGDEBUG)
+        return downloader
 
     def get_and_clear_prebuffer(self, track_id: str) -> Tuple[Optional[PrebufferResult], bool]:
         """Return prebuffer result for *track_id* and clear internal state.

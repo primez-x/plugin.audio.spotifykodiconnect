@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<addon id="plugin.audio.spotifykodiconnect" version="1.0.22" name="SpotifyKodiConnect" provider-name="primez-x">
+<addon id="plugin.audio.spotifykodiconnect" version="1.0.23" name="SpotifyKodiConnect" provider-name="primez-x">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
         <import addon="xbmc.addon" version="18.9.701" />
@@ -19,7 +19,11 @@
         <description lang="en_GB">Unofficial Spotify music plugin for Kodi. Improves on the original Spotify addon with consistent album/artist art in all views (including playlists), correct metadata tags, and background loading so navigation and playback feel smooth. Requires Spotify Premium.</description>
         <disclaimer lang="en_GB">This product uses the SPOTIFY WEB API but is not endorsed, certified or otherwise approved in any way by Spotify. Spotify is the registered trademark of Spotify AB.</disclaimer>
         <source>https://github.com/primez-x/plugin.audio.spotifykodiconnect</source>
-        <news>v1.0.22
+        <news>v1.0.23
+- Publish Spotify.CurrentTrack only after Kodi confirms active playback, so QueueNextFileEx/preload requests cannot make skins or companion addons believe the next song is already current.
+- Keep prebuffer and queued preload downloads from aborting an unfinished active stream; unsafe preloads now defer cleanly instead of causing decoder failures and skipped tracks.
+
+v1.0.22
 - Fix concurrent Kodi range readers trimming bytes out from under each other: the Spotty cache now tracks active reader positions and only trims data that every active reader has consumed.
 - Prevent the unread-tail cap from discarding bytes while a reader is active, avoiding zero-byte/partial responses during QueueNextFileEx and reconnect probes.
 

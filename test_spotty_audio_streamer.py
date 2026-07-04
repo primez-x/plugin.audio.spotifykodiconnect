@@ -106,6 +106,7 @@ class FakeSpotty:
 
 class FakeSpottyCacheManager:
     downloader = None
+    calls = []
 
     @classmethod
     def find_best_downloader(cls, track_id, request_byte):
@@ -124,8 +125,50 @@ class FakeSpottyCacheManager:
         wav_header,
         track_length,
         startup_silence_bytes=0,
+        **kwargs,
     ):
+        cls.calls.append(
+            {
+                "track_id": track_id,
+                "startup_silence_bytes": startup_silence_bytes,
+                "kwargs": dict(kwargs),
+            }
+        )
         return cls.downloader
+
+
+class ManagedFakeDownloader:
+    created = []
+
+    def __init__(
+        self,
+        spotty,
+        track_id,
+        duration_sec,
+        start_byte,
+        bitrate,
+        normalization,
+        volume,
+        wav_header,
+        track_length,
+        startup_silence_bytes=0,
+    ):
+        self.track_id = track_id
+        self.start_byte = start_byte
+        self.is_finished = False
+        self.error = False
+        self.aborted = False
+        self.started = False
+        ManagedFakeDownloader.created.append(self)
+
+    def start(self):
+        self.started = True
+
+    def abort(self):
+        self.aborted = True
+
+    def cleanup(self):
+        self.abort()
 
 
 class SpottyAudioStreamerTests(unittest.TestCase):
@@ -464,6 +507,84 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             self.assertLess(downloader.written_bytes, track_length)
         finally:
             spotty_cache.SpottyDownloader._MAX_SESSION_RETRIES = original_retries
+
+    def test_cache_start_without_abort_refuses_to_interrupt_active_downloader(self):
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+
+        original_downloader_class = spotty_cache.SpottyDownloader
+        spotty_cache.SpottyDownloader = ManagedFakeDownloader
+        ManagedFakeDownloader.created = []
+        manager = spotty_cache.SpottyCacheManager
+        manager._instances.clear()
+        manager._recent_tracks.clear()
+        try:
+            active = ManagedFakeDownloader(
+                spotty=object(),
+                track_id="current-track",
+                duration_sec=180,
+                start_byte=0,
+                bitrate="320",
+                normalization="off",
+                volume=35,
+                wav_header=b"0" * 44,
+                track_length=1000,
+            )
+            manager._instances[("current-track", 0)] = active
+            manager._recent_tracks = ["current-track"]
+
+            result = manager.get_or_start(
+                object(),
+                "next-track",
+                180,
+                0,
+                "320",
+                "off",
+                35,
+                b"0" * 44,
+                1000,
+                allow_abort_others=False,
+            )
+
+            self.assertIsNone(result)
+            self.assertFalse(active.aborted)
+            self.assertEqual(1, len(ManagedFakeDownloader.created))
+            self.assertNotIn(("next-track", 0), manager._instances)
+        finally:
+            manager._instances.clear()
+            manager._recent_tracks.clear()
+            spotty_cache.SpottyDownloader = original_downloader_class
+
+    def test_prebuffer_starts_cache_without_permission_to_abort_active_downloads(self):
+        FakeSpottyCacheManager.calls = []
+        FakeSpottyCacheManager.downloader = object()
+        sys.modules.pop("prebuffer", None)
+        import prebuffer
+
+        prebuffer.SpottyCacheManager = FakeSpottyCacheManager
+        manager = prebuffer.PrebufferManager(object())
+
+        result = manager.start_prebuffer("next-track", 180)
+
+        self.assertIs(result, FakeSpottyCacheManager.downloader)
+        self.assertEqual(1, len(FakeSpottyCacheManager.calls))
+        self.assertIs(False, FakeSpottyCacheManager.calls[0]["kwargs"]["allow_abort_others"])
+
+    def test_refused_prebuffer_does_not_report_later_cache_hit(self):
+        FakeSpottyCacheManager.calls = []
+        FakeSpottyCacheManager.downloader = None
+        sys.modules.pop("prebuffer", None)
+        import prebuffer
+
+        prebuffer.SpottyCacheManager = FakeSpottyCacheManager
+        manager = prebuffer.PrebufferManager(object())
+
+        result = manager.start_prebuffer("next-track", 180)
+        prebuffer_result, has_prebuffer = manager.get_and_clear_prebuffer("next-track")
+
+        self.assertIsNone(result)
+        self.assertIsNone(prebuffer_result)
+        self.assertIs(False, has_prebuffer)
 
 
 if __name__ == "__main__":
