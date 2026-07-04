@@ -259,6 +259,31 @@ class SpottyAudioStreamer:
 
         return downloader
 
+    def _startup_failed_before_real_pcm(
+        self, downloader, range_begin: int, wav_header: bytes
+    ) -> bool:
+        prefix_end = len(wav_header) + STARTUP_SILENCE_BYTES
+        if range_begin >= prefix_end:
+            return False
+
+        with downloader.cond:
+            written = int(getattr(downloader, "written_bytes", 0) or 0)
+            start_byte = int(getattr(downloader, "start_byte", 0) or 0)
+            no_real_pcm = written <= max(0, prefix_end - start_byte)
+            failed = (
+                bool(getattr(downloader, "error", False))
+                or bool(getattr(downloader, "aborted", False))
+                or bool(getattr(downloader, "is_finished", False))
+            )
+
+        return failed and no_real_pcm
+
+    def _cleanup_failed_startup_downloader(self, downloader) -> None:
+        try:
+            downloader.cleanup()
+        except Exception as ex:
+            log_exception(ex, "cleanup_failed_startup_downloader")
+
     def prepare_part_audio_stream(self, range_begin: int) -> bool:
         """Start downloader and verify startup does not fail before real PCM."""
         track_id = self.__track_id
@@ -279,18 +304,13 @@ class SpottyAudioStreamer:
         self._prime_startup_real_pcm(
             downloader, range_begin, wav_header, track_length, stream_generation
         )
-        prefix_end = len(wav_header) + STARTUP_SILENCE_BYTES
-        with downloader.cond:
-            if (
-                downloader.error
-                and range_begin < prefix_end
-                and downloader.written_bytes <= max(0, prefix_end - downloader.start_byte)
-            ):
-                self._log_transfer(
-                    "error",
-                    msg="Background downloader hit an error before real PCM",
-                )
-                return False
+        if self._startup_failed_before_real_pcm(downloader, range_begin, wav_header):
+            self._log_transfer(
+                "error",
+                msg="Background downloader finished before real PCM",
+            )
+            self._cleanup_failed_startup_downloader(downloader)
+            return False
         return True
 
     def send_part_audio_stream(
@@ -356,18 +376,12 @@ class SpottyAudioStreamer:
             self._prime_startup_real_pcm(
                 downloader, range_begin, wav_header, track_length, stream_generation
             )
-            prefix_end = len(wav_header) + STARTUP_SILENCE_BYTES
-            with downloader.cond:
-                silence_only_error = (
-                    downloader.error
-                    and range_begin < prefix_end
-                    and downloader.written_bytes <= max(0, prefix_end - downloader.start_byte)
-                )
-            if silence_only_error:
+            if self._startup_failed_before_real_pcm(downloader, range_begin, wav_header):
                 self._log_transfer(
                     "error",
-                    msg="Background downloader hit an error before real PCM",
+                    msg="Background downloader finished before real PCM",
                 )
+                self._cleanup_failed_startup_downloader(downloader)
                 return
 
             while bytes_sent < range_len and not self._is_terminated(stream_generation):

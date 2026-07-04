@@ -258,6 +258,22 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         FakeSpottyCacheManager.downloader = downloader
 
         self.assertFalse(streamer.prepare_part_audio_stream(0))
+        self.assertTrue(downloader.aborted)
+
+    def test_prepare_from_start_rejects_finished_downloader_before_real_pcm(self):
+        streamer = self.module.SpottyAudioStreamer(object())
+        streamer.set_track("track-1", 180)
+        wav_header, _ = self.module.create_wav_header_for_duration(180)
+        downloader = FakeDownloader(
+            wav_header,
+            bytes(self.module.STARTUP_SILENCE_BYTES),
+            auto_fill=False,
+        )
+        downloader.is_finished = True
+        FakeSpottyCacheManager.downloader = downloader
+
+        self.assertFalse(streamer.prepare_part_audio_stream(0))
+        self.assertTrue(downloader.aborted)
 
     def test_prepare_from_start_waits_after_prior_termination(self):
         streamer = self.module.SpottyAudioStreamer(object())
