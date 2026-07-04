@@ -186,6 +186,18 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
         self.assertEqual([], started)
         self.assertTrue(hasattr(result, "__iter__"))
 
+    def test_older_generator_streams_even_after_newer_request_updates_coordinator(self):
+        module = import_http_streamer()
+        streamer = module.HTTPSpottyAudioStreamer(object())
+
+        result = streamer.spotty_stream_audio_track("first-track", "180.wav")
+        streamer._HTTPSpottyAudioStreamer__current_request_id = "newer-request"
+
+        try:
+            self.assertEqual(b"x" * 16, next(result))
+        finally:
+            result.close()
+
     def test_queue_preload_does_not_terminate_unfinished_current_stream(self):
         module = import_http_streamer()
         module.PRELOAD_HANDOFF_WAIT_SECONDS = 0.0

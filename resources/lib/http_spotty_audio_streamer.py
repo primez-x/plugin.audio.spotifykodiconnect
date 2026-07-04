@@ -83,7 +83,7 @@ class HTTPSpottyAudioStreamer:
         self.__is_streaming = False
         self.__stream_lock = threading.Lock()
         self.__current_track_id: Optional[str] = None
-        self.__current_request_id: str = ""  # Track current request to ignore stale generators
+        self.__current_request_id: str = ""  # Track current request for init coordination.
         # Init coordination: when a new-track GET is being initialized, set this
         # so other concurrent GETs can wait and then reuse the same request id.
         self.__init_in_progress = False
@@ -284,7 +284,7 @@ class HTTPSpottyAudioStreamer:
         if bottle.request.method.upper() != "GET":
             return self._handle_head_only(track_id, duration)
 
-        # Generate unique request ID to prevent stale generators from executing
+        # Generate unique request ID for coordinating concurrent init requests.
         request_id = str(uuid.uuid4())
 
         # Read settings FIRST.
@@ -552,15 +552,6 @@ class HTTPSpottyAudioStreamer:
                 LOGDEBUG,
             )
 
-        # Check if this request is stale BEFORE returning generator (before HTTP headers commit)
-        if request_id and request_id != self.__current_request_id:
-            log_msg(
-                f"WAV request {request_id} is stale (current: {self.__current_request_id}), returning empty.",
-                LOGDEBUG,
-            )
-            bottle.response.status = 204  # No Content
-            return ""
-
         if (
             bottle.request.method.upper() == "GET"
             and is_new_track
@@ -571,16 +562,6 @@ class HTTPSpottyAudioStreamer:
                 return self._failed_new_track_response(track_id or "", request_id or "")
 
         def generate():
-            # Double-check inside generator as safety net
-            with self.__stream_lock:
-                # Only proceed if this is still the active request
-                if request_id and request_id != self.__current_request_id:
-                    log_msg(
-                        f"Generator for request {request_id} is stale (current: {self.__current_request_id}), aborting.",
-                        LOGDEBUG,
-                    )
-                    return
-
             try:
                 if is_seek:
                     # Do NOT terminate the active stream on seek. Kodi opens multiple connections
