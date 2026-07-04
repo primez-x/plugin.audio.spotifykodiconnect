@@ -617,6 +617,53 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             manager._recent_tracks.clear()
             spotty_cache.SpottyDownloader = original_downloader_class
 
+    def test_cache_restarts_downloader_when_requested_start_was_trimmed(self):
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+
+        original_downloader_class = spotty_cache.SpottyDownloader
+        spotty_cache.SpottyDownloader = ManagedFakeDownloader
+        ManagedFakeDownloader.created = []
+        manager = spotty_cache.SpottyCacheManager
+        manager._instances.clear()
+        manager._recent_tracks.clear()
+        try:
+            old = ManagedFakeDownloader(
+                spotty=object(),
+                track_id="trimmed-track",
+                duration_sec=180,
+                start_byte=0,
+                bitrate="320",
+                normalization="off",
+                volume=35,
+                wav_header=b"0" * 44,
+                track_length=1000,
+            )
+            old._trim_offset = 512
+            manager._instances[("trimmed-track", 0)] = old
+            manager._recent_tracks = ["trimmed-track"]
+
+            result = manager.get_or_start(
+                object(),
+                "trimmed-track",
+                180,
+                0,
+                "320",
+                "off",
+                35,
+                b"0" * 44,
+                1000,
+            )
+
+            self.assertIsNot(result, old)
+            self.assertTrue(old.aborted)
+            self.assertIs(result, manager._instances[("trimmed-track", 0)])
+            self.assertTrue(result.started)
+        finally:
+            manager._instances.clear()
+            manager._recent_tracks.clear()
+            spotty_cache.SpottyDownloader = original_downloader_class
+
     def test_cache_eviction_keeps_downloader_with_active_consumers(self):
         sys.modules.pop("spotty_cache", None)
         import spotty_cache
