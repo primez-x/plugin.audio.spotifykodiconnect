@@ -27,6 +27,22 @@ class FakeResponse:
         self.headers = {}
 
 
+class FakeWindow:
+    properties = {}
+
+    def __init__(self, window_id=None):
+        self.window_id = window_id
+
+    def getProperty(self, key):
+        return self.properties.get(key, "")
+
+    def setProperty(self, key, value):
+        self.properties[key] = str(value)
+
+    def clearProperty(self, key):
+        self.properties.pop(key, None)
+
+
 class FakeAddon:
     def getSetting(self, key):
         if key == "spotify_bitrate":
@@ -70,6 +86,8 @@ class FakeSpottyAudioStreamer:
 
 
 def install_stubs():
+    FakeWindow.properties = {}
+
     xbmc = types.ModuleType("xbmc")
     xbmc.LOGDEBUG = 0
     xbmc.getInfoLabel = lambda label: ""
@@ -80,7 +98,7 @@ def install_stubs():
     sys.modules["xbmcaddon"] = xbmcaddon
 
     xbmcgui = types.ModuleType("xbmcgui")
-    xbmcgui.Window = lambda window_id=None: None
+    xbmcgui.Window = FakeWindow
     sys.modules["xbmcgui"] = xbmcgui
 
     spotipy = types.ModuleType("spotipy")
@@ -207,6 +225,10 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
     def test_queue_preload_does_not_terminate_unfinished_current_stream(self):
         module = import_http_streamer()
         module.PRELOAD_HANDOFF_WAIT_SECONDS = 0.0
+        module.xbmcgui.Window(module.ADDON_WINDOW_ID).setProperty(
+            "Spotify.CurrentTrackId",
+            "current-track",
+        )
         spotty_cache = types.ModuleType("spotty_cache")
         spotty_cache.SpottyCacheManager = FakeSpottyCacheManager
         sys.modules["spotty_cache"] = spotty_cache
@@ -232,6 +254,10 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
     def test_early_player_metadata_does_not_override_unfinished_handoff(self):
         module = import_http_streamer()
         module.PRELOAD_HANDOFF_WAIT_SECONDS = 0.0
+        module.xbmcgui.Window(module.ADDON_WINDOW_ID).setProperty(
+            "Spotify.CurrentTrackId",
+            "current-track",
+        )
         module.xbmc.getInfoLabel = lambda label: (
             "queued-track"
             if label
@@ -262,6 +288,33 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
         )
         self.assertEqual(503, FakeBottleState.response.status)
         self.assertEqual("", result)
+
+    def test_stale_internal_stream_state_does_not_block_user_selected_track(self):
+        module = import_http_streamer()
+        spotty_cache = types.ModuleType("spotty_cache")
+        spotty_cache.SpottyCacheManager = MissingSpottyCacheManager
+        sys.modules["spotty_cache"] = spotty_cache
+        module.xbmc.getInfoLabel = lambda label: {
+            "Player.Filenameandpath": ("http://127.0.0.1:52309/track/selected-track/180.wav"),
+        }.get(label, "")
+
+        streamer = module.HTTPSpottyAudioStreamer(object())
+        streamer._HTTPSpottyAudioStreamer__is_streaming = True
+        streamer._HTTPSpottyAudioStreamer__current_track_id = "stale-track"
+        streamer._HTTPSpottyAudioStreamer__current_request_id = "stale-request"
+
+        result = streamer.spotty_stream_audio_track("selected-track", "180.wav")
+
+        self.assertNotEqual(503, FakeBottleState.response.status)
+        self.assertEqual(
+            1,
+            streamer._HTTPSpottyAudioStreamer__spotty_streamer.terminate_calls,
+        )
+        self.assertEqual(
+            [("selected-track", 180.0)],
+            streamer._HTTPSpottyAudioStreamer__spotty_streamer.set_track_calls,
+        )
+        result.close()
 
     def test_natural_end_handoff_allows_next_track_when_downloader_was_evicted(self):
         module = import_http_streamer()
