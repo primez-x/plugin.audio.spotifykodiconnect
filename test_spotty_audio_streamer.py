@@ -259,6 +259,23 @@ class SpottyAudioStreamerTests(unittest.TestCase):
 
         self.assertEqual(real_pcm, payload)
 
+    def test_seek_range_to_end_does_not_mark_track_finished(self):
+        streamer = self.module.SpottyAudioStreamer(object())
+        streamer.set_track("track-1", 180)
+        finished = []
+        streamer.set_notify_track_finished(lambda track_id: finished.append(track_id))
+        wav_header, track_length = self.module.create_wav_header_for_duration(180)
+        range_begin = track_length - 65536
+        downloader = FakeDownloader(b"", bytes(65536), auto_fill=False)
+        downloader.start_byte = range_begin
+        downloader.is_finished = True
+        FakeSpottyCacheManager.downloader = downloader
+
+        payload = b"".join(streamer.send_part_audio_stream(65536, range_begin))
+
+        self.assertEqual(65536, len(payload))
+        self.assertEqual([], finished)
+
     def test_downloader_seeds_silence_and_maps_seek_offset_to_real_pcm(self):
         sys.modules.pop("spotty_cache", None)
         import spotty_cache
