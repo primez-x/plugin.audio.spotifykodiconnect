@@ -41,6 +41,8 @@ def import_streamer():
 class FakeDownloader:
     def __init__(self, wav_header, initial_pcm=b"", auto_fill=True):
         self.start_byte = 0
+        self.wav_header = wav_header
+        self.startup_silence_bytes = 0
         self._buffer = bytearray(wav_header)
         self._buffer.extend(initial_pcm)
         self.written_bytes = len(self._buffer)
@@ -64,6 +66,9 @@ class FakeDownloader:
 
     def _trim_head_locked(self):
         return None
+
+    def cleanup(self):
+        self.aborted = True
 
 
 class FakeStdout:
@@ -684,6 +689,46 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertIsNone(prebuffer_result)
         self.assertIs(False, has_prebuffer)
+
+    def test_empty_prebuffer_does_not_report_cache_hit(self):
+        sys.modules.pop("prebuffer", None)
+        import prebuffer
+
+        wav_header, _ = self.module.create_wav_header_for_duration(180)
+        downloader = FakeDownloader(wav_header, bytes(self.module.STARTUP_SILENCE_BYTES))
+        downloader.startup_silence_bytes = self.module.STARTUP_SILENCE_BYTES
+        downloader.is_finished = True
+        FakeSpottyCacheManager.downloader = downloader
+        prebuffer.SpottyCacheManager = FakeSpottyCacheManager
+        manager = prebuffer.PrebufferManager(object())
+
+        manager.start_prebuffer("next-track", 180)
+        prebuffer_result, has_prebuffer = manager.get_and_clear_prebuffer("next-track")
+
+        self.assertIsNone(prebuffer_result)
+        self.assertIs(False, has_prebuffer)
+        self.assertTrue(downloader.aborted)
+
+    def test_prebuffer_with_real_pcm_reports_cache_hit(self):
+        sys.modules.pop("prebuffer", None)
+        import prebuffer
+
+        wav_header, _ = self.module.create_wav_header_for_duration(180)
+        downloader = FakeDownloader(
+            wav_header,
+            bytes(self.module.STARTUP_SILENCE_BYTES) + b"real-pcm",
+        )
+        downloader.startup_silence_bytes = self.module.STARTUP_SILENCE_BYTES
+        FakeSpottyCacheManager.downloader = downloader
+        prebuffer.SpottyCacheManager = FakeSpottyCacheManager
+        manager = prebuffer.PrebufferManager(object())
+
+        manager.start_prebuffer("next-track", 180)
+        prebuffer_result, has_prebuffer = manager.get_and_clear_prebuffer("next-track")
+
+        self.assertIsNotNone(prebuffer_result)
+        self.assertIs(True, has_prebuffer)
+        self.assertFalse(downloader.aborted)
 
 
 if __name__ == "__main__":

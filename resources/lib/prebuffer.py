@@ -41,6 +41,7 @@ class PrebufferManager:
         self.__bitrate: str = bitrate
         self.__lock = threading.Lock()
         self.__prebuffer_track_id: Optional[str] = None
+        self.__prebuffer_downloader = None
 
     def start_prebuffer(
         self,
@@ -59,6 +60,7 @@ class PrebufferManager:
             if self.__prebuffer_track_id == track_id:
                 return None
             self.__prebuffer_track_id = track_id
+            self.__prebuffer_downloader = None
 
         log_msg(f"Triggering prebuffer background download for {track_id}", LOGDEBUG)
         wav_header, track_length = create_wav_header_for_duration(duration_sec)
@@ -80,8 +82,28 @@ class PrebufferManager:
             with self.__lock:
                 if self.__prebuffer_track_id == track_id:
                     self.__prebuffer_track_id = None
+                    self.__prebuffer_downloader = None
             log_msg(f"Prebuffer for {track_id} deferred; active stream still owns cache", LOGDEBUG)
+        else:
+            with self.__lock:
+                if self.__prebuffer_track_id == track_id:
+                    self.__prebuffer_downloader = downloader
         return downloader
+
+    @staticmethod
+    def _has_real_pcm(downloader) -> bool:
+        if downloader is None:
+            return False
+        cond = getattr(downloader, "cond", None)
+        if cond is None:
+            return False
+        with cond:
+            if getattr(downloader, "error", False) or getattr(downloader, "aborted", False):
+                return False
+            wav_header = getattr(downloader, "wav_header", b"") or b""
+            startup_silence = max(0, int(getattr(downloader, "startup_silence_bytes", 0) or 0))
+            real_pcm_start = len(wav_header) + startup_silence
+            return int(getattr(downloader, "written_bytes", 0) or 0) > real_pcm_start
 
     def get_and_clear_prebuffer(self, track_id: str) -> Tuple[Optional[PrebufferResult], bool]:
         """Return prebuffer result for *track_id* and clear internal state.
@@ -93,13 +115,26 @@ class PrebufferManager:
             if self.__prebuffer_track_id != track_id:
                 return None, False
 
+            downloader = self.__prebuffer_downloader
             self.__prebuffer_track_id = None
-            return PrebufferResult(data=b""), True
+            self.__prebuffer_downloader = None
+
+        if not self._has_real_pcm(downloader):
+            try:
+                if downloader is not None:
+                    downloader.cleanup()
+            except Exception:
+                pass
+            log_msg(f"Discarding empty or failed prebuffer for {track_id}", LOGDEBUG)
+            return None, False
+
+        return PrebufferResult(data=b""), True
 
     def cancel_prebuffer(self) -> None:
         """Stop any running pre-buffer and clear state. The SpottyCacheManager handles its own cleanup."""
         with self.__lock:
             self.__prebuffer_track_id = None
+            self.__prebuffer_downloader = None
 
     def set_normalization_gain_type(self, value: str) -> None:
         self.__normalization_gain_type = (value or "auto").strip().lower()
