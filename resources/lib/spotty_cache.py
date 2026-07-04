@@ -355,10 +355,11 @@ class SpottyCacheManager:
             key = (track_id, start_byte)
             if key in cls._instances:
                 inst = cls._instances[key]
-                if not inst.aborted and not inst.error:
+                readable_start = inst.start_byte + getattr(inst, "_trim_offset", 0)
+                if not inst.aborted and not inst.error and readable_start <= start_byte:
                     return inst
                 else:
-                    inst.abort()
+                    inst.cleanup()
                     del cls._instances[key]
 
             if not allow_abort_others:
