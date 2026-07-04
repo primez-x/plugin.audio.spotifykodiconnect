@@ -209,6 +209,83 @@ class SpottyAudioStreamer:
         self.__terminated = True
         return True
 
+    def _get_or_start_downloader(
+        self,
+        track_id: str,
+        track_duration: int,
+        wav_header: bytes,
+        track_length: int,
+        range_begin: int,
+    ):
+        from spotty_cache import SpottyCacheManager
+
+        downloader = SpottyCacheManager.find_best_downloader(track_id, range_begin)
+
+        if not downloader:
+            return SpottyCacheManager.get_or_start(
+                self.__spotty,
+                track_id,
+                track_duration,
+                range_begin,
+                self.bitrate,
+                self.normalization_gain_type,
+                self.initial_volume,
+                wav_header,
+                track_length,
+                STARTUP_SILENCE_BYTES,
+            )
+
+        if (
+            range_begin > downloader.start_byte + downloader.written_bytes + 2097152
+            and not downloader.is_finished
+        ):
+            return SpottyCacheManager.get_or_start(
+                self.__spotty,
+                track_id,
+                track_duration,
+                range_begin,
+                self.bitrate,
+                self.normalization_gain_type,
+                self.initial_volume,
+                wav_header,
+                track_length,
+                STARTUP_SILENCE_BYTES,
+            )
+
+        return downloader
+
+    def prepare_part_audio_stream(self, range_begin: int) -> bool:
+        """Start downloader and verify startup does not fail before real PCM."""
+        track_id = self.__track_id
+        track_length = self.__track_length
+        track_duration = self.__track_duration
+        wav_header = bytes(self.__wav_header)
+        self.__terminated = False
+        downloader = self._get_or_start_downloader(
+            track_id,
+            track_duration,
+            wav_header,
+            track_length,
+            range_begin,
+        )
+        if downloader is None:
+            return False
+
+        self._prime_startup_real_pcm(downloader, range_begin, wav_header, track_length)
+        prefix_end = len(wav_header) + STARTUP_SILENCE_BYTES
+        with downloader.cond:
+            if (
+                downloader.error
+                and range_begin < prefix_end
+                and downloader.written_bytes <= max(0, prefix_end - downloader.start_byte)
+            ):
+                self._log_transfer(
+                    "error",
+                    msg="Background downloader hit an error before real PCM",
+                )
+                return False
+        return True
+
     def send_part_audio_stream(
         self,
         range_len: int,
@@ -217,8 +294,6 @@ class SpottyAudioStreamer:
         start_sec: int = 0,
     ):
         """Generator: yield WAV (PCM) bytes from the background downloader's in-memory buffer."""
-        from spotty_cache import SpottyCacheManager
-
         # Capture track-specific state at entry — set_track() may be called concurrently
         # when Kodi pre-loads the next track via QueueNextFileEx while this generator is
         # still draining the current one.  Local copies insulate this generator from those
@@ -231,41 +306,15 @@ class SpottyAudioStreamer:
         self.__terminated = False
         bytes_sent = 0
 
-        # Check if we have an active background downloader for this track that covers our request
-        downloader = SpottyCacheManager.find_best_downloader(track_id, range_begin)
-
-        # If no suitable downloader, or the downloader is too far behind (e.g. > 2MB behind),
-        # start a new downloader at the requested position.
-        # Since librespot downloads fast, we only jump if the user seeks far ahead of current progress.
-        if not downloader:
-            downloader = SpottyCacheManager.get_or_start(
-                self.__spotty,
-                track_id,
-                track_duration,
-                range_begin,
-                self.bitrate,
-                self.normalization_gain_type,
-                self.initial_volume,
-                wav_header,
-                track_length,
-                STARTUP_SILENCE_BYTES,
-            )
-        elif (
-            range_begin > downloader.start_byte + downloader.written_bytes + 2097152
-            and not downloader.is_finished
-        ):
-            downloader = SpottyCacheManager.get_or_start(
-                self.__spotty,
-                track_id,
-                track_duration,
-                range_begin,
-                self.bitrate,
-                self.normalization_gain_type,
-                self.initial_volume,
-                wav_header,
-                track_length,
-                STARTUP_SILENCE_BYTES,
-            )
+        downloader = self._get_or_start_downloader(
+            track_id,
+            track_duration,
+            wav_header,
+            track_length,
+            range_begin,
+        )
+        if downloader is None:
+            return
 
         # Rate-throttle: keep the HTTP connection alive for the full track duration so
         # Kodi's QueueNextFileEx fires while our connection is still active.

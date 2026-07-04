@@ -45,6 +45,7 @@ class FakeSpottyAudioStreamer:
         self.duration = 0
         self.terminate_calls = 0
         self.set_track_calls = []
+        self.prepare_result = True
 
     def set_notify_track_finished(self, func):
         self.notify_track_finished = func
@@ -63,6 +64,9 @@ class FakeSpottyAudioStreamer:
 
     def send_part_audio_stream(self, range_len, range_begin):
         yield b"x" * min(range_len, 16)
+
+    def prepare_part_audio_stream(self, range_begin):
+        return self.prepare_result
 
 
 def install_stubs():
@@ -240,6 +244,18 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
         )
         self.assertEqual(503, FakeBottleState.response.status)
         self.assertEqual("", result)
+
+    def test_new_track_preflight_failure_returns_503_before_generator(self):
+        module = import_http_streamer()
+        streamer = module.HTTPSpottyAudioStreamer(object())
+        streamer._HTTPSpottyAudioStreamer__spotty_streamer.prepare_result = False
+
+        result = streamer.spotty_stream_audio_track("failed-track", "180.wav")
+
+        self.assertEqual(503, FakeBottleState.response.status)
+        self.assertEqual("", result)
+        self.assertFalse(streamer._HTTPSpottyAudioStreamer__is_streaming)
+        self.assertEqual("", streamer._HTTPSpottyAudioStreamer__current_request_id)
 
 
 if __name__ == "__main__":
