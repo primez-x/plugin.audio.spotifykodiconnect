@@ -249,6 +249,26 @@ class HTTPSpottyAudioStreamer:
         )
         return ""
 
+    def _failed_new_track_response(self, track_id: str, request_id: str):
+        with self.__stream_lock:
+            if self.__current_track_id == track_id and self.__current_request_id == request_id:
+                self.__is_streaming = False
+                self.__current_request_id = ""
+                self.__init_in_progress = False
+                try:
+                    self.__init_event.set()
+                except Exception:
+                    pass
+        bottle.response.status = 503
+        bottle.response.content_type = "text/plain"
+        bottle.response.content_length = 0
+        bottle.response.headers["Retry-After"] = "1"
+        log_msg(
+            f"Refusing stream for {track_id}: Spotty failed before real PCM.",
+            LOGDEBUG,
+        )
+        return ""
+
     SPOTTY_AUDIO_TRACK_ROUTE = "/track/<track_id>/<duration>"
 
     def spotty_stream_audio_track(self, track_id: str, duration: str) -> bottle.Response:
@@ -540,6 +560,15 @@ class HTTPSpottyAudioStreamer:
             )
             bottle.response.status = 204  # No Content
             return ""
+
+        if (
+            bottle.request.method.upper() == "GET"
+            and is_new_track
+            and range_begin <= 44
+            and not prebuf_data
+        ):
+            if not streamer.prepare_part_audio_stream(range_begin):
+                return self._failed_new_track_response(track_id or "", request_id or "")
 
         def generate():
             # Double-check inside generator as safety net
