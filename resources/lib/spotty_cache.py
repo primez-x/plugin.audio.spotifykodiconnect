@@ -400,8 +400,16 @@ class SpottyCacheManager:
             # Keep only the 3 most recent tracks in memory
             tracks_to_keep = set(cls._recent_tracks[-3:])
             for k in list(cls._instances.keys()):
+                inst = cls._instances[k]
+                has_active_consumers = False
+                cond = getattr(inst, "cond", None)
+                if cond is not None and hasattr(inst, "_consumer_positions"):
+                    with cond:
+                        has_active_consumers = bool(inst._consumer_positions)
+                if has_active_consumers:
+                    continue
                 if k[0] not in tracks_to_keep:
-                    cls._instances[k].cleanup()
+                    inst.cleanup()
                     del cls._instances[k]
 
             # Trim _recent_tracks to only entries with active instances; prevents
