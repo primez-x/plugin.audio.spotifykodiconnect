@@ -258,6 +258,33 @@ class HTTPSpottyAudioStreamer:
             )
         return finished_cleanly
 
+    def _previous_stream_has_confirmed_playback(self, previous_track_id: str) -> bool:
+        try:
+            win = xbmcgui.Window(ADDON_WINDOW_ID)
+            confirmed_track_id = (win.getProperty("Spotify.CurrentTrackId") or "").strip()
+            if confirmed_track_id == previous_track_id:
+                return True
+
+            file_url = xbmc.getInfoLabel("Player.Filenameandpath") or ""
+            if f"/track/{previous_track_id}/" in file_url:
+                return True
+
+            if confirmed_track_id:
+                log_msg(
+                    f"Discarding stale Spotify stream guard for {previous_track_id}: "
+                    f"Kodi confirms {confirmed_track_id} instead.",
+                    LOGDEBUG,
+                )
+            else:
+                log_msg(
+                    f"Discarding stale Spotify stream guard for {previous_track_id}: "
+                    f"no Kodi-confirmed active Spotify playback.",
+                    LOGDEBUG,
+                )
+            return False
+        except Exception:
+            return True
+
     def _player_near_natural_handoff(self, previous_track_id: str) -> bool:
         try:
             file_url = xbmc.getInfoLabel("Player.Filenameandpath") or ""
@@ -419,7 +446,13 @@ class HTTPSpottyAudioStreamer:
             # the active stream until the previous downloader is safely complete.
             _skip_terminate = False
             if _previous_track_id and _previous_track_id != track_id and _previous_was_streaming:
-                if self._previous_downloader_finished_for_handoff(
+                if not self._previous_stream_has_confirmed_playback(_previous_track_id):
+                    log_msg(
+                        f"Starting {track_id}: previous stream {_previous_track_id} "
+                        f"is internal stale state, not active playback.",
+                        LOGDEBUG,
+                    )
+                elif self._previous_downloader_finished_for_handoff(
                     _previous_track_id,
                     track_id,
                 ):
