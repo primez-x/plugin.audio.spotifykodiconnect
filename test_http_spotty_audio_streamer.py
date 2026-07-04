@@ -91,6 +91,7 @@ def install_stubs():
     xbmc = types.ModuleType("xbmc")
     xbmc.LOGDEBUG = 0
     xbmc.getInfoLabel = lambda label: ""
+    xbmc.getCondVisibility = lambda condition: False
     sys.modules["xbmc"] = xbmc
 
     xbmcaddon = types.ModuleType("xbmcaddon")
@@ -225,6 +226,7 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
     def test_queue_preload_does_not_terminate_unfinished_current_stream(self):
         module = import_http_streamer()
         module.PRELOAD_HANDOFF_WAIT_SECONDS = 0.0
+        module.xbmc.getCondVisibility = lambda condition: condition == "Player.HasAudio"
         module.xbmcgui.Window(module.ADDON_WINDOW_ID).setProperty(
             "Spotify.CurrentTrackId",
             "current-track",
@@ -254,6 +256,7 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
     def test_early_player_metadata_does_not_override_unfinished_handoff(self):
         module = import_http_streamer()
         module.PRELOAD_HANDOFF_WAIT_SECONDS = 0.0
+        module.xbmc.getCondVisibility = lambda condition: condition == "Player.HasAudio"
         module.xbmcgui.Window(module.ADDON_WINDOW_ID).setProperty(
             "Spotify.CurrentTrackId",
             "current-track",
@@ -297,6 +300,63 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
         module.xbmc.getInfoLabel = lambda label: {
             "Player.Filenameandpath": ("http://127.0.0.1:52309/track/selected-track/180.wav"),
         }.get(label, "")
+
+        streamer = module.HTTPSpottyAudioStreamer(object())
+        streamer._HTTPSpottyAudioStreamer__is_streaming = True
+        streamer._HTTPSpottyAudioStreamer__current_track_id = "stale-track"
+        streamer._HTTPSpottyAudioStreamer__current_request_id = "stale-request"
+
+        result = streamer.spotty_stream_audio_track("selected-track", "180.wav")
+
+        self.assertNotEqual(503, FakeBottleState.response.status)
+        self.assertEqual(
+            1,
+            streamer._HTTPSpottyAudioStreamer__spotty_streamer.terminate_calls,
+        )
+        self.assertEqual(
+            [("selected-track", 180.0)],
+            streamer._HTTPSpottyAudioStreamer__spotty_streamer.set_track_calls,
+        )
+        result.close()
+
+    def test_stale_player_filename_without_active_audio_does_not_confirm_playback(self):
+        module = import_http_streamer()
+        spotty_cache = types.ModuleType("spotty_cache")
+        spotty_cache.SpottyCacheManager = MissingSpottyCacheManager
+        sys.modules["spotty_cache"] = spotty_cache
+        module.xbmc.getInfoLabel = lambda label: {
+            "Player.Filenameandpath": "http://127.0.0.1:52309/track/stale-track/180.wav",
+        }.get(label, "")
+        module.xbmc.getCondVisibility = lambda condition: False
+
+        streamer = module.HTTPSpottyAudioStreamer(object())
+        streamer._HTTPSpottyAudioStreamer__is_streaming = True
+        streamer._HTTPSpottyAudioStreamer__current_track_id = "stale-track"
+        streamer._HTTPSpottyAudioStreamer__current_request_id = "stale-request"
+
+        result = streamer.spotty_stream_audio_track("selected-track", "180.wav")
+
+        self.assertNotEqual(503, FakeBottleState.response.status)
+        self.assertEqual(
+            1,
+            streamer._HTTPSpottyAudioStreamer__spotty_streamer.terminate_calls,
+        )
+        self.assertEqual(
+            [("selected-track", 180.0)],
+            streamer._HTTPSpottyAudioStreamer__spotty_streamer.set_track_calls,
+        )
+        result.close()
+
+    def test_stale_current_property_without_active_audio_does_not_confirm_playback(self):
+        module = import_http_streamer()
+        spotty_cache = types.ModuleType("spotty_cache")
+        spotty_cache.SpottyCacheManager = MissingSpottyCacheManager
+        sys.modules["spotty_cache"] = spotty_cache
+        module.xbmcgui.Window(module.ADDON_WINDOW_ID).setProperty(
+            "Spotify.CurrentTrackId",
+            "stale-track",
+        )
+        module.xbmc.getCondVisibility = lambda condition: False
 
         streamer = module.HTTPSpottyAudioStreamer(object())
         streamer._HTTPSpottyAudioStreamer__is_streaming = True
