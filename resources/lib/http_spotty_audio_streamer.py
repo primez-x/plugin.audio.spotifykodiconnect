@@ -260,16 +260,23 @@ class HTTPSpottyAudioStreamer:
 
     def _previous_stream_has_confirmed_playback(self, previous_track_id: str) -> bool:
         try:
+            has_active_audio = bool(xbmc.getCondVisibility("Player.HasAudio"))
             win = xbmcgui.Window(ADDON_WINDOW_ID)
             confirmed_track_id = (win.getProperty("Spotify.CurrentTrackId") or "").strip()
-            if confirmed_track_id == previous_track_id:
+            if has_active_audio and confirmed_track_id == previous_track_id:
                 return True
 
             file_url = xbmc.getInfoLabel("Player.Filenameandpath") or ""
-            if f"/track/{previous_track_id}/" in file_url:
+            if has_active_audio and f"/track/{previous_track_id}/" in file_url:
                 return True
 
-            if confirmed_track_id:
+            if not has_active_audio:
+                log_msg(
+                    f"Discarding stale Spotify stream guard for {previous_track_id}: "
+                    f"Kodi has no active audio playback.",
+                    LOGDEBUG,
+                )
+            elif confirmed_track_id:
                 log_msg(
                     f"Discarding stale Spotify stream guard for {previous_track_id}: "
                     f"Kodi confirms {confirmed_track_id} instead.",
