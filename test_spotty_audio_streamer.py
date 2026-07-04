@@ -159,6 +159,8 @@ class ManagedFakeDownloader:
         self.error = False
         self.aborted = False
         self.started = False
+        self.cond = threading.Condition()
+        self._consumer_positions = {}
         ManagedFakeDownloader.created.append(self)
 
     def start(self):
@@ -589,6 +591,64 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             self.assertFalse(active.aborted)
             self.assertEqual(1, len(ManagedFakeDownloader.created))
             self.assertNotIn(("next-track", 0), manager._instances)
+        finally:
+            manager._instances.clear()
+            manager._recent_tracks.clear()
+            spotty_cache.SpottyDownloader = original_downloader_class
+
+    def test_cache_eviction_keeps_downloader_with_active_consumers(self):
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+
+        original_downloader_class = spotty_cache.SpottyDownloader
+        spotty_cache.SpottyDownloader = ManagedFakeDownloader
+        ManagedFakeDownloader.created = []
+        manager = spotty_cache.SpottyCacheManager
+        manager._instances.clear()
+        manager._recent_tracks.clear()
+        try:
+
+            def make_finished(track_id):
+                downloader = ManagedFakeDownloader(
+                    spotty=object(),
+                    track_id=track_id,
+                    duration_sec=180,
+                    start_byte=0,
+                    bitrate="320",
+                    normalization="off",
+                    volume=35,
+                    wav_header=b"0" * 44,
+                    track_length=1000,
+                )
+                downloader.is_finished = True
+                return downloader
+
+            active_reader = make_finished("active-reader")
+            with active_reader.cond:
+                active_reader._consumer_positions[1] = 0
+
+            manager._instances[("active-reader", 0)] = active_reader
+            manager._instances[("stale-1", 0)] = make_finished("stale-1")
+            manager._instances[("stale-2", 0)] = make_finished("stale-2")
+            manager._instances[("stale-3", 0)] = make_finished("stale-3")
+            manager._recent_tracks = ["active-reader", "stale-1", "stale-2", "stale-3"]
+
+            manager.get_or_start(
+                object(),
+                "new-track",
+                180,
+                0,
+                "320",
+                "off",
+                35,
+                b"0" * 44,
+                1000,
+            )
+
+            self.assertIn(("active-reader", 0), manager._instances)
+            self.assertIn(("new-track", 0), manager._instances)
+            self.assertNotIn(("stale-1", 0), manager._instances)
+            self.assertFalse(active_reader.aborted)
         finally:
             manager._instances.clear()
             manager._recent_tracks.clear()

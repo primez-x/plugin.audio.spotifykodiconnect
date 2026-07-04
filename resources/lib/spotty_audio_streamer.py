@@ -84,7 +84,7 @@ class SpottyAudioStreamer:
         self.__track_length: int = 0
 
         self.__notify_track_finished: Callable[[str], None] = lambda x: None
-        self.__terminated = False
+        self.__terminate_generation = 0
 
         # Streaming settings — updated by the HTTP layer before each track.
         self.normalization_gain_type: str = _DEFAULT_GAIN_TYPE
@@ -144,6 +144,7 @@ class SpottyAudioStreamer:
         range_begin: int,
         wav_header: bytes,
         track_length: int,
+        stream_generation: int,
     ) -> None:
         if range_begin > _WAV_HEADER_SIZE:
             return
@@ -175,7 +176,7 @@ class SpottyAudioStreamer:
             written=written,
         )
         deadline = time.monotonic() + _STARTUP_REAL_PCM_WAIT_SECONDS
-        while not self.__terminated:
+        while not self._is_terminated(stream_generation):
             with downloader.cond:
                 if (
                     downloader.written_bytes >= target_bytes_in_buf
@@ -206,8 +207,11 @@ class SpottyAudioStreamer:
 
     def terminate_stream(self) -> bool:
         """Signal the current generator to stop."""
-        self.__terminated = True
+        self.__terminate_generation += 1
         return True
+
+    def _is_terminated(self, stream_generation: int) -> bool:
+        return stream_generation != self.__terminate_generation
 
     def _get_or_start_downloader(
         self,
@@ -260,7 +264,7 @@ class SpottyAudioStreamer:
         track_length = self.__track_length
         track_duration = self.__track_duration
         wav_header = bytes(self.__wav_header)
-        self.__terminated = False
+        stream_generation = self.__terminate_generation
         downloader = self._get_or_start_downloader(
             track_id,
             track_duration,
@@ -271,7 +275,9 @@ class SpottyAudioStreamer:
         if downloader is None:
             return False
 
-        self._prime_startup_real_pcm(downloader, range_begin, wav_header, track_length)
+        self._prime_startup_real_pcm(
+            downloader, range_begin, wav_header, track_length, stream_generation
+        )
         prefix_end = len(wav_header) + STARTUP_SILENCE_BYTES
         with downloader.cond:
             if (
@@ -303,7 +309,7 @@ class SpottyAudioStreamer:
         track_duration = self.__track_duration
         wav_header = bytes(self.__wav_header)
 
-        self.__terminated = False
+        stream_generation = self.__terminate_generation
         bytes_sent = 0
 
         downloader = self._get_or_start_downloader(
@@ -344,7 +350,9 @@ class SpottyAudioStreamer:
                 downloader._next_consumer_id += 1
                 downloader._consumer_positions[consumer_id] = max(0, buf_offset)
 
-            self._prime_startup_real_pcm(downloader, range_begin, wav_header, track_length)
+            self._prime_startup_real_pcm(
+                downloader, range_begin, wav_header, track_length, stream_generation
+            )
             prefix_end = len(wav_header) + STARTUP_SILENCE_BYTES
             with downloader.cond:
                 silence_only_error = (
@@ -359,11 +367,11 @@ class SpottyAudioStreamer:
                 )
                 return
 
-            while bytes_sent < range_len and not self.__terminated:
+            while bytes_sent < range_len and not self._is_terminated(stream_generation):
                 target_bytes_in_buf = buf_offset + bytes_sent + 1
                 downloader.wait_for_bytes(target_bytes_in_buf, timeout=1.0)
 
-                if self.__terminated:
+                if self._is_terminated(stream_generation):
                     break
 
                 chunk = None
@@ -409,7 +417,9 @@ class SpottyAudioStreamer:
                         if bytes_sent > budget:
                             sleep_needed = (bytes_sent - budget) / _PCM_BYTES_PER_SEC
                             sleep_end = time.monotonic() + sleep_needed
-                            while time.monotonic() < sleep_end and not self.__terminated:
+                            while time.monotonic() < sleep_end and not self._is_terminated(
+                                stream_generation
+                            ):
                                 time.sleep(0.1)
                 elif is_finished:
                     break
@@ -418,7 +428,7 @@ class SpottyAudioStreamer:
             # incomplete track; padding those turns a failed stream into minutes
             # of fake silence while Kodi's OSD keeps advancing.
             remaining = range_len - bytes_sent
-            if remaining > 0 and not self.__terminated:
+            if remaining > 0 and not self._is_terminated(stream_generation):
                 with downloader.cond:
                     dl_finished = downloader.is_finished
                     dl_error = downloader.error
@@ -432,7 +442,7 @@ class SpottyAudioStreamer:
                             LOGWARNING,
                         )
                         silence_chunk = bytes(min(self.chunk_size, 1048576))
-                        while remaining > 0 and not self.__terminated:
+                        while remaining > 0 and not self._is_terminated(stream_generation):
                             to_yield = min(len(silence_chunk), remaining)
                             yield silence_chunk[:to_yield]
                             bytes_sent += to_yield
@@ -462,7 +472,6 @@ class SpottyAudioStreamer:
                 with downloader.cond:
                     downloader._consumer_positions.pop(consumer_id, None)
                     downloader._trim_head_locked()
-            self.__terminated = False
 
 
 def create_wav_header_for_duration(
