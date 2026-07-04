@@ -23,6 +23,7 @@ _PCM_BYTES_PER_SEC = 176400  # 44.1 kHz * 2 ch * 2 bytes/sample
 _WAV_HEADER_SIZE = 44
 STARTUP_SILENCE_BYTES = _PCM_BYTES_PER_SEC * 2
 _STARTUP_REAL_PCM_PREROLL_BYTES = 2097152
+_THROTTLE_LEAD_BYTES = 2097152
 _STARTUP_REAL_PCM_WAIT_SECONDS = 15.0
 
 # Maximum bytes of PCM silence to pad at the end of a stream when spotty exits
@@ -328,16 +329,18 @@ class SpottyAudioStreamer:
         # at full speed (40+ MB in ~6 seconds), closing the connection minutes before the
         # *next* QueueNextFileEx fires — causing "Unhandled exception" and cascading skips.
         # Allow a 2 MB initial burst so Kodi's decode buffer fills instantly, then pace
-        # at 176400 B/s (44.1 kHz × 2 ch × 2 bytes).  Only from-start requests are
-        # throttled; seeks (range_begin > 0) must respond immediately.
+        # at 176400 B/s (44.1 kHz × 2 ch × 2 bytes).  From-start and early
+        # follow-up range readers are throttled; true mid-song seeks respond
+        # immediately.
         _PCM_BYTES_PER_SEC = 176400  # 44.1 kHz × 2 ch × 2 bytes/sample
-        _THROTTLE_LEAD_BYTES = 2097152  # 2 MB burst window before throttle engages
         # Throttle for from-start requests (range_begin == 0) AND for WAV-header
         # restarts (range_begin == 44, i.e. "prev" skips the 44-byte header).
-        # Both are full-track deliveries that must keep the connection alive.
-        # Mid-song seeks (range_begin > 44) are never throttled.
+        # Kodi may also close the header GET and continue with an early range
+        # reader. Treat those as the same active stream, not as seeks with a new
+        # burst budget. Mid-song seeks beyond the lead window still respond
+        # immediately.
         _WAV_HEADER_SIZE = 44
-        stream_start_time = time.monotonic() if range_begin <= _WAV_HEADER_SIZE else None
+        stream_start_time = time.monotonic() if range_begin <= _THROTTLE_LEAD_BYTES else None
 
         self._log_transfer("start", range_begin=range_begin)
 
@@ -414,8 +417,9 @@ class SpottyAudioStreamer:
                     if stream_start_time is not None:
                         elapsed = time.monotonic() - stream_start_time
                         budget = elapsed * _PCM_BYTES_PER_SEC + _THROTTLE_LEAD_BYTES
-                        if bytes_sent > budget:
-                            sleep_needed = (bytes_sent - budget) / _PCM_BYTES_PER_SEC
+                        stream_position = range_begin + bytes_sent
+                        if stream_position > budget:
+                            sleep_needed = (stream_position - budget) / _PCM_BYTES_PER_SEC
                             sleep_end = time.monotonic() + sleep_needed
                             while time.monotonic() < sleep_end and not self._is_terminated(
                                 stream_generation
