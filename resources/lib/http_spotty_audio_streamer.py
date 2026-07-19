@@ -14,7 +14,12 @@ import xbmc
 import xbmcaddon
 import xbmcgui
 from spotty import Spotty
-from spotty_audio_streamer import SpottyAudioStreamer, create_wav_header_for_duration
+from spotty_audio_streamer import (
+    STARTUP_REAL_PCM_WAIT_SECONDS,
+    SpottyAudioStreamer,
+    SpottyStreamSpec,
+    create_wav_header_for_duration,
+)
 from utils import ADDON_ID, ADDON_WINDOW_ID, LOGDEBUG, get_cached_auth_token, log_msg
 
 _settings_cache = {
@@ -24,8 +29,9 @@ _settings_cache = {
 }
 _settings_cache_lock = threading.Lock()
 _SETTINGS_CACHE_TTL = 1.0  # Cache for 1 second
-PRELOAD_HANDOFF_WAIT_SECONDS = 60.0
 NATURAL_HANDOFF_REMAINING_SECONDS = 8.0
+INITIALIZATION_WAIT_SECONDS = STARTUP_REAL_PCM_WAIT_SECONDS + 2.0
+HEALTHY_PROGRESS_MAX_IDLE_SECONDS = 15.0
 
 
 def _get_current_stream_settings():
@@ -99,9 +105,12 @@ class HTTPSpottyAudioStreamer:
         self.__stream_lock = threading.Lock()
         self.__current_track_id: Optional[str] = None
         self.__current_request_id: str = ""  # Track current request for init coordination.
+        self.__current_stream_spec: Optional[SpottyStreamSpec] = None
         # Init coordination: when a new-track GET is being initialized, set this
         # so other concurrent GETs can wait and then reuse the same request id.
         self.__init_in_progress = False
+        self.__initializing_track_id: Optional[str] = None
+        self.__initializing_request_id: str = ""
         self.__init_event = threading.Event()
         self.__init_event.set()
 
@@ -168,7 +177,10 @@ class HTTPSpottyAudioStreamer:
             self.__is_streaming = False
             self.__current_track_id = None
             self.__current_request_id = ""
+            self.__current_stream_spec = None
             self.__init_in_progress = False
+            self.__initializing_track_id = None
+            self.__initializing_request_id = ""
             try:
                 self.__init_event.set()
             except Exception:
@@ -187,34 +199,137 @@ class HTTPSpottyAudioStreamer:
         previous_track_id: Optional[str],
         previous_request_id: str,
         previous_was_streaming: bool,
+        previous_stream_spec: Optional[SpottyStreamSpec],
+        initializing_request_id: Optional[str] = None,
     ) -> None:
         with self.__stream_lock:
+            if initializing_request_id is not None and (
+                not self.__init_in_progress
+                or self.__initializing_request_id != initializing_request_id
+            ):
+                return
             self.__is_streaming = previous_was_streaming
             self.__current_track_id = previous_track_id
             self.__current_request_id = previous_request_id
+            self.__current_stream_spec = previous_stream_spec
+            if previous_stream_spec is not None:
+                self.__spotty_streamer.restore_stream_spec(previous_stream_spec)
             self.__init_in_progress = False
+            self.__initializing_track_id = None
+            self.__initializing_request_id = ""
             try:
                 self.__init_event.set()
             except Exception:
                 pass
+
+    @staticmethod
+    def _find_downloader(track_id: str, request_byte: int = 0):
+        try:
+            from spotty_cache import SpottyCacheManager
+
+            return SpottyCacheManager.find_best_downloader(track_id, request_byte)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _find_active_downloader(track_id: str):
+        """Find a live track downloader without imposing range readability."""
+        try:
+            from spotty_cache import SpottyCacheManager
+
+            finder = getattr(SpottyCacheManager, "find_active_downloader", None)
+            if callable(finder):
+                return finder(track_id)
+            # Compatibility for older test doubles; production managers expose
+            # the trim-independent API above.
+            return SpottyCacheManager.find_best_downloader(track_id, 0)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _request_range_begin(request_range: str) -> int:
+        """Return a conservative byte offset for same-track health lookup."""
+        try:
+            value = (request_range or "").strip()
+            if not value or not value.startswith("bytes="):
+                return 0
+            start = value.split("bytes=", 1)[1].split("-", 1)[0].strip()
+            return max(0, int(start)) if start else 0
+        except (ValueError, IndexError):
+            return 0
+
+    @staticmethod
+    def _downloader_has_real_pcm(downloader) -> bool:
+        if downloader is None:
+            return False
+
+        has_real_pcm = getattr(downloader, "has_real_pcm", None)
+        if callable(has_real_pcm):
+            try:
+                return bool(has_real_pcm())
+            except Exception:
+                pass
+
+        cond = getattr(downloader, "cond", None)
+        if cond is None:
+            return False
+        try:
+            with cond:
+                if bool(getattr(downloader, "error", False)) or bool(
+                    getattr(downloader, "aborted", False)
+                ):
+                    return False
+                written = int(getattr(downloader, "written_bytes", 0) or 0)
+                start_byte = int(getattr(downloader, "start_byte", 0) or 0)
+                wav_header = getattr(downloader, "wav_header", b"") or b""
+                startup_silence = max(
+                    0,
+                    int(getattr(downloader, "startup_silence_bytes", 0) or 0),
+                )
+                synthetic_prefix_remaining = max(
+                    0,
+                    len(wav_header) + startup_silence - start_byte,
+                )
+                return written > synthetic_prefix_remaining
+        except Exception:
+            return False
+
+    @classmethod
+    def _downloader_has_healthy_progress(cls, downloader) -> bool:
+        if not cls._downloader_has_real_pcm(downloader):
+            return False
+
+        cond = getattr(downloader, "cond", None)
+        if cond is None:
+            return False
+        try:
+            with cond:
+                if bool(getattr(downloader, "error", False)) or bool(
+                    getattr(downloader, "aborted", False)
+                ):
+                    return False
+                if bool(getattr(downloader, "is_finished", False)):
+                    return True
+        except Exception:
+            return False
+
+        has_recent_progress = getattr(downloader, "has_recent_progress", None)
+        if callable(has_recent_progress):
+            try:
+                return bool(has_recent_progress(HEALTHY_PROGRESS_MAX_IDLE_SECONDS))
+            except Exception:
+                return False
+
+        # Older downloader implementations do not expose progress timestamps.
+        # Real PCM plus a non-error active state is the strongest safe fallback.
+        return True
 
     def _previous_downloader_finished_for_handoff(
         self,
         previous_track_id: str,
         next_track_id: str,
     ) -> bool:
-        from spotty_cache import SpottyCacheManager
-
-        if self._player_near_natural_handoff(previous_track_id):
-            log_msg(
-                f"QueueNextFileEx natural handoff allowed: Kodi is near the end of "
-                f"{previous_track_id}, so {next_track_id} may start even if the "
-                f"previous cache downloader already drained.",
-                LOGDEBUG,
-            )
-            return True
-
-        downloader = SpottyCacheManager.find_best_downloader(previous_track_id, 0)
+        downloader = self._find_active_downloader(previous_track_id)
         if downloader is None:
             log_msg(
                 f"QueueNextFileEx handoff blocked: no active downloader found for "
@@ -223,25 +338,18 @@ class HTTPSpottyAudioStreamer:
             )
             return False
 
-        deadline = time.monotonic() + max(0.0, PRELOAD_HANDOFF_WAIT_SECONDS)
-        with downloader.cond:
-            while not downloader.is_finished and not downloader.error and not downloader.aborted:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                downloader.cond.wait(timeout=min(0.5, remaining))
+        try:
+            with downloader.cond:
+                finished_cleanly = (
+                    bool(getattr(downloader, "is_finished", False))
+                    and not bool(getattr(downloader, "error", False))
+                    and not bool(getattr(downloader, "aborted", False))
+                )
+        except Exception:
+            finished_cleanly = False
 
-            finished_cleanly = (
-                downloader.is_finished and not downloader.error and not downloader.aborted
-            )
-
-        if not finished_cleanly and self._player_near_natural_handoff(previous_track_id):
-            log_msg(
-                f"QueueNextFileEx natural handoff allowed after wait: Kodi is near "
-                f"the end of {previous_track_id}, so {next_track_id} may start.",
-                LOGDEBUG,
-            )
-            return True
+        if finished_cleanly:
+            finished_cleanly = self._downloader_has_real_pcm(downloader)
 
         if finished_cleanly:
             log_msg(
@@ -252,48 +360,262 @@ class HTTPSpottyAudioStreamer:
             )
         else:
             log_msg(
-                f"QueueNextFileEx handoff deferred: {previous_track_id} is still active "
-                f"before {next_track_id}.",
+                f"QueueNextFileEx handoff deferred without waiting: {previous_track_id} "
+                f"is still active before {next_track_id}.",
                 LOGDEBUG,
             )
         return finished_cleanly
 
     def _previous_stream_has_confirmed_playback(self, previous_track_id: str) -> bool:
+        downloader = self._find_active_downloader(previous_track_id)
+        if not self._downloader_has_healthy_progress(downloader):
+            log_msg(
+                f"Discarding stale Spotify stream guard for {previous_track_id}: "
+                f"the prior downloader has no healthy real-PCM progress.",
+                LOGDEBUG,
+            )
+            return False
+
         try:
             has_active_audio = bool(xbmc.getCondVisibility("Player.HasAudio"))
-            win = xbmcgui.Window(ADDON_WINDOW_ID)
-            confirmed_track_id = (win.getProperty("Spotify.CurrentTrackId") or "").strip()
-            if has_active_audio and confirmed_track_id == previous_track_id:
-                return True
-
-            file_url = xbmc.getInfoLabel("Player.Filenameandpath") or ""
-            if has_active_audio and f"/track/{previous_track_id}/" in file_url:
-                return True
-
             if not has_active_audio:
                 log_msg(
                     f"Discarding stale Spotify stream guard for {previous_track_id}: "
                     f"Kodi has no active audio playback.",
                     LOGDEBUG,
                 )
-            elif confirmed_track_id:
+                return False
+
+            win = xbmcgui.Window(ADDON_WINDOW_ID)
+            confirmed_track_id = (win.getProperty("Spotify.CurrentTrackId") or "").strip()
+            if confirmed_track_id:
+                if confirmed_track_id == previous_track_id:
+                    return True
                 log_msg(
                     f"Discarding stale Spotify stream guard for {previous_track_id}: "
                     f"Kodi confirms {confirmed_track_id} instead.",
                     LOGDEBUG,
                 )
-            else:
-                log_msg(
-                    f"Discarding stale Spotify stream guard for {previous_track_id}: "
-                    f"no Kodi-confirmed active Spotify playback.",
-                    LOGDEBUG,
-                )
+                return False
+
+            file_url = xbmc.getInfoLabel("Player.Filenameandpath") or ""
+            if f"/track/{previous_track_id}/" in file_url:
+                return True
+
+            log_msg(
+                f"Discarding stale Spotify stream guard for {previous_track_id}: "
+                f"no Kodi-confirmed active Spotify playback.",
+                LOGDEBUG,
+            )
             return False
         except Exception:
+            return False
+
+    def _coordinate_initialization(
+        self,
+        track_id: str,
+        request_id: str,
+        request_byte: int = 0,
+    ):
+        deadline = time.monotonic() + INITIALIZATION_WAIT_SECONDS
+        while True:
+            wait_event = None
+            reuse_request_id = None
+            with self.__stream_lock:
+                if self.__init_in_progress:
+                    wait_event = self.__init_event
+                    initializing_track_id = self.__initializing_track_id
+                elif self.__is_streaming and self.__current_track_id == track_id:
+                    # Check downloader health outside __stream_lock. Cache lookup
+                    # and downloader.cond must never be nested under this lock.
+                    reuse_request_id = self.__current_request_id
+                else:
+                    previous_track_id = self.__current_track_id
+                    previous_request_id = self.__current_request_id
+                    previous_was_streaming = self.__is_streaming
+                    previous_stream_spec = self.__current_stream_spec
+                    self.__init_in_progress = True
+                    self.__initializing_track_id = track_id
+                    self.__initializing_request_id = request_id
+                    self.__init_event.clear()
+                    return (
+                        True,
+                        request_id,
+                        previous_track_id,
+                        previous_request_id,
+                        previous_was_streaming,
+                        previous_stream_spec,
+                        None,
+                    )
+
+            if reuse_request_id is not None:
+                downloader = self._find_downloader(track_id, request_byte)
+                healthy = self._downloader_has_healthy_progress(downloader)
+                with self.__stream_lock:
+                    # State may have changed while downloader health was checked.
+                    # Retry coordination instead of acting on a stale snapshot.
+                    if (
+                        self.__init_in_progress
+                        or not self.__is_streaming
+                        or self.__current_track_id != track_id
+                        or self.__current_request_id != reuse_request_id
+                    ):
+                        continue
+                    if healthy:
+                        current_stream_spec = self.__current_stream_spec
+                        return (
+                            False,
+                            reuse_request_id,
+                            self.__current_track_id,
+                            reuse_request_id,
+                            self.__is_streaming,
+                            current_stream_spec,
+                            current_stream_spec,
+                        )
+
+                    previous_track_id = self.__current_track_id
+                    previous_request_id = self.__current_request_id
+                    previous_was_streaming = self.__is_streaming
+                    previous_stream_spec = self.__current_stream_spec
+                    self.__init_in_progress = True
+                    self.__initializing_track_id = track_id
+                    self.__initializing_request_id = request_id
+                    self.__init_event.clear()
+
+                cleanup = getattr(downloader, "cleanup", None)
+                if callable(cleanup):
+                    try:
+                        cleanup()
+                    except Exception:
+                        pass
+                log_msg(
+                    f"Reinitializing {track_id}: the current downloader is missing, "
+                    "failed, or no longer making healthy real-PCM progress.",
+                    LOGDEBUG,
+                )
+                return (
+                    True,
+                    request_id,
+                    previous_track_id,
+                    previous_request_id,
+                    previous_was_streaming,
+                    previous_stream_spec,
+                    None,
+                )
+
+            log_msg(
+                f"Initialization for {initializing_track_id} already in progress; "
+                f"waiting before serving {track_id}.",
+                LOGDEBUG,
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not wait_event.wait(timeout=remaining):
+                return None
+
+    def _prepare_initialization(
+        self,
+        track_id: str,
+        request_id: str,
+        duration: str,
+        bitrate: str,
+        normalization: str,
+    ) -> Optional[SpottyStreamSpec]:
+        """Configure the shared streamer without publishing readiness.
+
+        The initialization reservation remains held while the caller performs
+        eager downloader preflight. Concurrent GETs therefore cannot reuse the
+        track or commit response headers before real PCM is ready.
+        """
+        with self.__stream_lock:
+            if (
+                not self.__init_in_progress
+                or self.__initializing_track_id != track_id
+                or self.__initializing_request_id != request_id
+            ):
+                return None
+            self.__spotty_streamer.bitrate = bitrate
+            self.__spotty_streamer.normalization_gain_type = normalization
+            self.__spotty_streamer.set_track(track_id, float(duration))
+            return self.__spotty_streamer.get_stream_spec()
+
+    def _commit_initialization(
+        self,
+        track_id: str,
+        request_id: str,
+        stream_spec: SpottyStreamSpec,
+    ) -> bool:
+        """Publish a preflighted stream and release same-track waiters."""
+        with self.__stream_lock:
+            if (
+                not self.__init_in_progress
+                or self.__initializing_track_id != track_id
+                or self.__initializing_request_id != request_id
+            ):
+                return False
+            self.__is_streaming = True
+            self.__current_track_id = track_id
+            self.__current_request_id = request_id
+            self.__current_stream_spec = stream_spec
+            self.__init_in_progress = False
+            self.__initializing_track_id = None
+            self.__initializing_request_id = ""
+            self.__init_event.set()
             return True
+
+    def _owns_initialization(self, track_id: str, request_id: str) -> bool:
+        """Return whether this request still owns the unpublished init reservation."""
+        with self.__stream_lock:
+            return (
+                self.__init_in_progress
+                and self.__initializing_track_id == track_id
+                and self.__initializing_request_id == request_id
+            )
+
+    def _abort_initialization(
+        self,
+        track_id: str,
+        request_id: str,
+        previous_track_id: Optional[str],
+        previous_request_id: str,
+        previous_was_streaming: bool,
+        previous_stream_spec: Optional[SpottyStreamSpec],
+        previous_stream_preserved: bool,
+    ) -> None:
+        """Release an owned reservation and restore only a preserved stream."""
+        with self.__stream_lock:
+            if (
+                not self.__init_in_progress
+                or self.__initializing_track_id != track_id
+                or self.__initializing_request_id != request_id
+            ):
+                return
+            self.__is_streaming = previous_was_streaming and previous_stream_preserved
+            self.__current_track_id = previous_track_id
+            self.__current_request_id = previous_request_id
+            self.__current_stream_spec = previous_stream_spec if previous_stream_preserved else None
+            if previous_stream_preserved and previous_stream_spec is not None:
+                self.__spotty_streamer.restore_stream_spec(previous_stream_spec)
+            self.__init_in_progress = False
+            self.__initializing_track_id = None
+            self.__initializing_request_id = ""
+            self.__init_event.set()
+
+    @staticmethod
+    def _initialization_busy_response(track_id: str):
+        bottle.response.status = 503
+        bottle.response.content_type = "text/plain"
+        bottle.response.content_length = 0
+        bottle.response.headers["Retry-After"] = "1"
+        log_msg(
+            f"Refusing stream for {track_id}: another Spotify stream is still initializing.",
+            LOGDEBUG,
+        )
+        return ""
 
     def _player_near_natural_handoff(self, previous_track_id: str) -> bool:
         try:
+            if not xbmc.getCondVisibility("Player.HasAudio"):
+                return False
             file_url = xbmc.getInfoLabel("Player.Filenameandpath") or ""
             if f"/track/{previous_track_id}/" not in file_url:
                 return False
@@ -313,12 +635,16 @@ class HTTPSpottyAudioStreamer:
         previous_track_id: Optional[str],
         previous_request_id: str,
         previous_was_streaming: bool,
+        previous_stream_spec: Optional[SpottyStreamSpec],
         next_track_id: str,
+        initializing_request_id: str,
     ):
         self._restore_previous_stream_state(
             previous_track_id,
             previous_request_id,
             previous_was_streaming,
+            previous_stream_spec,
+            initializing_request_id,
         )
         bottle.response.status = 503
         bottle.response.content_type = "text/plain"
@@ -331,16 +657,25 @@ class HTTPSpottyAudioStreamer:
         )
         return ""
 
-    def _failed_new_track_response(self, track_id: str, request_id: str):
-        with self.__stream_lock:
-            if self.__current_track_id == track_id and self.__current_request_id == request_id:
-                self.__is_streaming = False
-                self.__current_request_id = ""
-                self.__init_in_progress = False
-                try:
-                    self.__init_event.set()
-                except Exception:
-                    pass
+    def _failed_new_track_response(
+        self,
+        track_id: str,
+        request_id: str,
+        previous_track_id: Optional[str],
+        previous_request_id: str,
+        previous_was_streaming: bool,
+        previous_stream_spec: Optional[SpottyStreamSpec],
+        previous_stream_preserved: bool,
+    ):
+        self._abort_initialization(
+            track_id,
+            request_id,
+            previous_track_id,
+            previous_request_id,
+            previous_was_streaming,
+            previous_stream_spec,
+            previous_stream_preserved,
+        )
         bottle.response.status = 503
         bottle.response.content_type = "text/plain"
         bottle.response.content_length = 0
@@ -373,143 +708,148 @@ class HTTPSpottyAudioStreamer:
         bitrate, norm = _get_current_stream_settings()
 
         request_range = bottle.request.headers.get("Range", "")
-        is_new_track = not self.__is_streaming or self.__current_track_id != track_id
-        # Capture BEFORE the is_new_track lock block sets self.__current_track_id = track_id
-        # (line ~191). Used by _skip_terminate to identify QueueNextFileEx pre-loads.
-        _previous_track_id = self.__current_track_id
-        _previous_request_id = self.__current_request_id
-        _previous_was_streaming = self.__is_streaming
-
-        _r = (request_range or "").strip()
-        from_start = (
-            not _r
-            or _r == "bytes=0-"
-            or (_r.startswith("bytes=0-") and len(_r) > 8)  # bytes=0-1048575 etc.
+        coordination = self._coordinate_initialization(
+            track_id,
+            request_id,
+            self._request_range_begin(request_range),
         )
-
-        if from_start:
-            # Always re-init from start for WAV mode (header sent immediately).
-            is_new_track = True
-
-        # If this is a new track, coordinate initialization so multiple concurrent
-        # GET handlers don't all start spotty processes in parallel.
-        if is_new_track:
-            with self.__stream_lock:
-                # If another init is already in progress for same track, wait briefly.
-                if self.__init_in_progress and self.__current_track_id == track_id:
-                    log_msg(f"Init already in progress for {track_id}, waiting.", LOGDEBUG)
-                    # Wait up to 1s for init to complete
-                    self.__init_event.wait(1.0)
-                    # After wait, if streamer was initialized, treat as non-new
-                    if self.__is_streaming and self.__current_track_id == track_id:
-                        is_new_track = False
-                        request_id = self.__current_request_id
-                elif self.__is_streaming and self.__current_track_id == track_id:
-                    # Already streaming same track — reuse request id.
-                    is_new_track = False
-                    request_id = self.__current_request_id
-                else:
-                    # We are the initializer for this new track. Reserve slot.
-                    self.__init_in_progress = True
-                    self.__init_event.clear()
-                    self.__is_streaming = True
-                    self.__current_track_id = track_id
-                    self.__current_request_id = request_id
-                    # release lock and continue initialization below
-                    # (will clear init_in_progress after set_track)
-                    pass
-        else:
-            # Not a new track — reuse request id if already streaming this track.
-            with self.__stream_lock:
-                if self.__is_streaming and self.__current_track_id == track_id:
-                    request_id = self.__current_request_id
-
-        # Fetch prebuffer result (WAV bytes if prebuffer was used).
-        prebuf_result = None
-        has_prebuf = False
-        if is_new_track and self.__prebuffer_manager:
-            prebuf_result, has_prebuf = self.__prebuffer_manager.get_and_clear_prebuffer(track_id)
-            if has_prebuf:
-                kind = f"{len(prebuf_result.data)} bytes"
-                log_msg(f"Prebuffer hit for track {track_id} ({kind}).", LOGDEBUG)
-
-        if is_new_track:
-            # Cancel any running prebuffer immediately so its spotty process doesn't
-            # compete with the main stream for the single Spotify connection.  A
-            # prebuffer from the *previous* track selection may still be running
-            # (the 5-second deferred start in main_service only delays the *next*
-            # prebuffer, it doesn't cancel an already-running one).
-            if self.__prebuffer_manager:
-                self.__prebuffer_manager.cancel_prebuffer()
-
-            # Terminate the previous track's stream — unless this is Kodi's QueueNextFileEx
-            # pre-load (new track ID while the previous track's download is already complete
-            # in the cache).  In that case, killing the HTTP generator cuts the current track
-            # ~5 seconds short; let it drain naturally instead.  send_part_audio_stream()
-            # captures its track-specific state at entry, so two generators running briefly
-            # in parallel read from independent cache entries without interfering.
-            # New-track requests may arrive before the next decoder is actually ready
-            # (QueueNextFileEx can update player metadata early). Never let them kill
-            # the active stream until the previous downloader is safely complete.
-            _skip_terminate = False
-            if _previous_track_id and _previous_track_id != track_id and _previous_was_streaming:
-                if not self._previous_stream_has_confirmed_playback(_previous_track_id):
-                    log_msg(
-                        f"Starting {track_id}: previous stream {_previous_track_id} "
-                        f"is internal stale state, not active playback.",
-                        LOGDEBUG,
-                    )
-                elif self._previous_downloader_finished_for_handoff(
-                    _previous_track_id,
-                    track_id,
-                ):
-                    _skip_terminate = True
-                else:
-                    return self._busy_with_current_track_response(
-                        _previous_track_id,
-                        _previous_request_id,
-                        _previous_was_streaming,
-                        track_id,
-                    )
-            if not _skip_terminate:
-                self.__terminate_streaming()
-
-            # Set up new track with proper locking to prevent concurrent overwrites
-            with self.__stream_lock:
-                self.__spotty_streamer.bitrate = bitrate
-                self.__spotty_streamer.normalization_gain_type = norm
-                self.__spotty_streamer.set_track(track_id, float(duration))
-                self.__is_streaming = True
-                self.__current_track_id = track_id
-                self.__current_request_id = request_id
-            # Initialization complete — clear init flag and notify waiters.
-            with self.__stream_lock:
-                if self.__init_in_progress:
-                    self.__init_in_progress = False
-                    try:
-                        self.__init_event.set()
-                    except Exception:
-                        pass
-            log_msg(
-                f"Start streaming spotify track '{track_id}',"
-                f" track length {self.__spotty_streamer.get_track_length()}."
-            )
-
-            # Kodi may issue this GET for QueueNextFileEx/preload before audible
-            # playback starts. MainService publishes Spotify.CurrentTrack* only
-            # after xbmc.Player confirms active Spotify playback.
-
-        log_msg(f"Request header range: '{request_range}'.", LOGDEBUG)
-
-        return self._handle_wav_request(
+        if coordination is None:
+            return self._initialization_busy_response(track_id)
+        (
             is_new_track,
-            request_range,
-            prebuf_result,
-            has_prebuf,
-            track_id=track_id,
-            duration_str=duration,
-            request_id=request_id,
-        )
+            request_id,
+            _previous_track_id,
+            _previous_request_id,
+            _previous_was_streaming,
+            _previous_stream_spec,
+            request_stream_spec,
+        ) = coordination
+        previous_stream_preserved = bool(_previous_was_streaming)
+
+        try:
+            # Fetch prebuffer result (WAV bytes if prebuffer was used).
+            prebuf_result = None
+            has_prebuf = False
+            if is_new_track and self.__prebuffer_manager:
+                prebuf_result, has_prebuf = self.__prebuffer_manager.get_and_clear_prebuffer(
+                    track_id
+                )
+                if has_prebuf:
+                    kind = f"{len(prebuf_result.data)} bytes"
+                    log_msg(f"Prebuffer hit for track {track_id} ({kind}).", LOGDEBUG)
+
+            if is_new_track:
+                # Cancel any running prebuffer immediately so its spotty process doesn't
+                # compete with the main stream for the single Spotify connection.  A
+                # prebuffer from the *previous* track selection may still be running
+                # (the 5-second deferred start in main_service only delays the *next*
+                # prebuffer, it doesn't cancel an already-running one).
+                if self.__prebuffer_manager:
+                    self.__prebuffer_manager.cancel_prebuffer()
+
+                # Terminate the previous track's stream — unless this is Kodi's QueueNextFileEx
+                # pre-load (new track ID while the previous track's download is already complete
+                # in the cache).  In that case, killing the HTTP generator cuts the current track
+                # ~5 seconds short; let it drain naturally instead.  send_part_audio_stream()
+                # captures its track-specific state at entry, so two generators running briefly
+                # in parallel read from independent cache entries without interfering.
+                # New-track requests may arrive before the next decoder is actually ready
+                # (QueueNextFileEx can update player metadata early). Protect a healthy
+                # active stream, but never hold the HTTP worker waiting for it to finish.
+                _skip_terminate = False
+                if (
+                    _previous_track_id
+                    and _previous_track_id != track_id
+                    and _previous_was_streaming
+                ):
+                    if self._player_near_natural_handoff(_previous_track_id):
+                        log_msg(
+                            f"QueueNextFileEx natural handoff allowed: Kodi is near the end of "
+                            f"{_previous_track_id}, so {track_id} may start.",
+                            LOGDEBUG,
+                        )
+                        _skip_terminate = True
+                    elif not self._previous_stream_has_confirmed_playback(_previous_track_id):
+                        log_msg(
+                            f"Starting {track_id}: previous stream {_previous_track_id} "
+                            f"is stale or has no healthy real-PCM progress.",
+                            LOGDEBUG,
+                        )
+                    elif self._previous_downloader_finished_for_handoff(
+                        _previous_track_id,
+                        track_id,
+                    ):
+                        _skip_terminate = True
+                    else:
+                        return self._busy_with_current_track_response(
+                            _previous_track_id,
+                            _previous_request_id,
+                            _previous_was_streaming,
+                            _previous_stream_spec,
+                            track_id,
+                            request_id,
+                        )
+                if not _skip_terminate:
+                    # Once termination begins, restoration is unsafe even if the
+                    # termination call itself raises after partially taking effect.
+                    previous_stream_preserved = False
+                    self.__terminate_streaming()
+
+                request_stream_spec = self._prepare_initialization(
+                    track_id,
+                    request_id,
+                    duration,
+                    bitrate,
+                    norm,
+                )
+                if request_stream_spec is None:
+                    return self._initialization_busy_response(track_id)
+                log_msg(
+                    f"Preparing spotify track '{track_id}',"
+                    f" track length {request_stream_spec.track_length}."
+                )
+
+                # Kodi may issue this GET for QueueNextFileEx/preload before audible
+                # playback starts. MainService publishes Spotify.CurrentTrack* only
+                # after xbmc.Player confirms active Spotify playback.
+
+            log_msg(f"Request header range: '{request_range}'.", LOGDEBUG)
+
+            if request_stream_spec is None:
+                # Compatibility for restored state created before immutable stream
+                # specs existed. Normal initialized streams always carry one.
+                request_stream_spec = self.__spotty_streamer.get_stream_spec()
+
+            return self._handle_wav_request(
+                is_new_track,
+                request_range,
+                prebuf_result,
+                has_prebuf,
+                track_id=track_id,
+                duration_str=duration,
+                request_id=request_id,
+                previous_track_id=_previous_track_id,
+                previous_request_id=_previous_request_id,
+                previous_was_streaming=_previous_was_streaming,
+                previous_stream_spec=_previous_stream_spec,
+                previous_stream_preserved=previous_stream_preserved,
+                stream_spec=request_stream_spec,
+            )
+        except Exception:
+            # Unexpected failures before commit must not strand the coordinator
+            # with a cleared event. Preserve Bottle's normal exception handling
+            # by rolling back only our still-owned reservation, then re-raising.
+            if is_new_track and self._owns_initialization(track_id, request_id):
+                self._abort_initialization(
+                    track_id,
+                    request_id,
+                    _previous_track_id,
+                    _previous_request_id,
+                    _previous_was_streaming,
+                    _previous_stream_spec,
+                    previous_stream_preserved,
+                )
+            raise
 
     spotty_stream_audio_track.route = SPOTTY_AUDIO_TRACK_ROUTE
 
@@ -549,8 +889,15 @@ class HTTPSpottyAudioStreamer:
         track_id=None,
         duration_str=None,
         request_id=None,
+        previous_track_id=None,
+        previous_request_id="",
+        previous_was_streaming=False,
+        previous_stream_spec=None,
+        previous_stream_preserved=False,
+        stream_spec=None,
     ):
         streamer = self.__spotty_streamer
+        stream_spec = stream_spec or streamer.get_stream_spec()
         # Parse duration from request URL
         _duration_sec = 1.0
         if track_id and duration_str:
@@ -559,7 +906,7 @@ class HTTPSpottyAudioStreamer:
             except (ValueError, TypeError):
                 pass
 
-        file_size = streamer.get_track_length()
+        file_size = stream_spec.track_length
         range_begin = 0
         range_end = file_size
         is_seek = False
@@ -579,17 +926,7 @@ class HTTPSpottyAudioStreamer:
                     LOGDEBUG,
                 )
             except Exception:
-                # Fallback to previous behavior (mutating streamer) if static header generation fails.
-                try:
-                    streamer.set_track(track_id, _duration_sec)
-                    file_size = streamer.get_track_length()
-                    range_end = file_size
-                    log_msg(
-                        f"Recovered track length from URL (duration={_duration_sec}s), file_size={file_size}.",
-                        LOGDEBUG,
-                    )
-                except Exception:
-                    pass
+                pass
 
         prebuf_data = prebuf_result.data if (has_prebuf and prebuf_result) else None
 
@@ -640,14 +977,49 @@ class HTTPSpottyAudioStreamer:
                 LOGDEBUG,
             )
 
-        if (
-            bottle.request.method.upper() == "GET"
-            and is_new_track
-            and range_begin <= 44
-            and not prebuf_data
+        if bottle.request.method.upper() == "GET" and is_new_track and not prebuf_data:
+            if not streamer.prepare_part_audio_stream(range_begin, stream_spec=stream_spec):
+                return self._failed_new_track_response(
+                    track_id or "",
+                    request_id or "",
+                    previous_track_id,
+                    previous_request_id,
+                    previous_was_streaming,
+                    previous_stream_spec,
+                    previous_stream_preserved,
+                )
+
+        if is_new_track and not self._commit_initialization(
+            track_id or "",
+            request_id or "",
+            stream_spec,
         ):
-            if not streamer.prepare_part_audio_stream(range_begin):
-                return self._failed_new_track_response(track_id or "", request_id or "")
+            return self._initialization_busy_response(track_id or "")
+
+        r_begin = range_begin
+        r_end = range_end
+        r_len = r_end - r_begin
+        prebuffer_prefix = b""
+        stream_body = None
+        if prebuf_data:
+            prebuffer_len = len(prebuf_data)
+            if r_begin < prebuffer_len:
+                end_from_buf = min(r_end, prebuffer_len)
+                prebuffer_prefix = prebuf_data[r_begin:end_from_buf]
+            if r_end > prebuffer_len:
+                rest_begin = max(r_begin, prebuffer_len)
+                rest_len = r_end - rest_begin
+                stream_body = streamer.send_part_audio_stream(
+                    rest_len,
+                    rest_begin,
+                    stream_spec=stream_spec,
+                )
+        else:
+            stream_body = streamer.send_part_audio_stream(
+                r_len,
+                r_begin,
+                stream_spec=stream_spec,
+            )
 
         def generate():
             try:
@@ -668,20 +1040,10 @@ class HTTPSpottyAudioStreamer:
                         LOGDEBUG,
                     )
 
-                r_begin = range_begin
-                r_end = range_end
-                r_len = r_end - r_begin
-                if prebuf_data:
-                    prebuffer_len = len(prebuf_data)
-                    if r_begin < prebuffer_len:
-                        end_from_buf = min(r_end, prebuffer_len)
-                        yield prebuf_data[r_begin:end_from_buf]
-                    if r_end > prebuffer_len:
-                        rest_begin = max(r_begin, prebuffer_len)
-                        rest_len = r_end - rest_begin
-                        yield from streamer.send_part_audio_stream(rest_len, rest_begin)
-                else:
-                    yield from streamer.send_part_audio_stream(r_len, r_begin)
+                if prebuffer_prefix:
+                    yield prebuffer_prefix
+                if stream_body is not None:
+                    yield from stream_body
             except GeneratorExit:
                 # Back can mean "close OSD" (playback continues) or "cancel". Do NOT clear
                 # state here—we only clear when the track truly ends (__notify_track_finished).

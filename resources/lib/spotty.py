@@ -76,12 +76,17 @@ class Spotty:
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
+            capture_stderr = bool(extra_args and "--single-track" in extra_args)
+
             # Use a larger buffer size for the pipe to improve reading performance (1MB vs default ~4KB)
             return subprocess.Popen(
                 args,
                 startupinfo=startupinfo,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                # Only the single-track downloader continuously drains stderr.
+                # Long-lived zeroconf authentication does not, so piping its
+                # verbose output could fill the OS pipe and deadlock auth.
+                stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
                 env=self.__spotty_rust_env,
                 bufsize=1048576,  # 1MB buffer for stdout
             )
