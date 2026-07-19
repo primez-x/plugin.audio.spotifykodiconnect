@@ -149,7 +149,6 @@ class SpottyDownloader:
         volume: int,
         wav_header: bytes,
         track_length: int,
-        startup_silence_bytes: int = 0,
     ):
         self.spotty = spotty
         self.track_id = track_id
@@ -160,8 +159,6 @@ class SpottyDownloader:
         self.volume = _clamp_volume(volume)
         self.wav_header = wav_header
         self.track_length = track_length
-        self.startup_silence_bytes = max(0, int(startup_silence_bytes))
-        self.startup_silence_bytes -= self.startup_silence_bytes % 4
 
         self._buffer = bytearray()
         self._consumed_pos = 0  # furthest byte any consumer has read (abs, rel start_byte)
@@ -172,8 +169,8 @@ class SpottyDownloader:
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
         self.written_bytes = 0
-        # Explicit readiness/progress state. Seeded WAV header and startup
-        # silence never count as real PCM.
+        # Explicit readiness/progress state. The seeded WAV header never counts
+        # as real PCM.
         self.real_pcm_bytes = 0
         self.first_real_pcm_monotonic = None
         self.last_progress_monotonic = None
@@ -189,20 +186,12 @@ class SpottyDownloader:
                 return
 
             header_len = len(self.wav_header)
-            prefix_end = header_len + self.startup_silence_bytes
             if self.start_byte == 0:
                 self._buffer.extend(self.wav_header)
-                if self.startup_silence_bytes:
-                    self._buffer.extend(bytes(self.startup_silence_bytes))
-                self.written_bytes = prefix_end
+                self.written_bytes = header_len
             elif self.start_byte < header_len:
                 self._buffer.extend(self.wav_header[self.start_byte :])
-                if self.startup_silence_bytes:
-                    self._buffer.extend(bytes(self.startup_silence_bytes))
-                self.written_bytes = prefix_end - self.start_byte
-            elif self.start_byte < prefix_end:
-                self._buffer.extend(bytes(prefix_end - self.start_byte))
-                self.written_bytes = prefix_end - self.start_byte
+                self.written_bytes = header_len - self.start_byte
 
             self.thread = threading.Thread(target=self._download_loop, daemon=True)
             self.thread.start()
@@ -223,7 +212,7 @@ class SpottyDownloader:
         return (time.monotonic() - last_progress) <= max(0.0, float(max_idle_seconds))
 
     def wait_for_real_pcm(self, target_real_pcm_bytes: int, timeout: float = None) -> bool:
-        """Wait for actual Spotty PCM, excluding the synthetic WAV prefix."""
+        """Wait for actual Spotty PCM, excluding the generated WAV header."""
         target = max(1, int(target_real_pcm_bytes))
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
         with self.cond:
@@ -255,7 +244,7 @@ class SpottyDownloader:
         # Calculate start position in seconds. 176400 bytes per second (44.1kHz, 16-bit, stereo)
         target_start_byte = self.start_byte if start_byte is None else int(start_byte)
         header_len = len(self.wav_header)
-        pcm_target_offset = max(0, target_start_byte - header_len - self.startup_silence_bytes)
+        pcm_target_offset = max(0, target_start_byte - header_len)
         start_sec_wav = pcm_target_offset // PCM_BYTES_PER_SEC if pcm_target_offset > 0 else 0
 
         args = [
@@ -597,7 +586,6 @@ class SpottyCacheManager:
         volume: int,
         wav_header: bytes,
         track_length: int,
-        startup_silence_bytes: int = 0,
         allow_abort_others: bool = True,
     ) -> SpottyDownloader:
         with cls._lock:
@@ -636,7 +624,6 @@ class SpottyCacheManager:
                 volume,
                 wav_header,
                 track_length,
-                startup_silence_bytes,
             )
             cls._instances[key] = inst
 

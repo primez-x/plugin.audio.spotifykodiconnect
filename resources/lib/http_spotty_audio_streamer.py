@@ -282,15 +282,8 @@ class HTTPSpottyAudioStreamer:
                 written = int(getattr(downloader, "written_bytes", 0) or 0)
                 start_byte = int(getattr(downloader, "start_byte", 0) or 0)
                 wav_header = getattr(downloader, "wav_header", b"") or b""
-                startup_silence = max(
-                    0,
-                    int(getattr(downloader, "startup_silence_bytes", 0) or 0),
-                )
-                synthetic_prefix_remaining = max(
-                    0,
-                    len(wav_header) + startup_silence - start_byte,
-                )
-                return written > synthetic_prefix_remaining
+                header_bytes_in_buffer = max(0, len(wav_header) - start_byte)
+                return written > header_bytes_in_buffer
         except Exception:
             return False
 
