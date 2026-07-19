@@ -22,8 +22,7 @@ _DEFAULT_GAIN_TYPE = "track"
 
 _PCM_BYTES_PER_SEC = 176400  # 44.1 kHz * 2 ch * 2 bytes/sample
 _WAV_HEADER_SIZE = 44
-STARTUP_SILENCE_BYTES = _PCM_BYTES_PER_SEC * 2
-_STARTUP_REAL_PCM_PREROLL_BYTES = 2097152
+_STARTUP_REAL_PCM_BUFFER_BYTES = 2097152
 _THROTTLE_LEAD_BYTES = 2097152
 STARTUP_REAL_PCM_WAIT_SECONDS = 15.0
 
@@ -161,8 +160,6 @@ class SpottyAudioStreamer:
             )
             self.__track_duration = 1
 
-        # Include a short silent PCM preroll in the declared length so PAPlayer
-        # can initialize before Spotty has produced real PCM on cold starts.
         self.__wav_header, self.__track_length = create_wav_header_for_duration(
             self.__track_duration
         )
@@ -187,29 +184,29 @@ class SpottyAudioStreamer:
         track_id: str,
         allow_clean_short: bool = False,
     ) -> bool:
-        prefix_end = len(wav_header) + STARTUP_SILENCE_BYTES
-        downloader_real_start = max(prefix_end, int(downloader.start_byte))
-        requested_real_start = max(prefix_end, int(range_begin))
+        pcm_start = len(wav_header)
+        downloader_real_start = max(pcm_start, int(downloader.start_byte))
+        requested_real_start = max(pcm_start, int(range_begin))
         requested_real_end = min(
             track_length,
-            requested_real_start + _STARTUP_REAL_PCM_PREROLL_BYTES,
+            requested_real_start + _STARTUP_REAL_PCM_BUFFER_BYTES,
         )
         # real_pcm_bytes is relative to the downloader's own real-PCM start.
         # Include any bytes before the requested range so readiness proves that
-        # the requested position (plus a bounded preroll) is actually buffered.
+        # the requested position (plus a bounded buffer window) is actually buffered.
         target_real_pcm_bytes = max(0, requested_real_end - downloader_real_start)
         if target_real_pcm_bytes <= 0:
             return True
 
-        synthetic_bytes_in_buffer = max(0, prefix_end - downloader.start_byte)
-        target_bytes_in_buf = synthetic_bytes_in_buffer + target_real_pcm_bytes
+        header_bytes_in_buffer = max(0, pcm_start - downloader.start_byte)
+        target_bytes_in_buf = header_bytes_in_buffer + target_real_pcm_bytes
 
         def _real_pcm_bytes() -> int:
             explicit = getattr(downloader, "real_pcm_bytes", None)
             if explicit is not None:
                 return max(0, int(explicit or 0))
             # Compatibility for tests/older downloader doubles.
-            return max(0, int(downloader.written_bytes) - synthetic_bytes_in_buffer)
+            return max(0, int(downloader.written_bytes) - header_bytes_in_buffer)
 
         with downloader.cond:
             if (
@@ -307,7 +304,6 @@ class SpottyAudioStreamer:
                 stream_spec.initial_volume,
                 stream_spec.wav_header,
                 stream_spec.track_length,
-                STARTUP_SILENCE_BYTES,
             )
 
         if (
@@ -324,7 +320,6 @@ class SpottyAudioStreamer:
                 stream_spec.initial_volume,
                 stream_spec.wav_header,
                 stream_spec.track_length,
-                STARTUP_SILENCE_BYTES,
             )
 
         return downloader
@@ -332,7 +327,7 @@ class SpottyAudioStreamer:
     def _startup_failed_before_real_pcm(
         self, downloader, range_begin: int, wav_header: bytes
     ) -> bool:
-        prefix_end = len(wav_header) + STARTUP_SILENCE_BYTES
+        pcm_start = len(wav_header)
         explicit_has_real_pcm = None
         if not hasattr(downloader, "real_pcm_bytes"):
             has_real_pcm = getattr(downloader, "has_real_pcm", None)
@@ -346,7 +341,7 @@ class SpottyAudioStreamer:
             else:
                 written = int(getattr(downloader, "written_bytes", 0) or 0)
                 start_byte = int(getattr(downloader, "start_byte", 0) or 0)
-                no_real_pcm = written <= max(0, prefix_end - start_byte)
+                no_real_pcm = written <= max(0, pcm_start - start_byte)
             failed = (
                 bool(getattr(downloader, "error", False))
                 or bool(getattr(downloader, "aborted", False))
@@ -624,9 +619,7 @@ class SpottyAudioStreamer:
                     downloader._trim_head_locked()
 
 
-def create_wav_header_for_duration(
-    duration_sec: float, startup_silence_bytes: int = STARTUP_SILENCE_BYTES
-) -> Tuple[bytes, int]:
+def create_wav_header_for_duration(duration_sec: float) -> Tuple[bytes, int]:
     """Create a WAV header and total stream length for a given duration (no side effects)."""
     try:
         file = BytesIO()
@@ -635,8 +628,6 @@ def create_wav_header_for_duration(
         sample_rate = 44100
         bits_per_sample = 16
         block_align = channels * (bits_per_sample // 8)
-        preroll_size = max(0, int(startup_silence_bytes))
-        preroll_size -= preroll_size % block_align
 
         # Generate format chunk.
         format_chunk_spec = "<4sLHHLLHH"
@@ -654,7 +645,7 @@ def create_wav_header_for_duration(
 
         # Generate data chunk.
         data_chunk_spec = "<4sL"
-        data_size = int(num_samples * block_align) + preroll_size
+        data_size = int(num_samples * block_align)
         data_chunk = struct.pack(data_chunk_spec, b"data", data_size)
 
         # Standard WAV: RIFF size = 36 + data_size

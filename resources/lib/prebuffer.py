@@ -15,7 +15,7 @@ from typing import Optional, Tuple
 
 from spotty import Spotty
 from spotty_cache import SpottyCacheManager
-from spotty_audio_streamer import STARTUP_SILENCE_BYTES, create_wav_header_for_duration
+from spotty_audio_streamer import create_wav_header_for_duration
 from utils import log_msg
 from xbmc import LOGDEBUG
 
@@ -75,7 +75,6 @@ class PrebufferManager:
             35,
             wav_header,
             track_length,
-            STARTUP_SILENCE_BYTES,
             allow_abort_others=False,
         )
         if downloader is None:
@@ -97,13 +96,28 @@ class PrebufferManager:
         cond = getattr(downloader, "cond", None)
         if cond is None:
             return False
+        has_real_pcm = getattr(downloader, "has_real_pcm", None)
+        method_result = None
+        if callable(has_real_pcm):
+            try:
+                # SpottyDownloader.has_real_pcm() acquires this same Condition,
+                # so it must be called before taking the lock below.
+                method_result = bool(has_real_pcm())
+            except Exception:
+                pass
         with cond:
             if getattr(downloader, "error", False) or getattr(downloader, "aborted", False):
                 return False
+            real_pcm_bytes = getattr(downloader, "real_pcm_bytes", None)
+            if real_pcm_bytes is not None:
+                return int(real_pcm_bytes or 0) > 0
             wav_header = getattr(downloader, "wav_header", b"") or b""
-            startup_silence = max(0, int(getattr(downloader, "startup_silence_bytes", 0) or 0))
-            real_pcm_start = len(wav_header) + startup_silence
-            return int(getattr(downloader, "written_bytes", 0) or 0) > real_pcm_start
+            start_byte = int(getattr(downloader, "start_byte", 0) or 0)
+            header_bytes_in_buffer = max(0, len(wav_header) - start_byte)
+            written_bytes = getattr(downloader, "written_bytes", None)
+            if written_bytes is not None:
+                return int(written_bytes or 0) > header_bytes_in_buffer
+            return bool(method_result)
 
     def get_and_clear_prebuffer(self, track_id: str) -> Tuple[Optional[PrebufferResult], bool]:
         """Return prebuffer result for *track_id* and clear internal state.

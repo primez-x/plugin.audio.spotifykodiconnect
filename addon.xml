@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<addon id="plugin.audio.spotifykodiconnect" version="1.0.36" name="SpotifyKodiConnect" provider-name="primez-x">
+<addon id="plugin.audio.spotifykodiconnect" version="1.0.37" name="SpotifyKodiConnect" provider-name="primez-x">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
         <import addon="xbmc.addon" version="18.9.701" />
@@ -19,7 +19,10 @@
         <description lang="en_GB">Unofficial Spotify music plugin for Kodi. Improves on the original Spotify addon with consistent album/artist art in all views (including playlists), correct metadata tags, and background loading so navigation and playback feel smooth. Requires Spotify Premium.</description>
         <disclaimer lang="en_GB">This product uses the SPOTIFY WEB API but is not endorsed, certified or otherwise approved in any way by Spotify. Spotify is the registered trademark of Spotify AB.</disclaimer>
         <source>https://github.com/primez-x/plugin.audio.spotifykodiconnect</source>
-        <news>v1.0.36
+        <news>v1.0.37
+- Remove the obsolete two-second synthetic WAV preroll so tracks begin with genuine Spotify PCM and Kodi reports the correct duration, while retaining real-PCM startup gating and recovery.
+
+v1.0.36
 - Require genuine Spotify PCM before exposing a startup stream, and watchdog stalled Spotty attempts with bounded, offset-safe retries instead of serving synthetic silence.
 - Remove the blocking 60-second handoff wait and require healthy real-PCM progress before protecting a prior stream, preventing multi-minute stalls and 503 skip cascades.
 - Preserve bounded redacted Spotty diagnostics for failed attempts and read Kodi 21's active file-cache chunk setting.
