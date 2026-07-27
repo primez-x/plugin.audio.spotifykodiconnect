@@ -360,6 +360,10 @@ class MainService:
         self.__spotty = spotty.get_spotty(self.__spotty_helper)
 
         self.__spotty_auth: SpottyAuth = SpottyAuth(self.__spotty)
+        # Recover from an interrupted credential rotation (e.g. power loss
+        # during zeroconf re-auth): if credentials.json is missing but the
+        # .bak exists, restore it before any token fetch is attempted.
+        self.__spotty_auth.restore_credentials_from_backup_if_needed()
         self.__auth_token_expires_at = ""
         self.__welcome_msg = True
 
