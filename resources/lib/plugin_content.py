@@ -499,22 +499,33 @@ class PluginContent:
             flat[key] = value[0] if isinstance(value, (list, tuple)) and value else value
         return self.__build_url(flat)
 
-    def __refresh_active_listing(self, target_url: str) -> None:
+    def __is_active_listing(self, target_url: str) -> bool:
         if not target_url:
-            return
+            return False
         try:
             get_info_label = getattr(xbmc, "getInfoLabel", None)
             current_url = ""
             if callable(get_info_label):
                 current_url = get_info_label("Container.FolderPath") or ""
             if not current_url:
-                cache_log(f"Skipping dynamic refresh for {target_url}; active folder is unknown.")
-                return
-            if target_url and current_url != target_url:
                 cache_log(
-                    f"Skipping dynamic refresh for {target_url}; active folder is {current_url}."
+                    f"Skipping dynamic listing work for {target_url}; active folder is unknown."
                 )
-                return
+                return False
+            if current_url != target_url:
+                cache_log(
+                    f"Skipping dynamic listing work for {target_url}; active folder is {current_url}."
+                )
+                return False
+            return True
+        except Exception as exc:
+            log_exception(exc, "active dynamic listing check")
+            return False
+
+    def __refresh_active_listing(self, target_url: str) -> None:
+        if not self.__is_active_listing(target_url):
+            return
+        try:
             xbmc.executebuiltin("Container.Refresh")
         except Exception as exc:
             log_exception(exc, "dynamic listing refresh")
@@ -522,6 +533,8 @@ class PluginContent:
     def __start_dynamic_page_continuation(
         self, busy_key: str, target_url: str, worker: Callable[[], None]
     ) -> None:
+        if not self.__is_active_listing(target_url):
+            return
         prop_key = f"{DYNAMIC_PAGING_BUSY_PREFIX}{busy_key}"
         if self.__win.getProperty(prop_key):
             return

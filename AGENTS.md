@@ -20,5 +20,7 @@ For Python changes, run `compileall` and the focused root test that covers the t
 ## Commit & Pull Request Guidelines
 Use short imperative commit subjects. For Primez repository publishing, any commit pushed to the tracked `master` branch must bump the root `addon.xml` version in the same commit. Kodi auto-update consumes the generated repository version, not the Git SHA, and the central `kodi.addons` publish guard rejects webhook publishes whose source version does not increase.
 
+Before a CoreELEC install or publish, compare the target installation's version and every source-tracked file with the candidate source. If device-only deltas exist, preserve an out-of-repo whole-add-on rollback, layer only the requested change, verify unrelated tracked files remain unchanged, and block publication until every delta is either incorporated into source or intentionally removed from the target.
+
 ## Security & Configuration Tips
 Do not commit Spotify credentials, Kodi profile data, cache files, logs with tokens, generated ZIPs, or `.pyc` files.
