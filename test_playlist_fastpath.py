@@ -597,6 +597,11 @@ class PlaylistFastPathTests(unittest.TestCase):
         content._PluginContent__addon_icon_path = "icons"
         return content
 
+    def set_active_listing(self, content):
+        target_url = content._PluginContent__current_request_url()
+        self.plugin_content.xbmc.getInfoLabel = lambda label, target_url=target_url: target_url
+        return target_url
+
     def test_play_playlist_starts_after_first_page_before_fetching_remaining_pages(self):
         events = RecordingPlayer.events
         spotify = FakeSpotify(events, total=75)
@@ -705,11 +710,35 @@ class PlaylistFastPathTests(unittest.TestCase):
             "action": ["browse_playlist"],
             "playlistid": ["playlist-1"],
         }
+        content._PluginContent__action = "browse_playlist"
+        self.set_active_listing(content)
 
         content.browse_playlist()
 
         self.assertEqual(["fetch:0"], events)
         self.assertEqual(1, len(DeferredThread.started_targets))
+
+    def test_browse_playlist_skips_hidden_continuation_when_folder_is_not_active(self):
+        for active_folder in ("", "plugin://plugin.audio.spotifykodiconnect/?action=other"):
+            with self.subTest(active_folder=active_folder or "unknown"):
+                events = RecordingPlayer.events
+                events.clear()
+                DeferredThread.started_targets.clear()
+                spotify = FakeSpotify(events, total=75)
+                content = self.build_content(spotify)
+                content._PluginContent__params = {
+                    "action": ["browse_playlist"],
+                    "playlistid": ["playlist-1"],
+                }
+                content._PluginContent__action = "browse_playlist"
+                self.plugin_content.xbmc.getInfoLabel = (
+                    lambda label, active_folder=active_folder: active_folder
+                )
+
+                content.browse_playlist()
+
+                self.assertEqual(["fetch:0"], events)
+                self.assertEqual([], DeferredThread.started_targets)
 
     def test_browse_saved_tracks_uses_first_page_and_hidden_continuation(self):
         events = RecordingPlayer.events
@@ -717,6 +746,7 @@ class PlaylistFastPathTests(unittest.TestCase):
         content = self.build_content(spotify)
         content._PluginContent__params = {"action": ["browse_saved_tracks"]}
         content._PluginContent__action = "browse_saved_tracks"
+        self.set_active_listing(content)
 
         content.browse_saved_tracks()
 
@@ -734,6 +764,7 @@ class PlaylistFastPathTests(unittest.TestCase):
         content = self.build_content(spotify)
         content._PluginContent__params = {"action": ["browse_saved_tracks"]}
         content._PluginContent__action = "browse_saved_tracks"
+        self.set_active_listing(content)
 
         content.browse_saved_tracks()
         DeferredThread.started_targets[0]()
@@ -822,6 +853,7 @@ class PlaylistFastPathTests(unittest.TestCase):
         spotify = GenericDaylistSpotify(events, total=1)
         content = self.build_content(spotify)
         content._PluginContent__params = {"action": ["browse_playlists"], "ownerid": ["user"]}
+        self.set_active_listing(content)
         playlist = spotify_daylist()
         playlist["description"] = "Your day in a playlist."
         playlist["images"] = [
