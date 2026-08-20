@@ -132,12 +132,8 @@ class SpottyAuth:
                 self.__spotty.get_spotty_token_file(),
             ]
             spotty = self.__spotty.run_spotty(extra_args=args)
-            # done = Event()
-            # watcher = Thread(target=kill_on_timeout, args=(done, 5, spotty))
-            # watcher.daemon = True
-            # watcher.start()
 
-            stdout, stderr = spotty.communicate()
+            stdout, stderr = spotty.communicate(timeout=30)
             # done.set()
 
             with open(self.__spotty.get_spotty_token_file()) as f:

@@ -81,7 +81,7 @@ class Spotty:
                 args,
                 startupinfo=startupinfo,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.DEVNULL,
                 env=self.__spotty_rust_env,
                 bufsize=1048576,  # 1MB buffer for stdout
             )

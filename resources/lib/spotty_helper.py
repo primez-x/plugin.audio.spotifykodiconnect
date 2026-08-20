@@ -146,7 +146,7 @@ class SpottyHelper:
                 bufsize=0,
             )
 
-            stdout, stderr = test_spotty.communicate()
+            stdout, stderr = test_spotty.communicate(timeout=15)
 
             log_msg(stdout.decode(encoding="UTF-8"))
 

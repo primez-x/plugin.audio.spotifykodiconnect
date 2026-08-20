@@ -20,9 +20,11 @@ from xbmc import LOGDEBUG
 # Kodi music playlist id
 PLAYLIST_MUSIC = 0
 
-# URL pattern for our track endpoint: http://localhost:PORT/track/TRACK_ID/DURATION
+# URL pattern for our track endpoint: http://127.0.0.1:PORT/track/TRACK_ID/DURATION.wav
+# Also matches legacy localhost URLs and optional .wav suffix for backwards compat.
 _TRACK_URL_PATTERN = re.compile(
-    r"^https?://localhost(?::\d+)?/track/([^/]+)/(\d+)(?:/)?$", re.I
+    r"^https?://(?:localhost|127\.0\.0\.1)(?::\d+)?/track/([^/]+)/(\d+)(?:\.wav)?(?:/)?$",
+    re.I,
 )
 
 

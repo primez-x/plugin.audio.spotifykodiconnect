@@ -6,13 +6,14 @@ from wsgiref.simple_server import make_server
 
 import bottle
 from bottle import Bottle
-from utils import log_msg, log_exception, LOGDEBUG
+from utils import log_msg, log_exception, LOGDEBUG, PROXY_HOST
+from xbmc import LOGWARNING
 
 STREAMING_TIMEOUT_IN_SECS = 600
 
 
 def __bottle_stderr(*args):
-    log_msg(f"{args}")
+    log_msg(f"{args}", LOGDEBUG)
 
 
 bottle._stderr = __bottle_stderr
@@ -87,7 +88,7 @@ def __begin_app() -> None:
 def start_thread(web_port: int) -> None:
     global __manager_thread
     global __server
-    __server = MyWSGIRefServer(host="localhost", port=web_port)
+    __server = MyWSGIRefServer(host=PROXY_HOST, port=web_port)
     __manager_thread = threading.Thread(target=__begin_app)
     __manager_thread.start()
 
@@ -97,6 +98,8 @@ def stop_thread() -> None:
     try:
         __bottle_manager.close()
         __server.shutdown()
-        __manager_thread.join()
+        __manager_thread.join(timeout=5.0)
+        if __manager_thread.is_alive():
+            log_msg("Bottle thread did not terminate cleanly after 5s", LOGWARNING)
     except Exception as exc:
         log_exception(exc, f"Bottle app closed with exception.")

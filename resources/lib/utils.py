@@ -3,6 +3,7 @@ import os
 import platform
 import signal
 import sys
+import threading
 import time
 import unicodedata
 import traceback
@@ -21,6 +22,12 @@ ADDON_DATA_PATH = xbmcvfs.translatePath(f"special://profile/addon_data/{ADDON_ID
 ADDON_WINDOW_ID = 10000
 # Different port so this addon can run alongside plugin.audio.spotify if needed
 PROXY_PORT = 52309
+# Use 127.0.0.1 instead of "localhost" to avoid IPv6/IPv4 dual-stack resolution
+# delays.  WSGIServer defaults to AF_INET (IPv4), so the server always binds to
+# 127.0.0.1.  If URLs say "localhost", Kodi's libcurl may try ::1 (IPv6) first,
+# wait ~14 s for the timeout, then fall back to IPv4.  On some Linux devices
+# (CoreELEC / LibreELEC) localhost resolution can fail entirely.
+PROXY_HOST = "127.0.0.1"
 
 KODI_PROPERTY_SPOTIFY_AUTH_TOKEN = "spotifykodiconnect-auth-token"
 KODI_PROPERTY_AUTH_TOKEN_EXPIRES_AT = "spotifykodiconnect-auth-token-expires-at"
@@ -130,6 +137,22 @@ def cache_auth_token_expires_at(auth_token: str) -> None:
 
 def get_cached_auth_token_expires_at() -> str:
     return get_cached_value_from_kodi(KODI_PROPERTY_AUTH_TOKEN_EXPIRES_AT)
+
+
+_spotipy_client = None
+_spotipy_token: str = ""
+_spotipy_lock = threading.Lock()
+
+
+def get_spotipy_client(token: str):
+    """Return a cached Spotipy client, creating a new one only when the token changes."""
+    global _spotipy_client, _spotipy_token
+    with _spotipy_lock:
+        if token != _spotipy_token or _spotipy_client is None:
+            import spotipy
+            _spotipy_client = spotipy.Spotify(auth=token)
+            _spotipy_token = token
+        return _spotipy_client
 
 
 def cache_value_in_kodi(kodi_property_id: str, value: Any):

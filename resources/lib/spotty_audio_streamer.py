@@ -2,29 +2,29 @@ import json
 import os
 import struct
 import subprocess
+import threading
+import time
 from io import BytesIO
 from typing import Callable, Tuple
 
 from xbmc import LOGDEBUG, LOGWARNING, LOGERROR
 
 from spotty import Spotty
+from spotty_cache import SpottyCacheManager
 from utils import bytes_to_megabytes, kill_process_by_pid, log_msg, log_exception
 
 SPOTIFY_TRACK_PREFIX = "spotify:track:"
 
 SPOTIFY_BITRATE = "320"
-SPOTTY_GAIN_TYPE = "track"
-SPOTTY_STREAMING_BASE_ARGS = [
-    "--disable-audio-cache",
-    "--disable-discovery",
-    "--bitrate",
-    SPOTIFY_BITRATE,
-]
-SPOTTY_STREAMING_NORMALIZATION_ARGS = [
-    "--enable-volume-normalisation",
-    "--normalisation-gain-type",
-    SPOTTY_GAIN_TYPE,
-]
+_VALID_BITRATES = ("96", "160", "320")
+_VALID_GAIN_TYPES = ("auto", "track", "album")
+_DEFAULT_GAIN_TYPE = "track"
+
+# Maximum bytes of PCM silence to pad at the end of a stream when spotty exits
+# cleanly but short of the WAV-declared length. 10 seconds @ 176400 B/s = 1,764,000.
+# Duration mismatches between the declared track length and spotty's actual output
+# are typically < 10 s; larger gaps indicate a real error and should not be masked.
+_SILENCE_PADDING_MAX_BYTES = 176400 * 10
 
 
 def _clamp_volume(value: int) -> int:
@@ -58,18 +58,15 @@ def _get_kodi_chunk_size() -> int:
     return 1048576  # Default fallback
 
 class SpottyAudioStreamer:
+    """
+    Streams PCM audio from the spotty binary (librespot) as WAV, for a single track.
+    Uses a background file cache via spotty_cache to handle seeks instantly.
+    """
+
     def __init__(self, spotty: Spotty, initial_volume: int = 35):
         self.__spotty = spotty
         self.initial_volume = _clamp_volume(initial_volume)
         self.chunk_size = _get_kodi_chunk_size()
-
-        # Cache process properties to avoid dynamic lookups during tight loops
-        self._is_windows = (os.name == "nt")
-        if self._is_windows:
-            self._startupinfo = subprocess.STARTUPINFO()
-            self._startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        else:
-            self._startupinfo = None
 
         self.__track_id: str = ""
         self.__track_duration: int = 0
@@ -77,281 +74,250 @@ class SpottyAudioStreamer:
         self.__track_length: int = 0
 
         self.__notify_track_finished: Callable[[str], None] = lambda x: None
-        self.__last_spotty_pid = -1
         self.__terminated = False
 
-        self.use_normalization = True
+        # Streaming settings — updated by the HTTP layer before each track.
+        self.normalization_gain_type: str = _DEFAULT_GAIN_TYPE
+        self.bitrate: str = SPOTIFY_BITRATE
+        self.use_autoplay: bool = False
 
     def set_initial_volume(self, value: int) -> None:
+        """Set volume (1–100) for the next spotty run."""
         self.initial_volume = _clamp_volume(value)
 
     def get_track_length(self) -> int:
+        """Total byte length of the WAV stream (header + PCM) for the current track."""
         return self.__track_length
 
     def get_track_duration(self) -> int:
+        """Track duration in seconds used for the WAV header."""
         return self.__track_duration
 
     def set_track(self, track_id: str, track_duration: float) -> None:
+        """Set the track to stream; builds WAV header for PCM/WAV streaming."""
         self.__track_id = track_id
-        self.__track_duration = int(track_duration)
-        self.__wav_header, self.__track_length = self.__create_wav_header()
+        try:
+            if track_duration <= 0:
+                log_msg(f"Warning: Invalid track duration {track_duration} for track {track_id}. Using 1s fallback.", LOGWARNING)
+                self.__track_duration = 1
+            else:
+                self.__track_duration = int(track_duration)
+        except (TypeError, ValueError):
+            log_msg(f"Warning: Could not parse track duration {track_duration} for track {track_id}. Using 1s fallback.", LOGWARNING)
+            self.__track_duration = 1
+
+        # Always create WAV header for PCM streaming.
+        self.__wav_header, self.__track_length = create_wav_header_for_duration(self.__track_duration)
+
 
     def set_notify_track_finished(self, func: Callable[[str], None]) -> None:
+        """Set callback invoked when the full track has been sent (not on every range chunk)."""
         self.__notify_track_finished = func
 
+    def _log_transfer(self, state: str, **kwargs) -> None:
+        parts = [f"track={self.__track_id}", f"state={state}"]
+        for k, v in kwargs.items():
+            parts.append(f"{k}={v}")
+        log_msg(" | ".join(parts), LOGDEBUG)
+
     def terminate_stream(self) -> bool:
+        """Signal the current generator to stop."""
         self.__terminated = True
-        if self.__last_spotty_pid == -1:
-            return False
-        self.__kill_last_spotty()
         return True
 
-    def send_part_audio_stream(self, range_len: int, range_begin: int) -> str:
-        """Chunked transfer of audio data from spotty binary"""
+    def send_part_audio_stream(
+        self,
+        range_len: int,
+        range_begin: int,
+        defer_kill_previous: bool = False,
+        start_sec: int = 0,
+    ):
+        """Generator: yield WAV (PCM) bytes from the background downloader's in-memory buffer."""
+        # Capture track-specific state at entry — set_track() may be called concurrently
+        # when Kodi pre-loads the next track via QueueNextFileEx while this generator is
+        # still draining the current one.  Local copies insulate this generator from those
+        # updates so we always stream the correct track from the cache.
+        track_id = self.__track_id
+        track_length = self.__track_length
+        track_duration = self.__track_duration
+        wav_header = bytes(self.__wav_header)
 
         self.__terminated = False
-        spotty_process = None
         bytes_sent = 0
-        try:
-            self.__kill_last_spotty()
 
-            self.__log_start_transfer(range_begin)
+        # Check if we have an active background downloader for this track that covers our request
+        downloader = SpottyCacheManager.find_best_downloader(track_id, range_begin)
 
-            # File layout is [WAV header][PCM from spotty]. range_begin/range_len
-            # are file offsets. Spotty only outputs PCM, so we must skip
-            # (range_begin - header_len) bytes of PCM when seeking, not range_begin.
-            track_id_uri = SPOTIFY_TRACK_PREFIX + self.__track_id
-            self.__log_start_reading_audio(track_id_uri)
+        # If no suitable downloader, or the downloader is too far behind (e.g. > 2MB behind),
+        # start a new downloader at the requested position.
+        # Since librespot downloads fast, we only jump if the user seeks far ahead of current progress.
+        if not downloader:
+            downloader = SpottyCacheManager.get_or_start(
+                self.__spotty, track_id, track_duration, range_begin,
+                self.bitrate, self.normalization_gain_type, self.initial_volume,
+                wav_header, track_length
+            )
+        elif range_begin > downloader.start_byte + downloader.written_bytes + 2097152 and not downloader.is_finished:
+            downloader = SpottyCacheManager.get_or_start(
+                self.__spotty, track_id, track_duration, range_begin,
+                self.bitrate, self.normalization_gain_type, self.initial_volume,
+                wav_header, track_length
+            )
 
-            # File layout is [WAV header][PCM from spotty]. range_begin/range_len
-            # are file offsets.
-            header_len = len(self.__wav_header)
-            
-            # Calculate where we need to start in the PCM stream
-            pcm_target_offset = max(0, range_begin - header_len)
-            
-            # Use spotty's --start-position (in seconds) to avoid decoding everything from the beginning
-            # 44100 Hz * 2 channels * 2 bytes = 176400 bytes/sec
-            pcm_bytes_per_sec = 176400
-            
-            # Fast path logic: only do division and remainder if we are actually skipping into the PCM stream
-            if pcm_target_offset > 0:
-                start_sec = pcm_target_offset // pcm_bytes_per_sec
-                pcm_skip = pcm_target_offset % pcm_bytes_per_sec
-            else:
-                start_sec = 0
-                pcm_skip = 0
+        # Wait for a minimum initial buffer before yielding to prevent codec init failures.
+        # PAPlayer's QueueNextFileEx opens the URL while the current track is playing;
+        # if only the 44-byte WAV header is available, the codec reports
+        # "CAudioDecoder: Unable to Init Codec" and skips to the next track, cascading.
+        # This guard holds until 256 KB are buffered or the download definitively
+        # fails/is aborted — whichever comes first.  No fixed deadline: spotty retries
+        # internally on session conflicts (delays sum to ~17 s); a 5-second timeout
+        # would exit mid-retry, yield the 44-byte header, and start the codec-error
+        # cascade.  Kodi's HTTP client waits up to 30 s for the first bytes, giving us
+        # enough headroom to wait through all retries.  Seeks (range_begin > 0) are
+        # exempt because the user expects an immediate response.
+        if range_begin == 0:
+            _min_bytes = 262144  # 256 KB
+            while (
+                not self.__terminated
+                and not downloader.is_finished
+                and not downloader.error
+                and not downloader.aborted
+                and downloader.written_bytes < _min_bytes
+            ):
+                downloader.wait_for_bytes(downloader.written_bytes + 65536, timeout=0.5)
 
-            if range_begin == 0:
-                bytes_sent = header_len
-                self.__log_send_wav_header()
-                yield self.__wav_header
-            elif range_begin < header_len:
-                # Range starts inside the header (rare).
-                tail = self.__wav_header[range_begin:]
-                to_send = min(len(tail), range_len)
-                yield tail[:to_send]
-                bytes_sent = to_send
-
-            # Execute the spotty process, then collect stdout.
-            args = SPOTTY_STREAMING_BASE_ARGS.copy()
-            args += ["--initial-volume", str(self.initial_volume)]
-            if self.use_normalization:
-                args += SPOTTY_STREAMING_NORMALIZATION_ARGS
-            args += ["--single-track", track_id_uri]
-            
-            # Add start-position if we are seeking into the track
-            if start_sec > 0:
-                args += ["--start-position", str(start_sec)]
-                
-            # Check if terminated more frequently to be responsive
-            if self.__terminated:
-                return
-
-            spotty_process = self.__spotty.run_spotty(args)
-            self.__log_spotty_return_code(spotty_process)
-            self.__last_spotty_pid = spotty_process.pid
-
-            # Process reference and chunk size for inner loops
-            proc_stdout = spotty_process.stdout
-            c_size = self.chunk_size
-
-            # Skip the exact remaining PCM bytes so that we start perfectly on target
-            if pcm_skip > 0:
-                # We need to read and discard `pcm_skip` bytes
-                discarded = 0
-                while discarded < pcm_skip:
-                    if self.__terminated:
-                        return
-                    to_read = min(c_size, pcm_skip - discarded)
-                    chunk = proc_stdout.read(to_read)
-                    if not chunk:
-                        break
-                    discarded += len(chunk)
-
-            # Pre-fetch the first chunk before the loop to reduce latency
-            frame = proc_stdout.read(c_size)
-            
-            # Loop as long as there's something to output.
-            while frame and bytes_sent < range_len:
-                if self.__terminated:
+            # If the download failed with 0 PCM bytes (session conflict exhausted all
+            # retries), close the connection without sending any data.  This gives Kodi
+            # a clean stream-open failure instead of "Unable to Init Codec" from a
+            # 44-byte response, preventing the cascade-skip loop.
+            _wav_header_size = len(wav_header)
+            if not self.__terminated and not downloader.aborted:
+                if (downloader.error or downloader.is_finished) and downloader.written_bytes <= _wav_header_size:
+                    self._log_transfer(
+                        "error",
+                        msg="Download produced 0 PCM bytes; closing connection cleanly to avoid codec cascade",
+                    )
                     return
 
-                bytes_sent += len(frame)
-                
-                # Only log every ~10MB to reduce IO overhead in tight loop
-                if bytes_sent % 10485760 < c_size:
-                    self.__log_continue_sending(bytes_sent)
-                
-                yield frame
-                
-                # Fetch next frame while yielding current to allow overlap
-                frame = proc_stdout.read(c_size)
+        # Rate-throttle: keep the HTTP connection alive for the full track duration so
+        # Kodi's QueueNextFileEx fires while our connection is still active.
+        # Without throttling, tracks opened via QueueNextFileEx are pre-buffered by Kodi
+        # at full speed (40+ MB in ~6 seconds), closing the connection minutes before the
+        # *next* QueueNextFileEx fires — causing "Unhandled exception" and cascading skips.
+        # Allow a 2 MB initial burst so Kodi's decode buffer fills instantly, then pace
+        # at 176400 B/s (44.1 kHz × 2 ch × 2 bytes).  Only from-start requests are
+        # throttled; seeks (range_begin > 0) must respond immediately.
+        _PCM_BYTES_PER_SEC = 176400  # 44.1 kHz × 2 ch × 2 bytes/sample
+        _THROTTLE_LEAD_BYTES = 2097152  # 2 MB burst window before throttle engages
+        # Throttle for from-start requests (range_begin == 0) AND for WAV-header
+        # restarts (range_begin == 44, i.e. "prev" skips the 44-byte header).
+        # Both are full-track deliveries that must keep the connection alive.
+        # Mid-song seeks (range_begin > 44) are never throttled.
+        _WAV_HEADER_SIZE = 44
+        stream_start_time = time.monotonic() if range_begin <= _WAV_HEADER_SIZE else None
 
-            # All done.
-            self.__notify_track_finished(self.__track_id)
-            self.__log_finished_sending(range_begin, bytes_sent)
+        self._log_transfer("start", range_begin=range_begin)
+
+        buf_offset = range_begin - downloader.start_byte
+
+        try:
+            while bytes_sent < range_len and not self.__terminated:
+                target_bytes_in_buf = buf_offset + bytes_sent + 1
+                downloader.wait_for_bytes(target_bytes_in_buf, timeout=1.0)
+
+                if self.__terminated:
+                    break
+
+                chunk = None
+                with downloader.cond:
+                    available = downloader.written_bytes - buf_offset - bytes_sent
+                    if downloader.error and available <= 0:
+                        self._log_transfer("error", msg="Background downloader hit an error")
+                        break
+                    is_finished = downloader.is_finished
+                    if available > 0:
+                        # Use a small first chunk so Kodi gets response headers +
+                        # initial bytes within the QueueNextFileEx timeout (~160 ms
+                        # on ARM).  Copying 1 MB on ARM takes ~5-8 ms; 4 KB is
+                        # effectively instant.  Subsequent chunks use the full
+                        # chunk_size for throughput.
+                        effective_chunk = 4096 if bytes_sent == 0 else self.chunk_size
+                        to_read = min(effective_chunk, available, range_len - bytes_sent)
+                        read_start = buf_offset + bytes_sent
+                        chunk = bytes(downloader._buffer[read_start: read_start + to_read])
+
+                if chunk:
+                    yield chunk
+                    bytes_sent += len(chunk)
+                    if bytes_sent % 10485760 < self.chunk_size:
+                        self._log_transfer("progress", bytes_sent=bytes_sent)
+                    # Throttle to real-time rate after the initial burst window.
+                    # Sleep in 100 ms increments so terminate signals are honoured quickly.
+                    if stream_start_time is not None:
+                        elapsed = time.monotonic() - stream_start_time
+                        budget = elapsed * _PCM_BYTES_PER_SEC + _THROTTLE_LEAD_BYTES
+                        if bytes_sent > budget:
+                            sleep_needed = (bytes_sent - budget) / _PCM_BYTES_PER_SEC
+                            sleep_end = time.monotonic() + sleep_needed
+                            while time.monotonic() < sleep_end and not self.__terminated:
+                                time.sleep(0.1)
+                elif is_finished:
+                    break
+
+            end_of_range = range_begin + bytes_sent
+            if track_length > 0 and end_of_range >= track_length:
+                self.__notify_track_finished(track_id)
+            self._log_transfer("finished", range_begin=range_begin, bytes_sent=bytes_sent)
 
         except Exception as ex:
-            self.__log_exception_sending(ex, range_begin, bytes_sent)
+            self._log_transfer("exception", range_begin=range_begin, bytes_sent=bytes_sent, ex=ex)
+            log_exception(ex, "send_part_audio_stream")
         finally:
-            # Make sure spotty always gets terminated.
-            if spotty_process:
-                self.__last_spotty_pid = -1
-                spotty_process.terminate()
-                spotty_process.communicate()
-                # Make really sure!
-                kill_process_by_pid(spotty_process.pid)
+            self.__terminated = False
 
-    def __kill_last_spotty(self) -> None:
-        if self.__last_spotty_pid == -1:
-            return
-        kill_process_by_pid(self.__last_spotty_pid)
-        self.__last_spotty_pid = -1
 
-    def __log_start_transfer(self, range_begin: int) -> None:
-        log_msg(
-            f"Start transfer for track '{self.__track_id}' - range begin: {range_begin}",
-            LOGDEBUG,
-        )
-        log_msg(
-            f"Use Spotify normalization: {self.use_normalization}, initial volume: {self.initial_volume}.",
-            LOGDEBUG,
-        )
+def create_wav_header_for_duration(duration_sec: float) -> Tuple[bytes, int]:
+    """Create a WAV header and total stream length for a given duration (no side effects)."""
+    try:
+        file = BytesIO()
+        num_samples = 44100 * int(max(1, duration_sec))
+        channels = 2
+        sample_rate = 44100
+        bits_per_sample = 16
 
-    def __log_send_wav_header(self) -> None:
-        log_msg(
-            f"Sending wav header for track '{self.__track_id}'.",
-            LOGDEBUG,
+        # Generate format chunk.
+        format_chunk_spec = "<4sLHHLLHH"
+        format_chunk = struct.pack(
+            format_chunk_spec,
+            b"fmt ",
+            16,
+            1,
+            channels,
+            sample_rate,
+            sample_rate * channels * (bits_per_sample // 8),
+            channels * (bits_per_sample // 8),
+            bits_per_sample,
         )
 
-    def __log_start_reading_audio(self, track_id_uri: str) -> None:
-        log_msg(
-            f"Start reading audio data for track: '{track_id_uri}',"
-            f" length = {self.__track_length} ({self.__get_mb_str(self.__track_length)}).",
-            LOGDEBUG,
-        )
+        # Generate data chunk.
+        data_chunk_spec = "<4sL"
+        data_size = int(num_samples * channels * (bits_per_sample // 8))
+        data_chunk = struct.pack(data_chunk_spec, b"data", data_size)
 
-    def __log_continue_sending(self, bytes_sent: int) -> None:
-        log_msg(
-            f"Continue sending track '{self.__track_id}'"
-            f" - {self.__get_data_sent_str(bytes_sent, self.__track_length)}.",
-            LOGDEBUG,
-        )
+        # Standard WAV: RIFF size = 36 + data_size
+        riff_size = 36 + data_size
+        main_header_spec = "<4sL4s"
+        main_header = struct.pack(main_header_spec, b"RIFF", riff_size, b"WAVE")
 
-    def __log_finished_sending(self, range_begin: int, bytes_sent: int) -> None:
-        log_msg(
-            f"Finished sending track '{self.__track_id}'"
-            f" - range begin {range_begin}"
-            f" - range end {bytes_sent} - {self.__get_mb_str(bytes_sent)}.",
-            LOGDEBUG,
-        )
+        file.write(main_header)
+        file.write(format_chunk)
+        file.write(data_chunk)
 
-    def __log_exception_sending(self, ex: Exception, range_begin: int, bytes_sent: int) -> None:
-        log_msg(
-            f"EXCEPTION sending track '{self.__track_id}'"
-            f" - range begin {range_begin}"
-            f" - range end {bytes_sent} - {self.__get_mb_str(bytes_sent)}.",
-            LOGERROR,
-        )
-        log_msg(f"Exception: {ex}")
+        header_bytes = file.getvalue()
+        header_len = len(header_bytes)
+        total_length = header_len + data_size
+        return header_bytes, total_length
+    except Exception as exc:
+        log_exception(exc, "Failed to create wave header (static).")
+        raise
 
-    @staticmethod
-    def __log_spotty_return_code(spotty_process: subprocess.Popen) -> None:
-        if spotty_process.returncode:
-            log_msg(
-                f"Spotty process return code: {spotty_process.returncode}",
-                LOGWARNING,
-            )
-
-    @staticmethod
-    def __get_mb_str(data_bytes: int) -> str:
-        data_mb = bytes_to_megabytes(data_bytes)
-        return f"{data_mb:.1f}MB"
-
-    @staticmethod
-    def __get_data_sent_str(data_bytes: int, track_length: int) -> str:
-        data_mb = bytes_to_megabytes(data_bytes)
-        percent = int(100.0 * float(data_bytes) / float(track_length))
-        return f"sent so far: {data_mb:>5.1f}MB ({percent:>3}%)"
-
-    def __create_wav_header(self) -> Tuple[bytes, int]:
-        """generate a wav header for the stream"""
-        try:
-            log_msg(f"Start getting wav header. Duration = {self.__track_duration}", LOGDEBUG)
-            file = BytesIO()
-            num_samples = 44100 * self.__track_duration
-            channels = 2
-            sample_rate = 44100
-            bits_per_sample = 16
-
-            # Generate format chunk.
-            format_chunk_spec = "<4sLHHLLHH"
-            format_chunk = struct.pack(
-                format_chunk_spec,
-                "fmt ".encode(encoding="UTF-8"),  # Chunk id
-                16,  # Size of this chunk (excluding chunk id and this field)
-                1,  # Audio format, 1 for PCM
-                channels,  # Number of channels
-                sample_rate,  # Samplerate, 44100, 48000, etc.
-                sample_rate * channels * (bits_per_sample // 8),  # Byterate
-                channels * (bits_per_sample // 8),  # Blockalign
-                bits_per_sample,  # 16 bits for two byte samples, etc.
-            )
-
-            # Generate data chunk.
-            data_chunk_spec = "<4sL"
-            data_size = num_samples * channels * (bits_per_sample / 8)
-            data_chunk = struct.pack(
-                data_chunk_spec,
-                "data".encode(encoding="UTF-8"),  # Chunk id
-                int(data_size),  # Chunk size (excluding chunk id and this field)
-            )
-            sum_items = [
-                # "WAVE" string following size field
-                4,
-                # "fmt " + chunk size field + chunk size
-                struct.calcsize(format_chunk_spec),
-                # Size of data chunk spec + data size
-                struct.calcsize(data_chunk_spec) + data_size,
-            ]
-
-            # Generate main header.
-            all_chunks_size = int(sum(sum_items))
-            main_header_spec = "<4sL4s"
-            main_header = struct.pack(
-                main_header_spec,
-                "RIFF".encode(encoding="UTF-8"),
-                all_chunks_size,
-                "WAVE".encode(encoding="UTF-8"),
-            )
-
-            # Write all the contents in.
-            file.write(main_header)
-            file.write(format_chunk)
-            file.write(data_chunk)
-
-            return file.getvalue(), all_chunks_size + 8
-
-        except Exception as exc:
-            log_exception(exc, "Failed to create wave header.")

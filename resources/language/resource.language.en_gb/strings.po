@@ -139,23 +139,23 @@ msgid ""
 msgstr ""
 
 msgctxt "#11075"
-msgid "Use Spotify normalization when playing tracks"
+msgid "Spotify normalization"
 msgstr ""
 
-msgctxt "#11095"
-msgid "Spotify stream volume (1-100)"
+msgctxt "#11134"
+msgid "Off"
 msgstr ""
 
-msgctxt "#11096"
-msgid "Volume level of the incoming Spotify stream. Lower the value (e.g. 25-50) if Spotify sounds louder than other sources like Plex."
+msgctxt "#11135"
+msgid "Auto"
 msgstr ""
 
-msgctxt "#11097"
-msgid "Pre-buffer next track (seconds)"
+msgctxt "#11136"
+msgid "Track"
 msgstr ""
 
-msgctxt "#11098"
-msgid "How many seconds of the next track to load in the background (5–30). Higher values reduce gap between tracks but use more memory."
+msgctxt "#11137"
+msgid "Album"
 msgstr ""
 
 msgctxt "#11076"
@@ -282,14 +282,6 @@ msgctxt "#11108"
 msgid "When enabled, the prebuffer duration is derived from the Up Next preview duration (clamped to 5–30 seconds)."
 msgstr ""
 
-msgctxt "#11111"
-msgid "Broadcast to Next Track service"
-msgstr "Broadcast to Next Track service"
-
-msgctxt "#11112"
-msgid "When enabled, sends next-track data to the Next Track service addon so it can show the next-track overlay. Disable if you use only the built-in overlay or another addon."
-msgstr "When enabled, sends next-track data to the Next Track service addon so it can show the next-track overlay. Disable if you use only the built-in overlay or another addon."
-
 msgctxt "#11122"
 msgid "Welcome"
 msgstr ""
@@ -318,11 +310,27 @@ msgctxt "#11131"
 msgid "When enabled, spotty will automatically play similar songs when your music ends (Spotify autoplay)."
 msgstr ""
 
-msgctxt "#11132"
-msgid "Passthrough (raw stream)"
+msgctxt "#11138"
+msgid "Streaming quality (bitrate)"
 msgstr ""
 
-msgctxt "#11133"
-msgid "Stream raw Ogg Vorbis from Spotify (no WAV wrap). Uses less CPU; leave off if playback fails."
+msgctxt "#11139"
+msgid "Audio quality for all streams. Higher bitrate sounds better but uses more data. 320 kbps is Spotify Premium quality."
+msgstr ""
+
+msgctxt "#11140"
+msgid "96 kbps (low)"
+msgstr ""
+
+msgctxt "#11141"
+msgid "160 kbps (medium)"
+msgstr ""
+
+msgctxt "#11142"
+msgid "320 kbps (high)"
+msgstr ""
+
+msgctxt "#11143"
+msgid "Controls which Spotify normalization gain value is applied. Auto uses Spotify's default; Track and Album normalize to the respective gain value; Off disables normalization."
 msgstr ""
 
