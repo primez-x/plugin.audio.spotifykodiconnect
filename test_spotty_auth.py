@@ -45,6 +45,16 @@ def _make_kodi_stub():
     mod.LOGWARNING = 3
     mod.LOGERROR = 4
     mod.log = lambda msg, level=1: None
+    mod.sleep = lambda ms: None
+
+    class _FakeMonitor:
+        def waitForAbort(self, timeout=None):
+            return False
+
+        def abortRequested(self):
+            return False
+
+    mod.Monitor = _FakeMonitor
 
     addon_mod = types.ModuleType("xbmcaddon")
     addon_mod.Addon = lambda id=None: _FakeAddon()
@@ -302,6 +312,156 @@ class PoisonedTokenFileTests(unittest.TestCase):
         self.assertIsNotNone(result, "valid spotty response must produce a token_info dict")
         self.assertEqual(result["access_token"], "test-access-token")
         self.assertIn("expires_at", result)
+
+
+# ---------------------------------------------------------------------------
+# Renewal robustness: timeouts, bounded retries, abort, token preservation
+# ---------------------------------------------------------------------------
+
+
+class _Recorder:
+    def __init__(self):
+        self.calls = []
+
+
+class RenewalRobustnessTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = "/tmp/test_spotty_auth_renew_%d" % os.getpid()
+        os.makedirs(self._tmp, exist_ok=True)
+        for fname in ("credentials.json", "credentials.json.bak", "spotty-token"):
+            p = os.path.join(self._tmp, fname)
+            if os.path.exists(p):
+                os.remove(p)
+        self.spotty = FakeSpotty(self._tmp)
+        self.auth = SpottyAuth(self.spotty)
+        self._saved = {
+            name: getattr(spotty_auth.utils, name)
+            for name in (
+                "cache_auth_token",
+                "cache_auth_token_expires_at",
+                "cached_auth_token_is_unexpired",
+                "zeroconf_pairing_in_progress",
+                "get_username",
+            )
+        }
+        self._saved_monitor = spotty_auth.xbmc.Monitor
+        self.cached = {"token": "old-token", "expires": "999"}
+        spotty_auth.utils.cache_auth_token = lambda v: self.cached.__setitem__("token", v)
+        spotty_auth.utils.cache_auth_token_expires_at = lambda v: self.cached.__setitem__(
+            "expires", v
+        )
+        spotty_auth.utils.zeroconf_pairing_in_progress = lambda now=None: False
+        spotty_auth.utils.get_username = lambda: "user"
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            setattr(spotty_auth.utils, name, value)
+        spotty_auth.xbmc.Monitor = self._saved_monitor
+        for root, _dirs, files in os.walk(self._tmp, topdown=False):
+            for fname in files:
+                os.remove(os.path.join(root, fname))
+        os.rmdir(self._tmp)
+
+    def test_get_token_kills_and_reaps_hung_spotty(self):
+        import subprocess
+
+        events = []
+
+        class _HungProc:
+            def __init__(self):
+                self.killed = False
+
+            def communicate(self, timeout=None):
+                events.append(("communicate", timeout, self.killed))
+                if not self.killed:
+                    raise subprocess.TimeoutExpired("spotty", timeout)
+                return (b"", b"")
+
+            def kill(self):
+                self.killed = True
+                events.append(("kill",))
+
+        self.auth._SpottyAuth__spotty.run_spotty = lambda extra_args=None: _HungProc()
+        result = self.auth._SpottyAuth__get_token()  # type: ignore[attr-defined]
+
+        self.assertIsNone(result)
+        self.assertEqual(("communicate", spotty_auth.TOKEN_FETCH_TIMEOUT_SECS, False), events[0])
+        self.assertEqual(("kill",), events[1])
+        self.assertEqual("communicate", events[2][0])
+        self.assertTrue(events[2][2], "hung child must be reaped after kill")
+        self.assertLessEqual(spotty_auth.TOKEN_FETCH_TIMEOUT_SECS, 15)
+
+    def test_retry_is_bounded_and_uses_monitor_wait(self):
+        waits = []
+
+        class _Monitor:
+            def waitForAbort(self, timeout=None):
+                waits.append(timeout)
+                return False
+
+        spotty_auth.xbmc.Monitor = _Monitor
+        attempts = []
+        self.auth._SpottyAuth__get_token = lambda: attempts.append(1)  # type: ignore
+        result = self.auth._SpottyAuth__get_retry_auth_token()  # type: ignore[attr-defined]
+
+        self.assertIsNone(result)
+        self.assertEqual(spotty_auth.TOKEN_FETCH_MAX_RETRIES, len(attempts))
+        self.assertEqual(3, spotty_auth.TOKEN_FETCH_MAX_RETRIES)
+        self.assertEqual(spotty_auth.TOKEN_FETCH_MAX_RETRIES - 1, len(waits))
+
+    def test_retry_stops_on_abort(self):
+        class _AbortingMonitor:
+            def waitForAbort(self, timeout=None):
+                return True
+
+        spotty_auth.xbmc.Monitor = _AbortingMonitor
+        attempts = []
+        self.auth._SpottyAuth__get_token = lambda: attempts.append(1)  # type: ignore
+        self.auth._SpottyAuth__get_retry_auth_token()  # type: ignore[attr-defined]
+        self.assertEqual(1, len(attempts))
+
+    def test_renew_failure_keeps_unexpired_token(self):
+        spotty_auth.utils.cached_auth_token_is_unexpired = lambda now=None: True
+        self.auth._SpottyAuth__get_retry_auth_token = lambda: None  # type: ignore
+        with self.assertRaises(Exception):
+            self.auth.renew_token()
+        self.assertEqual("old-token", self.cached["token"])
+        self.assertEqual("999", self.cached["expires"])
+
+    def test_renew_failure_clears_expired_token(self):
+        spotty_auth.utils.cached_auth_token_is_unexpired = lambda now=None: False
+        self.auth._SpottyAuth__get_retry_auth_token = lambda: None  # type: ignore
+        with self.assertRaises(Exception):
+            self.auth.renew_token()
+        self.assertEqual("", self.cached["token"])
+        self.assertEqual("", self.cached["expires"])
+
+    def test_renew_restores_backup_before_attempt(self):
+        with open(self.spotty.cred_backup, "w") as f:
+            f.write("{}")
+        seen = []
+
+        def fake_retry():
+            seen.append(os.path.exists(self.spotty.cred_file))
+            return {"access_token": "new", "expires_at": 12345}
+
+        self.auth._SpottyAuth__get_retry_auth_token = fake_retry  # type: ignore
+        self.auth.renew_token()
+        self.assertEqual([True], seen)
+        self.assertEqual("new", self.cached["token"])
+
+    def test_restore_skipped_while_zeroconf_pairing(self):
+        with open(self.spotty.cred_backup, "w") as f:
+            f.write("{}")
+        spotty_auth.utils.zeroconf_pairing_in_progress = lambda now=None: True
+        self.assertFalse(self.auth.restore_credentials_from_backup_if_needed())
+        self.assertFalse(os.path.exists(self.spotty.cred_file))
+
+    def test_has_stored_credentials(self):
+        self.assertFalse(self.auth.has_stored_credentials())
+        with open(self.spotty.cred_backup, "w") as f:
+            f.write("{}")
+        self.assertTrue(self.auth.has_stored_credentials())
 
 
 if __name__ == "__main__":

@@ -358,3 +358,6 @@ msgctxt "#11149"
 msgid "Write detailed debug logs. Leave disabled for normal playback performance."
 msgstr ""
 
+msgctxt "#11150"
+msgid "Spotify is connecting…"
+msgstr ""
