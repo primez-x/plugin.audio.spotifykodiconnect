@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git push origin HEAD:master)",
+      "Bash(git push origin master)",
+      "Bash(git push -u origin master)",
+      "Bash(git push -u origin claude/*)",
+      "Bash(git push origin claude/*)"
+    ]
+  }
+}
