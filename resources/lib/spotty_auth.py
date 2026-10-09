@@ -193,11 +193,11 @@ class SpottyAuth:
         token_info = None
 
         try:
-            # Belt-and-suspenders against a poisoned token file: if a previous
-            # run wrote an error-shaped payload, remove it before invoking
-            # spotty again. See _remove_token_file_if_poisoned for the full
-            # rationale.
-            self._remove_token_file_if_poisoned()
+            token_file = self.__spotty.get_spotty_token_file()
+            # Remove any token file left by a previous run (valid, expired or
+            # error-shaped) so that only a file this spotty run wrote can be
+            # accepted. If removal fails, remember its mtime instead.
+            stale_mtime = self._discard_stale_token_file(token_file)
 
             args = [
                 "--client-id",
@@ -205,7 +205,7 @@ class SpottyAuth:
                 "--scope",
                 ",".join(SPOTTY_SCOPE),
                 "--save-token",
-                self.__spotty.get_spotty_token_file(),
+                token_file,
             ]
             spotty = self.__spotty.run_spotty(extra_args=args)
 
@@ -220,7 +220,23 @@ class SpottyAuth:
                 self._kill_and_reap(spotty)
                 return None
 
-            with open(self.__spotty.get_spotty_token_file()) as f:
+            returncode = getattr(spotty, "returncode", None)
+            if returncode != 0:
+                # The stale file was removed above, so a token file present now
+                # was written by this run; the payload checks below still apply.
+                log_msg(
+                    f"Spotty token fetch exited with code {returncode}.",
+                    loglevel=LOGWARNING,
+                )
+
+            if not self._token_file_was_rewritten(token_file, stale_mtime):
+                log_msg(
+                    "Spotty token fetch did not write a new token file; will retry.",
+                    loglevel=LOGWARNING,
+                )
+                return None
+
+            with open(token_file) as f:
                 json_token = json.load(f)
 
             # Spotty writes {"error": "..."} into the --save-token path when
@@ -262,6 +278,35 @@ class SpottyAuth:
             log_exception(exc, "Get Spotify token error")
 
         return token_info
+
+    @staticmethod
+    def _discard_stale_token_file(token_file: str) -> Union[int, None]:
+        """Delete a token file left by an earlier spotty run.
+
+        Returns None when no file remains (the normal case), or the leftover
+        file's mtime (ns) when it could not be removed, so the caller can tell
+        whether spotty rewrote it.
+        """
+        try:
+            os.remove(token_file)
+            log_msg("Removed previous spotty token file before re-invoking spotty.", LOGDEBUG)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            log_exception(exc, "Failed to remove previous spotty token file")
+        try:
+            return os.stat(token_file).st_mtime_ns
+        except OSError:
+            return None
+
+    @staticmethod
+    def _token_file_was_rewritten(token_file: str, stale_mtime: Union[int, None]) -> bool:
+        """True when token_file exists and is not the leftover from before the run."""
+        try:
+            mtime = os.stat(token_file).st_mtime_ns
+        except OSError:
+            return False
+        return stale_mtime is None or mtime != stale_mtime
 
     @staticmethod
     def _kill_and_reap(proc) -> None:

@@ -107,6 +107,79 @@ class SimpleCache(object):
         # remove this task from list
         self._busy_tasks.remove(task_name)
 
+    def get_many(self, endpoints, checksum="", json_data=False, mem_cache=True):
+        '''
+            get several objects from cache at once (same rules as get())
+            returns a dict {endpoint: data} holding only the endpoints found;
+            all database misses are read over a single connection
+        '''
+        checksum = self._get_checksum(checksum)
+        cur_time = self._get_timestamp(datetime.datetime.now())
+        use_mem = self.enable_mem_cache and mem_cache
+        results = {}
+        missing = []
+        seen = set()
+        for endpoint in endpoints:
+            if endpoint in seen:
+                continue
+            seen.add(endpoint)
+            result = None
+            if use_mem:
+                result = self._get_mem_cache(endpoint, checksum, cur_time, json_data)
+            if result is None:
+                missing.append(endpoint)
+            else:
+                results[endpoint] = result
+        if missing:
+            results.update(
+                self._get_db_cache_many(missing, checksum, cur_time, json_data, use_mem)
+            )
+        return results
+
+    def set_many(self, items, checksum="", expiration=datetime.timedelta(days=30), json_data=False,
+                 mem_cache=True):
+        '''
+            set several objects in cache at once (same rules as set())
+            items: dict {endpoint: data} or iterable of (endpoint, data) pairs;
+            the database rows are written in one transaction
+        '''
+        items = list(items.items() if isinstance(items, dict) else items)
+        if not items:
+            return
+        task_name = "set_many.%s" % items[0][0]
+        self._busy_tasks.append(task_name)
+        try:
+            checksum = self._get_checksum(checksum)
+            expires = self._get_timestamp(datetime.datetime.now() + expiration)
+            for endpoint, data in items:
+                if self._exit:
+                    break
+                if self.enable_mem_cache and mem_cache:
+                    self._set_mem_cache(endpoint, checksum, expires, data, json_data)
+                elif not mem_cache:
+                    self._win.clearProperty(endpoint)
+            if not self._exit:
+                rows = [(endpoint, expires, json.dumps(data), checksum) for endpoint, data in items]
+                query = ("INSERT OR REPLACE INTO simplecache( id, expires, data, checksum) "
+                         "VALUES (?, ?, ?, ?)")
+
+                def _write(connection):
+                    connection.execute("BEGIN IMMEDIATE")
+                    try:
+                        connection.executemany(query, rows)
+                        connection.execute("COMMIT")
+                    except Exception:
+                        try:
+                            connection.execute("ROLLBACK")
+                        except Exception:
+                            pass
+                        raise
+                    return True
+
+                self._run_on_database(_write)
+        finally:
+            self._busy_tasks.remove(task_name)
+
     def check_cleanup(self):
         '''check if cleanup is needed - public method, may be called by calling addon'''
         cur_time = datetime.datetime.now()
@@ -173,6 +246,40 @@ class SimpleCache(object):
                     if self.enable_mem_cache and use_mem:
                         self._set_mem_cache(endpoint, checksum, cache_data[0], result, json_data)
         return result
+
+    def _get_db_cache_many(self, endpoints, checksum, cur_time, json_data, use_mem=True):
+        '''get several cache entries from the sqllite _database over one connection'''
+        chunk_size = 500  # stay below SQLITE_MAX_VARIABLE_NUMBER on old builds
+
+        def _read(connection):
+            rows = []
+            for start in range(0, len(endpoints), chunk_size):
+                chunk = endpoints[start:start + chunk_size]
+                query = "SELECT id, expires, data, checksum FROM simplecache WHERE id IN (%s)" % (
+                    ",".join("?" * len(chunk)))
+                rows.extend(connection.execute(query, chunk).fetchall())
+            results = {}
+            corrupt = []
+            for endpoint, expires, data, row_checksum in rows:
+                if not expires > cur_time:
+                    continue
+                if checksum and row_checksum != checksum:
+                    continue
+                try:
+                    results[endpoint] = (expires, json.loads(data))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    corrupt.append((endpoint,))
+            if corrupt:
+                connection.executemany("DELETE FROM simplecache WHERE id = ?", corrupt)
+            return results
+
+        rows = self._run_on_database(_read) or {}
+        results = {}
+        for endpoint, (expires, result) in rows.items():
+            if self.enable_mem_cache and use_mem:
+                self._set_mem_cache(endpoint, checksum, expires, result, json_data)
+            results[endpoint] = result
+        return results
 
     def _set_db_cache(self, endpoint, checksum, expires, data, json_data):
         ''' store cache data in _database '''
@@ -278,6 +385,42 @@ class SimpleCache(object):
                     else:
                         cursor = _database.execute(query)
                     return _SqlResult(cursor.fetchall())
+                except sqlite3.OperationalError as exc:
+                    error = exc
+                    if "locked" in str(exc):
+                        self._log_msg("retrying DB commit...")
+                        retries += 1
+                        self._monitor.waitForAbort(0.5)
+                    else:
+                        break
+                except Exception as exc:
+                    error = exc
+                    break
+            self._log_msg("_database ERROR ! -- %s" % str(error), xbmc.LOGWARNING)
+        finally:
+            try:
+                _database.close()
+            except Exception:
+                pass
+        return None
+
+    def _run_on_database(self, func):
+        '''run func(connection) on one fresh connection, retrying while the db is locked
+
+        Returns func's result, or None on failure.
+        '''
+        retries = 0
+        error = None
+        _database = self._get_database()
+        if _database is None:
+            self._log_msg("_database unavailable; skipping query", xbmc.LOGWARNING)
+            return None
+        try:
+            while not retries == 10 and not self._monitor.abortRequested():
+                if self._exit:
+                    return None
+                try:
+                    return func(_database)
                 except sqlite3.OperationalError as exc:
                     error = exc
                     if "locked" in str(exc):

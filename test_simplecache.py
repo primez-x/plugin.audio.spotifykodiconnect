@@ -130,6 +130,80 @@ class SimpleCacheTests(unittest.TestCase):
         self.cache._get_database = lambda: None
         self.cache._do_cleanup()
 
+    def _count_connections(self):
+        opened = []
+        real_get_database = self.cache._get_database
+
+        def _tracking():
+            opened.append(True)
+            return real_get_database()
+
+        self.cache._get_database = _tracking
+        return opened
+
+    def test_set_many_then_get_many_round_trip(self):
+        self.cache.set_many({"a": "1", "b": {"x": [1]}}, checksum="c", mem_cache=False)
+        self.assertEqual(
+            {"a": "1", "b": {"x": [1]}},
+            self.cache.get_many(["a", "b", "missing"], checksum="c", mem_cache=False),
+        )
+        # rows are ordinary entries, readable one at a time as well
+        self.assertEqual("1", self.cache.get("a", checksum="c", mem_cache=False))
+        self.assertEqual({}, self.cache.get_many(["a", "b"], checksum="other", mem_cache=False))
+
+    def test_set_many_accepts_pairs_and_mirrors_into_window_property(self):
+        self.cache.set_many([("a", "1"), ("b", "0")], checksum="c")
+        self.assertIn("a", _Window.props)
+        self.assertIn("b", _Window.props)
+        self.assertEqual({"a": "1", "b": "0"}, self.cache.get_many(["a", "b"], checksum="c"))
+
+    def test_set_many_and_get_many_use_one_connection_each(self):
+        opened = self._count_connections()
+        self.cache.set_many({f"k{i}": str(i) for i in range(600)}, checksum="c", mem_cache=False)
+        self.assertEqual(1, len(opened), "set_many must write all rows over one connection")
+        del opened[:]
+        result = self.cache.get_many([f"k{i}" for i in range(600)], checksum="c", mem_cache=False)
+        self.assertEqual(600, len(result))
+        self.assertEqual("599", result["k599"])
+        self.assertEqual(1, len(opened), "get_many must read all rows over one connection")
+
+    def test_get_many_serves_memory_hits_without_database(self):
+        self.cache.set_many({"a": "1", "b": "2"}, checksum="c")
+        opened = self._count_connections()
+        self.assertEqual({"a": "1", "b": "2"}, self.cache.get_many(["a", "b"], checksum="c"))
+        self.assertEqual([], opened)
+
+    def test_get_many_db_hit_repopulates_memory_mirror(self):
+        self.cache.set_many({"a": "1"}, checksum="c")
+        _Window.props.clear()
+        self.assertEqual({"a": "1"}, self.cache.get_many(["a"], checksum="c"))
+        self.assertIn("a", _Window.props)
+
+    def test_get_many_honours_expiration(self):
+        import datetime
+
+        self.cache.set_many(
+            {"old": "1"}, checksum="c", expiration=datetime.timedelta(seconds=-5)
+        )
+        self.cache.set_many({"new": "1"}, checksum="c", expiration=datetime.timedelta(minutes=5))
+        self.assertEqual({"new": "1"}, self.cache.get_many(["old", "new"], checksum="c"))
+        self.assertIsNone(self.cache.get("old", checksum="c"))
+
+    def test_get_many_drops_corrupt_rows(self):
+        self.cache.set("bad", "x", checksum="c", mem_cache=False)
+        self.cache._execute_sql(
+            "UPDATE simplecache SET data = ? WHERE id = ?", ("{not json", "bad")
+        )
+        self.assertEqual({}, self.cache.get_many(["bad"], checksum="c", mem_cache=False))
+        rows = self.cache._execute_sql("SELECT id FROM simplecache WHERE id = ?", ("bad",))
+        self.assertEqual([], rows.fetchall())
+
+    def test_many_methods_handle_unavailable_database(self):
+        self.cache._get_database = lambda: None
+        self.cache.set_many({"k": [1]}, mem_cache=False)
+        self.assertEqual({}, self.cache.get_many(["k"], mem_cache=False))
+        self.cache.set_many({})
+
 
 if __name__ == "__main__":
     unittest.main()

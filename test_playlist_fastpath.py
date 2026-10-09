@@ -155,6 +155,20 @@ class FakeCache:
         self.set_calls = getattr(self, "set_calls", [])
         self.set_calls.append((key, kwargs))
 
+    def get_many(self, keys, checksum=None, **kwargs):
+        self.get_many_calls = getattr(self, "get_many_calls", 0) + 1
+        result = {}
+        for key in keys:
+            value = self.get(key, checksum=checksum, **kwargs)
+            if value is not None:
+                result[key] = value
+        return result
+
+    def set_many(self, items, checksum=None, **kwargs):
+        self.set_many_calls = getattr(self, "set_many_calls", 0) + 1
+        for key, value in dict(items).items():
+            self.values[key] = (value, checksum)
+
 
 def install_kodi_stubs():
     xbmc = types.ModuleType("xbmc")
@@ -300,7 +314,7 @@ class FakeSpotify:
         self.saved_track_calls += 1
         return {"total": 0, "items": []}
 
-    def current_user_saved_albums(self, limit=50, offset=0):
+    def current_user_saved_albums(self, limit=50, offset=0, market=None):
         self.saved_album_calls += 1
         return {"total": 0, "items": []}
 
@@ -544,7 +558,7 @@ class ChecksumSpotify(FakeSpotify):
             ],
         }
 
-    def current_user_saved_albums(self, limit=50, offset=0):
+    def current_user_saved_albums(self, limit=50, offset=0, market=None):
         self.saved_album_calls += 1
         self.saved_album_requests.append((limit, offset))
         return {

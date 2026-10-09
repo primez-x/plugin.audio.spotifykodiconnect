@@ -925,6 +925,33 @@ class PluginContent:
             expiration=RELATION_CACHE_EXPIRATION,
         )
 
+    def __set_relation_cache_many(self, namespace: str, states: Dict[str, bool]) -> None:
+        """Store several relation states in one cache write (one sqlite transaction)."""
+        values = {
+            self.__relation_cache_key(namespace, item_id): "1" if value else "0"
+            for item_id, value in states.items()
+            if item_id
+        }
+        if not values:
+            return
+        self.cache.set_many(
+            values,
+            checksum=CACHE_SCHEMA_VERSION,
+            expiration=RELATION_CACHE_EXPIRATION,
+        )
+
+    def __get_relation_cache_many(self, namespace: str, item_ids: List[str]) -> Dict[str, str]:
+        """Read several relation states in one cache read; misses are absent."""
+        keys = {
+            self.__relation_cache_key(namespace, item_id): item_id
+            for item_id in item_ids
+            if item_id
+        }
+        if not keys:
+            return {}
+        cached = self.cache.get_many(list(keys), checksum=CACHE_SCHEMA_VERSION) or {}
+        return {keys[key]: value for key, value in cached.items() if key in keys}
+
     def __get_relation_set_for_page(
         self,
         namespace: str,
@@ -933,15 +960,10 @@ class PluginContent:
     ) -> Set[str]:
         result: Set[str] = set()
         missing: List[str] = []
-        seen: Set[str] = set()
-        for item_id in item_ids:
-            if not item_id or item_id in seen:
-                continue
-            seen.add(item_id)
-            cached = self.cache.get(
-                self.__relation_cache_key(namespace, item_id),
-                checksum=CACHE_SCHEMA_VERSION,
-            )
+        unique_ids = list(OrderedDict.fromkeys(item_id for item_id in item_ids if item_id))
+        cached_states = self.__get_relation_cache_many(namespace, unique_ids)
+        for item_id in unique_ids:
+            cached = cached_states.get(item_id)
             if cached == "1":
                 result.add(item_id)
             elif cached == "0":
@@ -949,6 +971,7 @@ class PluginContent:
             else:
                 missing.append(item_id)
 
+        fetched: Dict[str, bool] = {}
         for chunk in get_chunks(missing, 50):
             try:
                 states = lookup(chunk) or []
@@ -959,7 +982,8 @@ class PluginContent:
                 related = bool(is_related)
                 if related:
                     result.add(item_id)
-                self.__set_relation_cache(namespace, item_id, related)
+                fetched[item_id] = related
+        self.__set_relation_cache_many(namespace, fetched)
 
         return result
 
@@ -982,16 +1006,22 @@ class PluginContent:
         self, playlists: List[Dict[str, Any]], relation_mode: str = "cache"
     ) -> Dict[str, Optional[bool]]:
         states: Dict[str, Optional[bool]] = {}
-        for playlist in playlists:
-            if not playlist or not playlist.get("id"):
-                continue
-            if (playlist.get("owner") or {}).get("id") == self.__userid:
-                continue
+        candidates = [
+            playlist
+            for playlist in playlists
+            if playlist
+            and playlist.get("id")
+            and (playlist.get("owner") or {}).get("id") != self.__userid
+        ]
+        cached_states = self.__get_relation_cache_many(
+            "followedplaylist", [playlist["id"] for playlist in candidates]
+        )
+        fetched: Dict[str, bool] = {}
+        for playlist in candidates:
             playlist_id = playlist["id"]
-            cached = self.cache.get(
-                self.__relation_cache_key("followedplaylist", playlist_id),
-                checksum=CACHE_SCHEMA_VERSION,
-            )
+            if playlist_id in states:
+                continue
+            cached = cached_states.get(playlist_id)
             if cached == "1":
                 states[playlist_id] = True
                 continue
@@ -1000,7 +1030,7 @@ class PluginContent:
                 continue
             if relation_mode == "user_collection":
                 states[playlist_id] = True
-                self.__set_relation_cache("followedplaylist", playlist_id, True)
+                fetched[playlist_id] = True
                 continue
             if relation_mode != "lookup":
                 states[playlist_id] = None
@@ -1012,7 +1042,8 @@ class PluginContent:
                 log_exception(exc, "playlist follow relation lookup")
                 is_followed = False
             states[playlist_id] = is_followed
-            self.__set_relation_cache("followedplaylist", playlist_id, is_followed)
+            fetched[playlist_id] = is_followed
+        self.__set_relation_cache_many("followedplaylist", fetched)
         return states
 
     def __get_followed_playlist_ids_for_page(self, playlists: List[Dict[str, Any]]) -> Set[str]:
@@ -1462,16 +1493,25 @@ class PluginContent:
                 f'Retrieved {album["tracks"]["total"]} cached tracks for album "{album["name"]}".'
             )
         else:
-            track_ids = []
-            count = 0
-            while album["tracks"]["total"] > count:
-                tracks = self.__spotipy.album_tracks(
+            # GET /albums/{id} already embeds the first page of tracks; only page
+            # album_tracks for whatever lies beyond it.
+            album_track_page = album.get("tracks") or {}
+            total = int(album_track_page.get("total") or 0)
+            items = list(album_track_page.get("items") or [])
+            count = len(items)
+            while total > count:
+                page = self.__spotipy.album_tracks(
                     album["id"], market=self.__user_country, limit=50, offset=count
                 )["items"]
-                for track in tracks:
-                    track_ids.append(track["id"])
-                count += 50
-            album_tracks = self.__prepare_track_listitems(track_ids, album_details=album)
+                if not page:
+                    break
+                items += page
+                count += len(page)
+            track_ids = [track["id"] for track in items if track and track.get("id")]
+            # Every track references album_details; leave out the embedded
+            # track page so it is not serialised once per track in the cache.
+            album_details = {key: value for key, value in album.items() if key != "tracks"}
+            album_tracks = self.__prepare_track_listitems(track_ids, album_details=album_details)
             self.cache.set(cache_str, album_tracks, checksum=checksum)
             cache_log(
                 f'Retrieved {album["tracks"]["total"]} UNCACHED tracks for album "{album["name"]}".'
@@ -2444,10 +2484,12 @@ class PluginContent:
         # For tracks, we always get the full details unless full tracks already supplied.
         if track_ids and not tracks:
             # Add early exit condition
-            for chunk in get_chunks(track_ids, 20):
+            for chunk in get_chunks(track_ids, 50):
                 tracks += self.__spotipy.tracks(chunk, market=self.__user_country)["tracks"]
 
         for track in tracks:
+            if not track:
+                continue
             if track.get("track"):
                 track = track["track"]
             if album_details:
@@ -2503,8 +2545,9 @@ class PluginContent:
                     for track_id in track_ids_for_context
                     if track_id in known_saved_track_ids
                 }
-                for track_id in saved_track_ids:
-                    self.__set_relation_cache("savedtrack", track_id, True)
+                self.__set_relation_cache_many(
+                    "savedtrack", {track_id: True for track_id in saved_track_ids}
+                )
             followed_artists = self.__get_followed_artist_ids_for_page(
                 [t.get("artistid") for t in new_tracks if t.get("artistid")]
             )
@@ -2712,20 +2755,31 @@ class PluginContent:
         return context_items
 
     def __prepare_album_listitems(
-        self, album_ids: List[str] = None, albums: List[Dict[str, Any]] = None
+        self,
+        album_ids: List[str] = None,
+        albums: List[Dict[str, Any]] = None,
+        known_saved_album_ids: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
         if albums is None:
             albums: List[Dict[str, Any]] = []
         if album_ids is None:
             album_ids = []
         if not albums and album_ids:
-            # Get full info in chunks of 20.
+            # Get full info in chunks of 20 (the /albums endpoint maximum).
             for chunk in get_chunks(album_ids, 20):
                 albums += self.__spotipy.albums(chunk, market=self.__user_country)["albums"]
+        albums = [album for album in albums if album]
 
-        saved_albums = self.__get_saved_album_ids_for_page(
-            [album.get("id") for album in albums if album and album.get("id")]
-        )
+        page_album_ids = [album.get("id") for album in albums if album.get("id")]
+        if known_saved_album_ids is None:
+            saved_albums = self.__get_saved_album_ids_for_page(page_album_ids)
+        else:
+            saved_albums = {
+                album_id for album_id in page_album_ids if album_id in known_saved_album_ids
+            }
+            self.__set_relation_cache_many(
+                "savedalbum", {album_id: True for album_id in saved_albums}
+            )
         relation_ts = time.time()
 
         # process listing
@@ -3201,43 +3255,65 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
-    def __get_saved_album_ids(self) -> List[str]:
-        albums = self.__spotipy.current_user_saved_albums(limit=50, offset=0)
-        cache_str = f"spotify-savedalbumids.{self.__userid}"
-        checksum = albums["total"]
-        album_ids = self.cache.get(cache_str, checksum=checksum)
-        if album_ids:
-            cache_log(f'Retrieved {len(album_ids)} cached album ids for user "{self.__userid}".')
-            return album_ids
-
-        album_ids = []
-        if albums and albums.get("items"):
-            count = len(albums["items"])
-            while albums["total"] > count:
-                albums["items"] += self.__spotipy.current_user_saved_albums(limit=50, offset=count)[
-                    "items"
-                ]
-                count += 50
-            for album in albums["items"]:
-                album_ids.append(album["album"]["id"])
-            self.cache.set(cache_str, album_ids, checksum=checksum)
-            cache_log(
-                f'Retrieved {_get_len(album_ids)} UNCACHED album ids for user "{self.__userid}".'
-            )
-
-        return album_ids
+    def __saved_albums_cache_checksum(
+        self, total: int, first_items: Optional[List[Dict[str, Any]]] = None
+    ) -> str:
+        """Saved albums are newest-first, so the head item catches save+remove
+        pairs that leave the total unchanged. The first page is fetched anyway."""
+        generic_checksum = self.__addon.getSetting("cache_checksum")
+        head = ""
+        first = (first_items or [None])[0]
+        if isinstance(first, dict):
+            album = first.get("album") or {}
+            head = f"-{first.get('added_at') or ''}-{album.get('id') or ''}"
+        return f"v{CACHE_SCHEMA_VERSION}-savedalbums-{int(total)}{head}-{generic_checksum}"
 
     def __get_saved_albums(self) -> List[Dict[str, Any]]:
-        album_ids = self.__get_saved_album_ids()
+        first_page = (
+            self.__spotipy.current_user_saved_albums(
+                limit=50, offset=0, market=self.__user_country
+            )
+            or {}
+        )
+        total = int(first_page.get("total") or 0)
+        raw_items = list(first_page.get("items") or [])
         cache_str = f"spotify.savedalbums.{self.__userid}"
-        checksum = self.__cache_checksum(len(album_ids))
+        checksum = self.__saved_albums_cache_checksum(total, raw_items)
         albums = self.cache.get(cache_str, checksum=checksum)
-        if isinstance(albums, list) and (len(albums) > 0 or len(album_ids) == 0):
+        if isinstance(albums, list) and (len(albums) > 0 or total == 0):
             cache_log(f'Retrieved {len(albums)} cached albums for user "{self.__userid}".')
-        else:
-            albums = self.__prepare_album_listitems(album_ids)
-            self.cache.set(cache_str, albums, checksum=checksum)
-            cache_log(f'Retrieved {_get_len(albums)} UNCACHED albums for user "{self.__userid}".')
+            return albums
+
+        offset = len(raw_items)
+        while raw_items and total > offset:
+            page = (
+                self.__spotipy.current_user_saved_albums(
+                    limit=50, offset=offset, market=self.__user_country
+                )
+                or {}
+            )
+            items = page.get("items") or []
+            if not items:
+                break
+            raw_items += items
+            offset += len(items)
+
+        # /me/albums already returns full album objects; no /albums?ids= refetch.
+        # The embedded first page of tracks is not used by album listings.
+        album_objects = []
+        for item in raw_items:
+            album = item.get("album") if isinstance(item, dict) else None
+            if not album or not album.get("id"):
+                continue
+            album = dict(album)
+            album.pop("tracks", None)
+            album_objects.append(album)
+        albums = self.__prepare_album_listitems(
+            albums=album_objects,
+            known_saved_album_ids={album["id"] for album in album_objects},
+        )
+        self.cache.set(cache_str, albums, checksum=checksum)
+        cache_log(f'Retrieved {_get_len(albums)} UNCACHED albums for user "{self.__userid}".')
         return albums
 
     def browse_saved_albums(self) -> None:
@@ -3593,27 +3669,26 @@ class PluginContent:
             (
                 f"{xbmc.getLocalizedString(KODI_ARTISTS_STR_ID)}"
                 f" ({result['artists']['total']})",
-                f"plugin://{ADDON_ID}/" f"?action={self.search_artists.__name__}&artistid={value}",
+                self.__build_url({"action": self.search_artists.__name__, "artistid": value}),
             )
         )
         items.append(
             (
                 f"{xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID)}"
                 f" ({result['playlists']['total']})",
-                f"plugin://{ADDON_ID}/"
-                f"?action={self.search_playlists.__name__}&playlistid={value}",
+                self.__build_url({"action": self.search_playlists.__name__, "playlistid": value}),
             )
         )
         items.append(
             (
                 f"{xbmc.getLocalizedString(KODI_ALBUMS_STR_ID)} ({result['albums']['total']})",
-                f"plugin://{ADDON_ID}/" f"?action={self.search_albums.__name__}&albumid={value}",
+                self.__build_url({"action": self.search_albums.__name__, "albumid": value}),
             )
         )
         items.append(
             (
                 f"{xbmc.getLocalizedString(KODI_SONGS_STR_ID)} ({result['tracks']['total']})",
-                f"plugin://{ADDON_ID}/" f"?action={self.search_tracks.__name__}&trackid={value}",
+                self.__build_url({"action": self.search_tracks.__name__, "trackid": value}),
             )
         )
         for item in items:
