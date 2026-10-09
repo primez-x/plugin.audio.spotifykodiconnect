@@ -710,71 +710,56 @@ class MainService:
             seen_ids = get_playlist_track_ids()
             seen_ids.add(seed_track_id)
 
-            rec_ids = [t.get("id") for t in rec_tracks if t.get("id")]
-            rec_ids = [rid for rid in rec_ids if rid and rid not in seen_ids]
-
-            from utils import get_chunks
-
+            # /recommendations returns full track objects (name, duration_ms,
+            # artists, album with images), so no /tracks refetch is needed.
             added = 0
-            for chunk in get_chunks(rec_ids, 20):
+            for full in rec_tracks:
                 if added >= RECOMMEND_LIMIT:
                     break
+                if not isinstance(full, dict):
+                    continue
                 try:
-                    batch = sp.tracks(chunk, market=None).get("tracks") or []
-                except Exception:
-                    # Fall back to per-track calls for this chunk.
-                    batch = []
-                    for tid in chunk:
+                    tid = full.get("id") or ""
+                    if not tid or tid in seen_ids:
+                        continue
+                    name = full.get("name") or ""
+                    duration_ms = full.get("duration_ms") or 0
+                    artists = full.get("artists") or []
+                    artist_name = artists[0].get("name") or "" if artists else ""
+                    album = full.get("album") or {}
+                    album_name = album.get("name") or ""
+                    images = album.get("images") or []
+                    art_url = images[0].get("url") if images else ""
+                    duration_sec = math.ceil(duration_ms / 1000) if duration_ms else 1
+                    url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{tid}/{duration_sec}.wav"
+                    li = xbmcgui.ListItem(label=name)
+                    li.setProperty("IsPlayable", "true")
+                    li.setProperty("spotifytrackid", tid)
+                    li.setInfo(
+                        "music",
+                        {
+                            "title": name,
+                            "artist": artist_name,
+                            "album": album_name,
+                            "duration": duration_sec,
+                        },
+                    )
+                    if art_url:
                         try:
-                            batch.append(sp.track(tid))
+                            li.setArt(
+                                {
+                                    "thumb": art_url,
+                                    "icon": art_url,
+                                    "fanart": art_url,
+                                }
+                            )
                         except Exception:
-                            continue
-
-                for full in batch:
-                    if added >= RECOMMEND_LIMIT:
-                        break
-                    try:
-                        tid = full.get("id") or ""
-                        if not tid or tid in seen_ids:
-                            continue
-                        name = full.get("name") or ""
-                        duration_ms = full.get("duration_ms") or 0
-                        artists = full.get("artists") or []
-                        artist_name = artists[0].get("name") or "" if artists else ""
-                        album = full.get("album") or {}
-                        album_name = album.get("name") or ""
-                        images = album.get("images") or []
-                        art_url = images[0].get("url") if images else ""
-                        duration_sec = math.ceil(duration_ms / 1000) if duration_ms else 1
-                        url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{tid}/{duration_sec}.wav"
-                        li = xbmcgui.ListItem(label=name)
-                        li.setProperty("IsPlayable", "true")
-                        li.setProperty("spotifytrackid", tid)
-                        li.setInfo(
-                            "music",
-                            {
-                                "title": name,
-                                "artist": artist_name,
-                                "album": album_name,
-                                "duration": duration_sec,
-                            },
-                        )
-                        if art_url:
-                            try:
-                                li.setArt(
-                                    {
-                                        "thumb": art_url,
-                                        "icon": art_url,
-                                        "fanart": art_url,
-                                    }
-                                )
-                            except Exception:
-                                pass
-                        playlist.add(url, li)
-                        seen_ids.add(tid)
-                        added += 1
-                    except Exception:
-                        pass
+                            pass
+                    playlist.add(url, li)
+                    seen_ids.add(tid)
+                    added += 1
+                except Exception:
+                    pass
 
             log_msg(
                 f"Autoplay: appended {added} recommendations (seed={seed_track_id}).",

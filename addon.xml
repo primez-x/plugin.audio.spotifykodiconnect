@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<addon id="plugin.audio.spotifykodiconnect" version="1.0.42" name="SpotifyKodiConnect" provider-name="primez-x">
+<addon id="plugin.audio.spotifykodiconnect" version="1.0.43" name="SpotifyKodiConnect" provider-name="primez-x">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
         <import addon="xbmc.addon" version="18.9.701" />
@@ -19,7 +19,15 @@
         <description lang="en_GB">Unofficial Spotify music plugin for Kodi. Improves on the original Spotify addon with consistent album/artist art in all views (including playlists), correct metadata tags, and background loading so navigation and playback feel smooth. Requires Spotify Premium.</description>
         <disclaimer lang="en_GB">This product uses the SPOTIFY WEB API but is not endorsed, certified or otherwise approved in any way by Spotify. Spotify is the registered trademark of Spotify AB.</disclaimer>
         <source>https://github.com/primez-x/plugin.audio.spotifykodiconnect</source>
-        <news>v1.0.42
+        <news>v1.0.43
+- Fix search results for queries containing &amp;, #, + or % (sub-search links are now URL-encoded).
+- Saved albums load from the /me/albums response directly instead of re-fetching every album, and liking a song no longer invalidates the saved-albums cache.
+- Opening an album reuses its embedded first page of tracks; track lookups use batches of 50.
+- Autoplay uses recommendation results directly instead of re-fetching each track.
+- Like/follow state is read and written in one cache transaction per page.
+- Token renewal never accepts a stale token file left by an earlier run.
+
+v1.0.42
 - Add Claude Code project settings (not packaged).
 
 v1.0.41

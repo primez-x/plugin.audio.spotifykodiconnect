@@ -490,6 +490,82 @@ class SpotifyAutoplayGatingTests(unittest.TestCase):
 
         self.assertEqual([], fired, "User-disabled autoplay must never fire")
 
+    def test_autoplay_builds_items_from_recommendation_objects(self):
+        """/recommendations returns full track objects: no /tracks refetch."""
+        main_service = import_main_service({})
+        calls = []
+
+        def _track(index):
+            return {
+                "id": f"rec-{index}",
+                "name": f"Rec {index}",
+                "duration_ms": 180500,
+                "artists": [{"id": "a", "name": f"Artist {index}"}],
+                "album": {"name": "Album", "images": [{"url": f"img-{index}"}]},
+            }
+
+        class _Spotify:
+            def recommendations(self, seed_tracks=None, limit=20):
+                calls.append(("recommendations", tuple(seed_tracks), limit))
+                return {"tracks": [_track(1), _track(2), _track(1), _track(3), None]}
+
+            def tracks(self, *args, **kwargs):
+                calls.append(("tracks",))
+                raise AssertionError("must not refetch recommended tracks")
+
+            def track(self, *args, **kwargs):
+                calls.append(("track",))
+                raise AssertionError("must not refetch recommended tracks")
+
+        added = []
+
+        class _PlayList:
+            def __init__(self, _kind):
+                pass
+
+            def add(self, url, li):
+                added.append((url, li))
+
+        class _ListItem:
+            def __init__(self, label=""):
+                self.label = label
+                self.props = {}
+                self.info = {}
+                self.art = {}
+
+            def setProperty(self, key, value):
+                self.props[key] = value
+
+            def setInfo(self, _kind, info):
+                self.info = info
+
+            def setArt(self, art):
+                self.art = art
+
+        main_service.get_cached_auth_token = lambda: "token"
+        main_service.spotipy.Spotify = lambda auth=None: _Spotify()
+        main_service.get_playlist_track_ids = lambda: {"rec-2"}
+        main_service.xbmc.PLAYLIST_MUSIC = 0
+        main_service.xbmc.PlayList = _PlayList
+        main_service.xbmcgui.ListItem = _ListItem
+
+        service = object.__new__(main_service.MainService)
+        service._MainService__queue_autoplay_tracks("seed")
+
+        self.assertEqual([("recommendations", ("seed",), 49)], calls)
+        self.assertEqual(
+            [
+                "http://127.0.0.1:52309/track/rec-1/181.wav",
+                "http://127.0.0.1:52309/track/rec-3/181.wav",
+            ],
+            [url for url, _li in added],
+        )
+        first = added[0][1]
+        self.assertEqual("rec-1", first.props["spotifytrackid"])
+        self.assertEqual("Artist 1", first.info["artist"])
+        self.assertEqual("Album", first.info["album"])
+        self.assertEqual("img-1", first.art["thumb"])
+
     def test_osd_clear_wipes_play_queue_session_state(self):
         """When playback stops, _SpotifyOSDPlayerMonitor._clear() must drop
         the play-queue session so a stale 'loading' state doesn't suppress

@@ -265,6 +265,8 @@ class PoisonedTokenFileTests(unittest.TestCase):
         # Stub run_spotty to simulate spotty overwriting the file with another
         # error payload (as it does when it cannot authenticate).
         class _FakeProc:
+            returncode = 0
+
             def communicate(self, timeout=None):
                 # spotty would write the new error payload here.
                 with open(self_file[0], "w") as f:
@@ -295,6 +297,8 @@ class PoisonedTokenFileTests(unittest.TestCase):
         self._write_token(ERROR_PAYLOAD)
 
         class _FakeProc:
+            returncode = 0
+
             def communicate(self, timeout=None):
                 with open(self_file[0], "w") as f:
                     json.dump(VALID_TOKEN_PAYLOAD, f)
@@ -312,6 +316,69 @@ class PoisonedTokenFileTests(unittest.TestCase):
         self.assertIsNotNone(result, "valid spotty response must produce a token_info dict")
         self.assertEqual(result["access_token"], "test-access-token")
         self.assertIn("expires_at", result)
+
+    def _run_fake_spotty(self, returncode=0, payload=None):
+        """Stub run_spotty; record whether the old token file was gone at spawn."""
+        seen = []
+        token_file = self.spotty.token_file
+
+        class _FakeProc:
+            def __init__(self):
+                self.returncode = None
+
+            def communicate(self, timeout=None):
+                seen.append(os.path.exists(token_file))
+                if payload is not None:
+                    with open(token_file, "w") as f:
+                        json.dump(payload, f)
+                self.returncode = returncode
+                return (b"", b"")
+
+        self.auth._SpottyAuth__spotty.run_spotty = lambda extra_args=None: _FakeProc()
+        result = self.auth._SpottyAuth__get_token()  # type: ignore[attr-defined]
+        return result, seen
+
+    def test_get_token_removes_previous_valid_token_file_before_spawning(self):
+        self._write_token(VALID_TOKEN_PAYLOAD)
+        result, seen = self._run_fake_spotty(payload=VALID_TOKEN_PAYLOAD)
+        self.assertEqual([False], seen, "old token file must be gone before spotty runs")
+        self.assertIsNotNone(result)
+
+    def test_get_token_rejects_stale_file_when_spotty_writes_nothing(self):
+        """A previous run's valid token must not be accepted as this run's result."""
+        self._write_token(VALID_TOKEN_PAYLOAD)
+        result, _seen = self._run_fake_spotty(payload=None)
+        self.assertIsNone(result)
+        self.assertFalse(os.path.exists(self.spotty.token_file))
+
+    def test_get_token_accepts_fresh_file_despite_nonzero_exit(self):
+        """The stale file is removed first, so a file present afterwards is fresh."""
+        self._write_token(VALID_TOKEN_PAYLOAD)
+        result, _seen = self._run_fake_spotty(returncode=1, payload=VALID_TOKEN_PAYLOAD)
+        self.assertIsNotNone(result)
+
+    def test_get_token_rejects_stale_file_on_nonzero_exit(self):
+        self._write_token(VALID_TOKEN_PAYLOAD)
+        result, _seen = self._run_fake_spotty(returncode=1, payload=None)
+        self.assertIsNone(result)
+
+    def test_get_token_rejects_unrewritten_file_when_removal_fails(self):
+        """If the old file cannot be deleted, an unchanged mtime means it is stale."""
+        self._write_token(VALID_TOKEN_PAYLOAD)
+        real_remove = spotty_auth.os.remove
+
+        def failing_remove(path):
+            if path == self.spotty.token_file:
+                raise PermissionError("read-only")
+            return real_remove(path)
+
+        spotty_auth.os.remove = failing_remove
+        try:
+            result, seen = self._run_fake_spotty(payload=None)
+        finally:
+            spotty_auth.os.remove = real_remove
+        self.assertEqual([True], seen)
+        self.assertIsNone(result)
 
 
 # ---------------------------------------------------------------------------
