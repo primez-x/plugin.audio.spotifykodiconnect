@@ -97,6 +97,39 @@ class SimpleCacheTests(unittest.TestCase):
         self.cache.set("big", [1], checksum="c1", mem_cache=False)
         self.assertIsNone(self.cache.get("big", checksum="c2", mem_cache=False))
 
+    def test_execute_sql_closes_connection(self):
+        closed = []
+        real_get_database = self.cache._get_database
+
+        class _Tracking:
+            def __init__(self, conn):
+                self.conn = conn
+
+            def execute(self, *args):
+                return self.conn.execute(*args)
+
+            def executemany(self, *args):
+                return self.conn.executemany(*args)
+
+            def close(self):
+                closed.append(True)
+                self.conn.close()
+
+        self.cache._get_database = lambda: _Tracking(real_get_database())
+        self.cache.set("k", [1, 2], checksum="c", mem_cache=False)
+        self.assertEqual([1, 2], self.cache.get("k", checksum="c", mem_cache=False))
+        self.assertGreaterEqual(len(closed), 2, "each query must close its connection")
+
+    def test_execute_sql_handles_unavailable_database(self):
+        self.cache._get_database = lambda: None
+        self.assertIsNone(self.cache._execute_sql("SELECT 1"))
+        self.cache.set("k", [1], mem_cache=False)
+        self.assertIsNone(self.cache.get("k", mem_cache=False))
+
+    def test_cleanup_survives_unavailable_database(self):
+        self.cache._get_database = lambda: None
+        self.cache._do_cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

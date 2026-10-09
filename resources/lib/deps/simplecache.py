@@ -14,6 +14,19 @@ import sqlite3
 import json
 from functools import reduce
 
+class _SqlResult(object):
+    '''rows fetched before the connection is closed (cursor-like API)'''
+
+    def __init__(self, rows):
+        self._rows = list(rows or [])
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
+
+
 class SimpleCache(object):
     '''simple stateless caching system for Kodi'''
     enable_mem_cache = True
@@ -180,7 +193,8 @@ class SimpleCache(object):
         self._win.setProperty("simplecachecleanbusy", "busy")
 
         query = "SELECT id, expires FROM simplecache"
-        for cache_data in self._execute_sql(query).fetchall():
+        rows = self._execute_sql(query)
+        for cache_data in (rows.fetchall() if rows else []):
             cache_id = cache_data[0]
             cache_expires = cache_data[1]
 
@@ -214,12 +228,18 @@ class SimpleCache(object):
         if not xbmcvfs.exists(dbpath):
             xbmcvfs.mkdirs(dbpath)
         del addon
+        connection = None
         try:
             connection = sqlite3.connect(dbfile, timeout=30, isolation_level=None)
             connection.execute('SELECT * FROM simplecache LIMIT 1')
             return connection
         except Exception as error:
             # our _database is corrupt or doesn't exist yet, we simply try to recreate it
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
             if xbmcvfs.exists(dbfile):
                 xbmcvfs.delete(dbfile)
             try:
@@ -234,33 +254,47 @@ class SimpleCache(object):
                 return None
 
     def _execute_sql(self, query, data=None):
-        '''little wrapper around execute and executemany to just retry a db command if db is locked'''
+        '''little wrapper around execute and executemany to just retry a db command if db is locked
+
+        Returns a cursor-like object whose rows were fetched before the
+        connection was closed, or None on failure.
+        '''
         retries = 0
-        result = None
         error = None
         # always use new db object because we need to be sure that data is available for other simplecache instances
-        with self._get_database() as _database:
+        _database = self._get_database()
+        if _database is None:
+            self._log_msg("_database unavailable; skipping query", xbmc.LOGWARNING)
+            return None
+        try:
             while not retries == 10 and not self._monitor.abortRequested():
                 if self._exit:
                     return None
                 try:
                     if isinstance(data, list):
-                        result = _database.executemany(query, data)
+                        cursor = _database.executemany(query, data)
                     elif data:
-                        result = _database.execute(query, data)
+                        cursor = _database.execute(query, data)
                     else:
-                        result = _database.execute(query)
-                    return result
-                except sqlite3.OperationalError as error:
-                    if "locked" in str(error):
+                        cursor = _database.execute(query)
+                    return _SqlResult(cursor.fetchall())
+                except sqlite3.OperationalError as exc:
+                    error = exc
+                    if "locked" in str(exc):
                         self._log_msg("retrying DB commit...")
                         retries += 1
                         self._monitor.waitForAbort(0.5)
                     else:
                         break
-                except Exception as error:
+                except Exception as exc:
+                    error = exc
                     break
             self._log_msg("_database ERROR ! -- %s" % str(error), xbmc.LOGWARNING)
+        finally:
+            try:
+                _database.close()
+            except Exception:
+                pass
         return None
 
     @staticmethod

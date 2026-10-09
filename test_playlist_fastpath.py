@@ -685,6 +685,44 @@ class PlaylistFastPathTests(unittest.TestCase):
         self.assertEqual("true", win.getProperty("Spotify.PlayQueue.OriginalComplete"))
         self.assertEqual("75", win.getProperty("Spotify.PlayQueue.OriginalLoaded"))
 
+    def test_play_playlist_with_no_playable_tracks_marks_session_complete(self):
+        spotify = FakeSpotify(RecordingPlayer.events, total=3)
+        spotify.playlist_items = lambda *args, **kwargs: {"items": [{"track": {"id": None}}]}
+        content = self.build_content(spotify)
+        ended = []
+        self.plugin_content.xbmcplugin.endOfDirectory = lambda *a, **kw: ended.append(kw)
+
+        content.play_playlist()
+
+        win = self._play_queue_window()
+        self.assertEqual("true", win.getProperty("Spotify.PlayQueue.OriginalComplete"))
+        self.assertEqual([], DeferredThread.started_targets)
+        self.assertEqual([{"handle": 1, "succeeded": False}], ended)
+
+    def test_play_playlist_first_page_failure_marks_session_complete(self):
+        spotify = FakeSpotify(RecordingPlayer.events, total=3)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("network")
+
+        spotify.playlist_items = boom
+        content = self.build_content(spotify)
+
+        with self.assertRaises(RuntimeError):
+            content.play_playlist()
+        win = self._play_queue_window()
+        self.assertEqual("true", win.getProperty("Spotify.PlayQueue.OriginalComplete"))
+
+    def test_saved_tracks_checksum_tracks_head_item(self):
+        content = self.build_content(FakeSpotify(RecordingPlayer.events, total=1))
+        checksum = content._PluginContent__saved_tracks_cache_checksum
+        first = [{"added_at": "2026-01-01T00:00:00Z", "track": {"id": "a"}}]
+        swapped = [{"added_at": "2026-01-02T00:00:00Z", "track": {"id": "b"}}]
+        self.assertNotEqual(checksum(10, first), checksum(10, swapped))
+        self.assertEqual(checksum(10, first), checksum(10, list(first)))
+        self.assertNotEqual(checksum(10, first), checksum(11, first))
+        self.assertTrue(checksum(0, []))
+
     def test_play_playlist_paging_thread_marks_complete_even_on_empty_page(self):
         """If paging exits early (e.g. Spotify returns an empty page mid-way),
         the finally block must still mark original_complete. Without this,

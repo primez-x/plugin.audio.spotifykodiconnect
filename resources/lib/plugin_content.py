@@ -1888,16 +1888,24 @@ class PluginContent:
         # total <= 0, otherwise mark_original_complete below after paging).
         play_queue_start_session(total)
         page_limit = 50
-        raw_items = self.__get_playlist_items_page(
-            playlist_details["id"], offset=0, limit=page_limit
-        )
-        items = self.__prepare_playlist_items_page(
-            playlist_details,
-            raw_items,
-            include_context_items=False,
-            include_artist_fanart=False,
-        )
+        try:
+            raw_items = self.__get_playlist_items_page(
+                playlist_details["id"], offset=0, limit=page_limit
+            )
+            items = self.__prepare_playlist_items_page(
+                playlist_details,
+                raw_items,
+                include_context_items=False,
+                include_artist_fanart=False,
+            )
+        except Exception:
+            # Never leave the service believing the original is still loading.
+            play_queue_mark_original_complete()
+            raise
         if not items:
+            log_msg(f"Playlist '{playlist_details.get('name', '')}' has no playable tracks.")
+            play_queue_mark_original_complete()
+            self.__end_directory(succeeded=False)
             return
         log_msg(f"Start playing playlist '{playlist_details['name']}'.")
 
@@ -3227,9 +3235,18 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
-    def __saved_tracks_cache_checksum(self, total: int) -> str:
+    def __saved_tracks_cache_checksum(
+        self, total: int, first_items: Optional[List[Dict[str, Any]]] = None
+    ) -> str:
+        """Saved tracks are newest-first, so the head item catches like+unlike
+        pairs that leave the total unchanged. The first page is fetched anyway."""
         generic_checksum = self.__addon.getSetting("cache_checksum")
-        return f"v{CACHE_SCHEMA_VERSION}-savedtracks-{int(total)}-{generic_checksum}"
+        head = ""
+        first = (first_items or [None])[0]
+        if isinstance(first, dict):
+            track = first.get("track") or {}
+            head = f"-{first.get('added_at') or ''}-{track.get('id') or ''}"
+        return f"v{CACHE_SCHEMA_VERSION}-savedtracks-{int(total)}{head}-{generic_checksum}"
 
     def __get_saved_tracks_page(
         self, offset: int = 0, limit: int = DYNAMIC_PAGE_LIMIT
@@ -3319,7 +3336,7 @@ class PluginContent:
         total = int(first_page.get("total") or 0)
         raw_items = first_page.get("items") or []
         cache_str = f"spotify.savedtracks.{self.__userid}"
-        checksum = self.__saved_tracks_cache_checksum(total)
+        checksum = self.__saved_tracks_cache_checksum(total, raw_items)
         target_url = (
             self.__current_request_url()
             if self.__action == self.browse_saved_tracks.__name__
