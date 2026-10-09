@@ -62,6 +62,10 @@ PLAYLIST_COLLECTION_CACHE_EXPIRATION = datetime.timedelta(
 USER_PLAYLIST_CACHE_BUCKET_SECONDS = 300
 USER_PLAYLIST_CACHE_EXPIRATION = datetime.timedelta(seconds=USER_PLAYLIST_CACHE_BUCKET_SECONDS)
 RELATION_CACHE_EXPIRATION = datetime.timedelta(minutes=5)
+# Background paging persists the growing collection every N pages (and at
+# the end) instead of after every page; these collections are kept out of
+# simplecache's window-property mirror (database only).
+PAGED_CACHE_WRITE_EVERY_PAGES = 5
 # Content listings (album, artist pages, playlist details) are cached without
 # depending on library totals; liked/followed state is overlaid at render time
 # from user-action overrides (see __apply_relation_overrides).
@@ -648,6 +652,21 @@ class PluginContent:
             suffix = f"-{suffix}"
         generic_checksum = self.__addon.getSetting("cache_checksum")
         return f"v{CACHE_SCHEMA_VERSION}-content-{namespace}{suffix}-{generic_checksum}"
+
+    def __paged_cache_get(self, cache_str: str, checksum: Any = None) -> Any:
+        """Read a large, dynamically paged collection (database only)."""
+        if checksum is None:
+            return self.cache.get(cache_str, mem_cache=False)
+        return self.cache.get(cache_str, checksum=checksum, mem_cache=False)
+
+    def __paged_cache_set(self, cache_str: str, value: Any, checksum: Any = None, **kwargs) -> None:
+        """Write a large, dynamically paged collection (database only).
+
+        simplecache otherwise json-encodes the whole collection twice per write
+        (window property + sqlite) and keeps a multi-MB copy in Kodi's home
+        window properties.
+        """
+        self.cache.set(cache_str, value, checksum=checksum, mem_cache=False, **kwargs)
 
     def __relation_overrides_key(self) -> str:
         return f"spotify.relationoverrides.{self.__userid}"
@@ -1613,25 +1632,38 @@ class PluginContent:
             monitor = xbmc.Monitor()
             all_items = list(prepared_items)
             offset = loaded
-            while total > offset:
-                if monitor.abortRequested():
-                    return
-                raw_items = self.__get_playlist_items_page(
-                    playlist["id"], offset=offset, limit=DYNAMIC_PAGE_LIMIT
-                )
-                if not raw_items:
-                    break
-                all_items += self.__prepare_playlist_items_page(playlist, raw_items)
-                offset += len(raw_items)
-                playlist["tracks"]["items"] = all_items
-                self.__mark_dynamic_collection_state(
-                    playlist["tracks"], offset, total, total <= offset
-                )
-                self.cache.set(cache_str, playlist, checksum=checksum)
+            unsaved_pages = 0
 
-            self.__mark_dynamic_collection_state(playlist["tracks"], offset, total, True)
-            self.cache.set(cache_str, playlist, checksum=checksum)
-            self.__refresh_active_listing(target_url)
+            def _persist():
+                self.__paged_cache_set(cache_str, playlist, checksum=checksum)
+
+            try:
+                while total > offset:
+                    if monitor.abortRequested():
+                        return
+                    raw_items = self.__get_playlist_items_page(
+                        playlist["id"], offset=offset, limit=DYNAMIC_PAGE_LIMIT
+                    )
+                    if not raw_items:
+                        break
+                    all_items += self.__prepare_playlist_items_page(playlist, raw_items)
+                    offset += len(raw_items)
+                    playlist["tracks"]["items"] = all_items
+                    self.__mark_dynamic_collection_state(
+                        playlist["tracks"], offset, total, total <= offset
+                    )
+                    unsaved_pages += 1
+                    if unsaved_pages >= PAGED_CACHE_WRITE_EVERY_PAGES:
+                        _persist()
+                        unsaved_pages = 0
+
+                self.__mark_dynamic_collection_state(playlist["tracks"], offset, total, True)
+                _persist()
+                unsaved_pages = 0
+                self.__refresh_active_listing(target_url)
+            finally:
+                if unsaved_pages:
+                    _persist()
 
         self.__start_dynamic_page_continuation(cache_str, target_url, _continue_playlist_details)
 
@@ -1657,33 +1689,41 @@ class PluginContent:
             monitor = xbmc.Monitor()
             all_items = list(collection.get("items") or [])
             offset = loaded
-            while total > offset:
-                if monitor.abortRequested():
-                    return
-                raw_items = fetch_page(offset)
-                if not raw_items:
-                    break
-                all_items += self.__prepare_playlist_listitems(
-                    raw_items, group_label=group_label, relation_mode=relation_mode
-                )
-                offset += len(raw_items)
-                collection["items"] = all_items
-                self.__mark_dynamic_collection_state(collection, offset, total, total <= offset)
-                self.cache.set(
+            unsaved_pages = 0
+
+            def _persist():
+                self.__paged_cache_set(
                     cache_str,
                     container,
                     checksum=checksum,
                     expiration=PLAYLIST_COLLECTION_CACHE_EXPIRATION,
                 )
 
-            self.__mark_dynamic_collection_state(collection, offset, total, True)
-            self.cache.set(
-                cache_str,
-                container,
-                checksum=checksum,
-                expiration=PLAYLIST_COLLECTION_CACHE_EXPIRATION,
-            )
-            self.__refresh_active_listing(target_url)
+            try:
+                while total > offset:
+                    if monitor.abortRequested():
+                        return
+                    raw_items = fetch_page(offset)
+                    if not raw_items:
+                        break
+                    all_items += self.__prepare_playlist_listitems(
+                        raw_items, group_label=group_label, relation_mode=relation_mode
+                    )
+                    offset += len(raw_items)
+                    collection["items"] = all_items
+                    self.__mark_dynamic_collection_state(collection, offset, total, total <= offset)
+                    unsaved_pages += 1
+                    if unsaved_pages >= PAGED_CACHE_WRITE_EVERY_PAGES:
+                        _persist()
+                        unsaved_pages = 0
+
+                self.__mark_dynamic_collection_state(collection, offset, total, True)
+                _persist()
+                unsaved_pages = 0
+                self.__refresh_active_listing(target_url)
+            finally:
+                if unsaved_pages:
+                    _persist()
 
         self.__start_dynamic_page_continuation(cache_str, target_url, _continue_playlist_collection)
 
@@ -1707,31 +1747,39 @@ class PluginContent:
             monitor = xbmc.Monitor()
             all_items = list(collection.get("items") or [])
             offset = loaded
-            while total > offset:
-                if monitor.abortRequested():
-                    return
-                raw_items = fetch_page(offset)
-                if not raw_items:
-                    break
-                all_items += self.__prepare_album_listitems(albums=raw_items)
-                offset += len(raw_items)
-                collection["items"] = all_items
-                self.__mark_dynamic_collection_state(collection, offset, total, total <= offset)
-                self.cache.set(
+            unsaved_pages = 0
+
+            def _persist():
+                self.__paged_cache_set(
                     cache_str,
                     container,
                     checksum=checksum,
                     expiration=PLAYLIST_COLLECTION_CACHE_EXPIRATION,
                 )
 
-            self.__mark_dynamic_collection_state(collection, offset, total, True)
-            self.cache.set(
-                cache_str,
-                container,
-                checksum=checksum,
-                expiration=PLAYLIST_COLLECTION_CACHE_EXPIRATION,
-            )
-            self.__refresh_active_listing(target_url)
+            try:
+                while total > offset:
+                    if monitor.abortRequested():
+                        return
+                    raw_items = fetch_page(offset)
+                    if not raw_items:
+                        break
+                    all_items += self.__prepare_album_listitems(albums=raw_items)
+                    offset += len(raw_items)
+                    collection["items"] = all_items
+                    self.__mark_dynamic_collection_state(collection, offset, total, total <= offset)
+                    unsaved_pages += 1
+                    if unsaved_pages >= PAGED_CACHE_WRITE_EVERY_PAGES:
+                        _persist()
+                        unsaved_pages = 0
+
+                self.__mark_dynamic_collection_state(collection, offset, total, True)
+                _persist()
+                unsaved_pages = 0
+                self.__refresh_active_listing(target_url)
+            finally:
+                if unsaved_pages:
+                    _persist()
 
         self.__start_dynamic_page_continuation(cache_str, target_url, _continue_album_collection)
 
@@ -1748,7 +1796,7 @@ class PluginContent:
         # Keyed on the playlist's own version only (snapshot_id), not library
         # totals: liking a track must not invalidate every playlist cache.
         checksum = self.__content_checksum("playlist", playlist_checksum)
-        playlist_details = self.cache.get(cache_str, checksum=checksum)
+        playlist_details = self.__paged_cache_get(cache_str, checksum=checksum)
         expected_total = playlist["tracks"]["total"] or 0
         target_url = (
             self.__current_request_url() if self.__action == self.browse_playlist.__name__ else ""
@@ -1795,7 +1843,7 @@ class PluginContent:
                 expected_total,
                 expected_total <= loaded,
             )
-            self.cache.set(cache_str, playlist_details, checksum=checksum)
+            self.__paged_cache_set(cache_str, playlist_details, checksum=checksum)
             cache_log(
                 f"Retrieved first {loaded}/{expected_total} playlist details"
                 f' for "{playlist["name"]}".'
@@ -1922,7 +1970,7 @@ class PluginContent:
         categoryid = self.__resolve_category_id(categoryid)
         cache_str = f"spotify.categoryplaylists.{categoryid}"
         checksum = self.__playlist_collection_checksum("category", categoryid)
-        cached = self.cache.get(cache_str, checksum=checksum)
+        cached = self.__paged_cache_get(cache_str, checksum=checksum)
         if cached and (cached.get("playlists") or {}).get("items"):
             self.__start_playlist_collection_continuation(
                 cache_str,
@@ -1950,7 +1998,7 @@ class PluginContent:
                 offset=0,
             )
         except Exception as exc:
-            cached = self.cache.get(cache_str)
+            cached = self.__paged_cache_get(cache_str)
             if cached and (cached.get("playlists") or {}).get("items"):
                 log_exception(exc, f"category playlists lookup {categoryid}")
                 return cached
@@ -1963,7 +2011,7 @@ class PluginContent:
             playlists["playlists"]["items"], group_label=playlists["category"]
         )
         self.__mark_dynamic_collection_state(playlists["playlists"], loaded, total, total <= loaded)
-        self.cache.set(
+        self.__paged_cache_set(
             cache_str,
             playlists,
             checksum=checksum,
@@ -2114,7 +2162,7 @@ class PluginContent:
     def __get_featured_playlists(self) -> Playlist:
         cache_str = "spotify.featuredplaylists"
         checksum = self.__playlist_collection_checksum("featured", self.__user_country)
-        cached = self.cache.get(cache_str, checksum=checksum)
+        cached = self.__paged_cache_get(cache_str, checksum=checksum)
         if cached and (cached.get("playlists") or {}).get("items"):
             self.__start_playlist_collection_continuation(
                 cache_str,
@@ -2135,7 +2183,7 @@ class PluginContent:
                 country=self.__user_country, limit=DYNAMIC_PAGE_LIMIT, offset=0
             )
         except Exception as exc:
-            cached = self.cache.get(cache_str)
+            cached = self.__paged_cache_get(cache_str)
             if cached and (cached.get("playlists") or {}).get("items"):
                 log_exception(exc, "featured playlists lookup")
                 return cached
@@ -2147,7 +2195,7 @@ class PluginContent:
             playlists["playlists"]["items"], group_label=playlists["message"]
         )
         self.__mark_dynamic_collection_state(playlists["playlists"], loaded, total, total <= loaded)
-        self.cache.set(
+        self.__paged_cache_set(
             cache_str,
             playlists,
             checksum=checksum,
@@ -2172,7 +2220,7 @@ class PluginContent:
         cache_str = f"spotify.userplaylists.{userid}"
         checksum = self.__user_playlists_checksum(userid)
 
-        cached_playlists = self.cache.get(cache_str, checksum=checksum)
+        cached_playlists = self.__paged_cache_get(cache_str, checksum=checksum)
         if isinstance(cached_playlists, dict):
             items = cached_playlists.get("items") or []
             cache_log(f'Retrieved {len(items)} cached playlists for user "{self.__userid}".')
@@ -2198,7 +2246,7 @@ class PluginContent:
             DYNAMIC_PAGING_LOADED_KEY: loaded,
             DYNAMIC_PAGING_COMPLETE_KEY: total <= loaded,
         }
-        self.cache.set(
+        self.__paged_cache_set(
             cache_str, payload, checksum=checksum, expiration=USER_PLAYLIST_CACHE_EXPIRATION
         )
         cache_log(
@@ -2220,41 +2268,52 @@ class PluginContent:
             monitor = xbmc.Monitor()
             all_items = list(payload.get("items") or [])
             offset = loaded
-            while total > offset:
-                if monitor.abortRequested():
-                    return
-                page = self.__spotipy.user_playlists(
-                    userid, limit=DYNAMIC_PAGE_LIMIT, offset=offset
-                )["items"]
-                if not page:
-                    break
-                all_items += self.__prepare_playlist_listitems(
-                    page,
-                    group_label=xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID),
-                    relation_mode="user_collection",
-                )
-                offset += len(page)
-                payload["items"] = all_items
-                payload[DYNAMIC_PAGING_LOADED_KEY] = offset
-                payload[DYNAMIC_PAGING_COMPLETE_KEY] = total <= offset
-                self.cache.set(
+            unsaved_pages = 0
+
+            def _persist():
+                self.__paged_cache_set(
                     cache_str,
                     payload,
                     checksum=checksum,
                     expiration=USER_PLAYLIST_CACHE_EXPIRATION,
                 )
 
-            payload[DYNAMIC_PAGING_LOADED_KEY] = offset
-            payload[DYNAMIC_PAGING_COMPLETE_KEY] = True
-            self.cache.set(
-                cache_str, payload, checksum=checksum, expiration=USER_PLAYLIST_CACHE_EXPIRATION
-            )
-            target_url = (
-                self.__current_request_url()
-                if self.__action == self.browse_playlists.__name__
-                else ""
-            )
-            self.__refresh_active_listing(target_url)
+            try:
+                while total > offset:
+                    if monitor.abortRequested():
+                        return
+                    page = self.__spotipy.user_playlists(
+                        userid, limit=DYNAMIC_PAGE_LIMIT, offset=offset
+                    )["items"]
+                    if not page:
+                        break
+                    all_items += self.__prepare_playlist_listitems(
+                        page,
+                        group_label=xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID),
+                        relation_mode="user_collection",
+                    )
+                    offset += len(page)
+                    payload["items"] = all_items
+                    payload[DYNAMIC_PAGING_LOADED_KEY] = offset
+                    payload[DYNAMIC_PAGING_COMPLETE_KEY] = total <= offset
+                    unsaved_pages += 1
+                    if unsaved_pages >= PAGED_CACHE_WRITE_EVERY_PAGES:
+                        _persist()
+                        unsaved_pages = 0
+
+                payload[DYNAMIC_PAGING_LOADED_KEY] = offset
+                payload[DYNAMIC_PAGING_COMPLETE_KEY] = True
+                _persist()
+                unsaved_pages = 0
+                target_url = (
+                    self.__current_request_url()
+                    if self.__action == self.browse_playlists.__name__
+                    else ""
+                )
+                self.__refresh_active_listing(target_url)
+            finally:
+                if unsaved_pages:
+                    _persist()
 
         self.__start_dynamic_page_continuation(
             cache_str, self.__current_request_url(), _continue_user_playlists
@@ -2283,7 +2342,7 @@ class PluginContent:
     def __get_new_releases(self):
         cache_str = "spotify.newreleases"
         checksum = self.__paged_collection_checksum("newreleases", self.__user_country)
-        cached = self.cache.get(cache_str, checksum=checksum)
+        cached = self.__paged_cache_get(cache_str, checksum=checksum)
         if cached and (cached.get("albums") or {}).get("items"):
             self.__start_album_collection_continuation(
                 cache_str,
@@ -2305,7 +2364,7 @@ class PluginContent:
         loaded = len(albums["albums"]["items"])
         albums["albums"]["items"] = self.__prepare_album_listitems(albums=albums["albums"]["items"])
         self.__mark_dynamic_collection_state(albums["albums"], loaded, total, total <= loaded)
-        self.cache.set(
+        self.__paged_cache_set(
             cache_str,
             albums,
             checksum=checksum,
@@ -3220,25 +3279,38 @@ class PluginContent:
             all_items = list(collection.get("items") or [])
             offset = loaded
             current_total = total
-            while current_total > offset:
-                if monitor.abortRequested():
-                    return
-                page = self.__get_saved_tracks_page(offset=offset, limit=DYNAMIC_PAGE_LIMIT)
-                raw_items = page.get("items") or []
-                current_total = int(page.get("total") or current_total)
-                if not raw_items:
-                    break
-                all_items += self.__prepare_saved_track_items_page(raw_items)
-                offset += len(raw_items)
-                collection["items"] = all_items
-                self.__mark_dynamic_collection_state(
-                    collection, offset, current_total, current_total <= offset
-                )
-                self.cache.set(cache_str, collection, checksum=checksum)
+            unsaved_pages = 0
 
-            self.__mark_dynamic_collection_state(collection, offset, current_total, True)
-            self.cache.set(cache_str, collection, checksum=checksum)
-            self.__refresh_active_listing(target_url)
+            def _persist():
+                self.__paged_cache_set(cache_str, collection, checksum=checksum)
+
+            try:
+                while current_total > offset:
+                    if monitor.abortRequested():
+                        return
+                    page = self.__get_saved_tracks_page(offset=offset, limit=DYNAMIC_PAGE_LIMIT)
+                    raw_items = page.get("items") or []
+                    current_total = int(page.get("total") or current_total)
+                    if not raw_items:
+                        break
+                    all_items += self.__prepare_saved_track_items_page(raw_items)
+                    offset += len(raw_items)
+                    collection["items"] = all_items
+                    self.__mark_dynamic_collection_state(
+                        collection, offset, current_total, current_total <= offset
+                    )
+                    unsaved_pages += 1
+                    if unsaved_pages >= PAGED_CACHE_WRITE_EVERY_PAGES:
+                        _persist()
+                        unsaved_pages = 0
+
+                self.__mark_dynamic_collection_state(collection, offset, current_total, True)
+                _persist()
+                unsaved_pages = 0
+                self.__refresh_active_listing(target_url)
+            finally:
+                if unsaved_pages:
+                    _persist()
 
         self.__start_dynamic_page_continuation(cache_str, target_url, _continue_saved_tracks)
 
@@ -3254,7 +3326,7 @@ class PluginContent:
             else ""
         )
 
-        collection = self.cache.get(cache_str, checksum=checksum)
+        collection = self.__paged_cache_get(cache_str, checksum=checksum)
         if isinstance(collection, dict):
             tracks = collection.get("items") or []
             if total == 0 or tracks:
@@ -3271,7 +3343,7 @@ class PluginContent:
         collection = {"items": tracks}
         loaded = len(raw_items)
         self.__mark_dynamic_collection_state(collection, loaded, total, total <= loaded)
-        self.cache.set(cache_str, collection, checksum=checksum)
+        self.__paged_cache_set(cache_str, collection, checksum=checksum)
         cache_log(f'Retrieved first {loaded}/{total} saved tracks for user "{self.__userid}".')
         self.__start_saved_tracks_continuation(cache_str, checksum, collection, target_url)
         return tracks
