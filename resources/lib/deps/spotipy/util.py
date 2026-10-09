@@ -149,10 +149,35 @@ def normalize_scope(scope):
         return None
 
 
+# SpotifyKodiConnect: urllib3 honours Retry-After without an upper bound, so a
+# 429 with "Retry-After: 3600" would block the calling Kodi thread for an hour.
+# Retry-After values above this cap fail fast instead of sleeping.
+MAX_RETRY_AFTER_SECS = 10
+
+# Optional hook, set by the add-on, called with the absolute epoch time until
+# which Spotify asked us to back off when a long Retry-After is refused.
+on_long_rate_limit = None
+
+
 class Retry(urllib3.Retry):
     """
     Custom class for printing a warning when a rate/request limit is reached.
+
+    Fails fast (MaxRetryError -> requests RetryError -> SpotifyException 429)
+    instead of sleeping when Spotify's Retry-After exceeds MAX_RETRY_AFTER_SECS.
     """
+
+    def _long_retry_after(self, response) -> float | None:
+        if response is None or getattr(response, "status", None) != 429:
+            return None
+        header = response.headers.get("Retry-After") if response.headers else None
+        if not header:
+            return None
+        try:
+            retry_after = float(self.parse_retry_after(header))
+        except Exception:
+            return None
+        return retry_after if retry_after > MAX_RETRY_AFTER_SECS else None
     def increment(
             self,
             method: str | None = None,
@@ -162,6 +187,28 @@ class Retry(urllib3.Retry):
             _pool: urllib3.connectionpool.ConnectionPool | None = None,
             _stacktrace: TracebackType | None = None,
     ) -> urllib3.Retry:
+        long_retry_after = self._long_retry_after(response)
+        if long_retry_after is not None:
+            logging.warning(
+                "Spotify rate limit with Retry-After %.0fs exceeds %ss; not retrying.",
+                long_retry_after,
+                MAX_RETRY_AFTER_SECS,
+            )
+            hook = on_long_rate_limit
+            if callable(hook):
+                try:
+                    import time
+
+                    hook(time.time() + long_retry_after)
+                except Exception:
+                    pass
+            raise urllib3.exceptions.MaxRetryError(
+                _pool,
+                url,
+                urllib3.exceptions.ResponseError(
+                    f"too many 429 error responses (Retry-After {long_retry_after:.0f}s)"
+                ),
+            )
         if response:
             retry_header = response.headers.get("Retry-After")
             if self.is_retry(method, response.status, bool(retry_header)):

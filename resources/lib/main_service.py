@@ -35,6 +35,7 @@ from utils import (
 from xbmc import LOGDEBUG, LOGWARNING
 
 SPOTIFY_ADDON = xbmcaddon.Addon(id=ADDON_ID)
+utils.install_spotipy_rate_limit_hook(spotipy)
 SPOTIFY_TRACK_HOOK_KEYS = (
     "Id",
     "Title",
@@ -508,6 +509,8 @@ class MainService:
         def _fetch_artist_fanart_urls():
             global _artist_fanart_urls, _artist_fanart_index
             try:
+                if utils.is_rate_limited():
+                    return
                 token = get_cached_auth_token()
                 if not token:
                     return
@@ -540,6 +543,9 @@ class MainService:
 
         def _set_liked_state():
             try:
+                if utils.is_rate_limited():
+                    log_msg(f"Spotify rate limited; skipping liked state for {track_id}.")
+                    return
                 token = get_cached_auth_token()
                 if not token:
                     log_msg(

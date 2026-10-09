@@ -36,6 +36,8 @@ from utils import (
     log_msg,
 )
 
+utils.install_spotipy_rate_limit_hook(spotipy)
+
 MUSIC_ARTISTS_ICON = "icon_music_artists.png"
 MUSIC_TOP_ARTISTS_ICON = "icon_music_top_artists.png"
 MUSIC_SONGS_ICON = "icon_music_songs.png"
@@ -653,6 +655,9 @@ class PluginContent:
 
         def _run():
             try:
+                if utils.is_rate_limited():
+                    cache_log(f"Dynamic continuation {busy_key} skipped; Spotify rate limited.")
+                    return
                 if not self.__wait_for_active_listing(target_url):
                     cache_log(f"Dynamic continuation {busy_key} skipped; listing not active.")
                     return
@@ -3291,6 +3296,8 @@ class PluginContent:
 
     def __should_stop_precache(self, monitor: xbmc.Monitor, token: str) -> bool:
         if monitor.abortRequested():
+            return True
+        if utils.is_rate_limited():
             return True
         if self.__win.getProperty(PRECACHE_NAVIGATION_TOKEN_PROP) != token:
             return True
