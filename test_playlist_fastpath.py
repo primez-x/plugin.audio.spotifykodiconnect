@@ -85,7 +85,16 @@ class FakeListItem:
 
 
 class FakeMonitor:
+    wait_calls = 0
+    on_wait = None
+
     def abortRequested(self):
+        return False
+
+    def waitForAbort(self, timeout=None):
+        FakeMonitor.wait_calls += 1
+        if FakeMonitor.on_wait:
+            FakeMonitor.on_wait()
         return False
 
 
@@ -736,9 +745,88 @@ class PlaylistFastPathTests(unittest.TestCase):
                 )
 
                 content.browse_playlist()
+                self.assertEqual(1, len(DeferredThread.started_targets))
+                DeferredThread.started_targets[0]()
 
-                self.assertEqual(["fetch:0"], events)
-                self.assertEqual([], DeferredThread.started_targets)
+                self.assertEqual(["fetch:0"], events, "inactive listing must not page")
+                busy = [
+                    key
+                    for key in content._PluginContent__win.properties
+                    if key.startswith(self.plugin_content.DYNAMIC_PAGING_BUSY_PREFIX)
+                ]
+                self.assertEqual([], busy, "busy flag must be cleared")
+
+    def test_browse_playlist_continuation_waits_for_folder_to_resolve(self):
+        """First navigation: FolderPath is still the parent while the plugin
+        builds the directory, then becomes the target once Kodi resolves it."""
+        events = RecordingPlayer.events
+        spotify = FakeSpotify(events, total=75)
+        content = self.build_content(spotify)
+        content._PluginContent__params = {
+            "action": ["browse_playlist"],
+            "playlistid": ["playlist-1"],
+        }
+        content._PluginContent__action = "browse_playlist"
+        target_url = content._PluginContent__current_request_url()
+        folder = ["addons://sources/audio/"]
+        self.plugin_content.xbmc.getInfoLabel = lambda label: folder[0]
+
+        content.browse_playlist()
+        self.assertEqual(1, len(DeferredThread.started_targets))
+        self.assertTrue(
+            any(
+                key.startswith(self.plugin_content.DYNAMIC_PAGING_BUSY_PREFIX)
+                for key in content._PluginContent__win.properties
+            ),
+            "busy flag is held while the continuation is pending",
+        )
+
+        def resolve():
+            folder[0] = target_url
+
+        FakeMonitor.wait_calls = 0
+        FakeMonitor.on_wait = resolve
+        try:
+            DeferredThread.started_targets[0]()
+        finally:
+            FakeMonitor.on_wait = None
+
+        self.assertGreaterEqual(FakeMonitor.wait_calls, 1)
+        self.assertEqual(["fetch:0", "fetch:50"], events)
+        busy_props = [
+            key
+            for key in content._PluginContent__win.properties
+            if key.startswith(self.plugin_content.DYNAMIC_PAGING_BUSY_PREFIX)
+        ]
+        self.assertEqual([], busy_props, "busy flag must be cleared after the worker")
+
+    def test_continuation_gives_up_and_clears_busy_flag_when_never_active(self):
+        events = RecordingPlayer.events
+        spotify = FakeSpotify(events, total=75)
+        content = self.build_content(spotify)
+        content._PluginContent__params = {
+            "action": ["browse_playlist"],
+            "playlistid": ["playlist-1"],
+        }
+        content._PluginContent__action = "browse_playlist"
+        self.plugin_content.xbmc.getInfoLabel = lambda label: "addons://sources/audio/"
+
+        content.browse_playlist()
+        FakeMonitor.wait_calls = 0
+        DeferredThread.started_targets[0]()
+
+        self.assertEqual(["fetch:0"], events)
+        expected_polls = int(
+            self.plugin_content.ACTIVE_LISTING_WAIT_SECS
+            / self.plugin_content.ACTIVE_LISTING_POLL_SECS
+        )
+        self.assertEqual(expected_polls, FakeMonitor.wait_calls)
+        busy_props = [
+            key
+            for key in content._PluginContent__win.properties
+            if key.startswith(self.plugin_content.DYNAMIC_PAGING_BUSY_PREFIX)
+        ]
+        self.assertEqual([], busy_props)
 
     def test_browse_saved_tracks_uses_first_page_and_hidden_continuation(self):
         events = RecordingPlayer.events
