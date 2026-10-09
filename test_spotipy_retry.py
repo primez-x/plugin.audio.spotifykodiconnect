@@ -9,8 +9,18 @@ DEPS_DIR = os.path.join(REPO_ROOT, "resources", "lib", "deps")
 if DEPS_DIR not in sys.path:
     sys.path.insert(0, DEPS_DIR)
 
+
+def _drop_stub_spotipy():
+    """Other test modules register a bare stub named 'spotipy'; load the real one."""
+    module = sys.modules.get("spotipy")
+    if module is not None and not hasattr(module, "__path__"):
+        sys.modules.pop("spotipy", None)
+
+
 try:
     import urllib3
+
+    _drop_stub_spotipy()
     from spotipy import util as spotipy_util
 
     HAVE_DEPS = True
@@ -102,10 +112,9 @@ class LongRetryAfterTests(unittest.TestCase):
         sys.modules.pop("utils", None)
         try:
             import utils
-            import spotipy
 
-            utils.install_spotipy_rate_limit_hook(spotipy)
-            self.assertIs(spotipy.util.on_long_rate_limit, utils.set_rate_limited_until)
+            utils.install_spotipy_rate_limit_hook(types.SimpleNamespace(util=spotipy_util))
+            self.assertIs(spotipy_util.on_long_rate_limit, utils.set_rate_limited_until)
             self.assertFalse(utils.is_rate_limited())
             utils.set_rate_limited_until(10_000_000_000)
             self.assertTrue(utils.is_rate_limited())
