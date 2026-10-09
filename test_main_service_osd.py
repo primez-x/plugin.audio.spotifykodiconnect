@@ -133,6 +133,8 @@ def install_stubs(info_labels, settings=None):
     utils.PROXY_HOST = "127.0.0.1"
     utils.PROXY_PORT = 52309
     utils.get_cached_auth_token = lambda: None
+    utils.install_spotipy_rate_limit_hook = lambda module: None
+    utils.is_rate_limited = lambda now=None: False
     utils.log_exception = lambda *args, **kwargs: None
     utils.log_msg = lambda *args, **kwargs: None
     sys.modules["utils"] = utils

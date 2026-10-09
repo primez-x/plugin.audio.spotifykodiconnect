@@ -800,6 +800,26 @@ class PlaylistFastPathTests(unittest.TestCase):
         ]
         self.assertEqual([], busy_props, "busy flag must be cleared after the worker")
 
+    def test_continuation_skips_while_rate_limited(self):
+        events = RecordingPlayer.events
+        spotify = FakeSpotify(events, total=75)
+        content = self.build_content(spotify)
+        content._PluginContent__params = {
+            "action": ["browse_playlist"],
+            "playlistid": ["playlist-1"],
+        }
+        content._PluginContent__action = "browse_playlist"
+        self.set_active_listing(content)
+        utils_module = self.plugin_content.utils
+        original = utils_module.is_rate_limited
+        self.addCleanup(setattr, utils_module, "is_rate_limited", original)
+        utils_module.is_rate_limited = lambda now=None: True
+
+        content.browse_playlist()
+        DeferredThread.started_targets[0]()
+
+        self.assertEqual(["fetch:0"], events)
+
     def test_continuation_gives_up_and_clears_busy_flag_when_never_active(self):
         events = RecordingPlayer.events
         spotify = FakeSpotify(events, total=75)

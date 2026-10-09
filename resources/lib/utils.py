@@ -38,6 +38,8 @@ KODI_PROPERTY_AUTH_TOKEN_EXPIRES_AT = "spotifykodiconnect-auth-token-expires-at"
 # credentials.json from the .bak the pairing flow just moved aside.
 KODI_PROPERTY_ZEROCONF_PAIRING_SINCE = "Spotify.ZeroconfPairingSince"
 ZEROCONF_PAIRING_STALE_SECS = 600
+# Epoch seconds until which Spotify told us (429 Retry-After) to back off.
+KODI_PROPERTY_RATE_LIMITED_UNTIL = "Spotify.RateLimitedUntil"
 
 
 def _debug_logging_enabled() -> bool:
@@ -210,6 +212,38 @@ def zeroconf_pairing_in_progress(now: float = None) -> bool:
     except (TypeError, ValueError):
         return False
     return ((time.time() if now is None else now) - started) < ZEROCONF_PAIRING_STALE_SECS
+
+
+def set_rate_limited_until(until_epoch: float) -> None:
+    """Record a long Spotify 429 back-off so background work can skip itself."""
+    try:
+        win = xbmcgui.Window(ADDON_WINDOW_ID)
+        current = float(win.getProperty(KODI_PROPERTY_RATE_LIMITED_UNTIL) or 0)
+        if until_epoch > current:
+            win.setProperty(KODI_PROPERTY_RATE_LIMITED_UNTIL, str(int(until_epoch)))
+    except Exception:
+        pass
+
+
+def is_rate_limited(now: float = None) -> bool:
+    """True while a recorded Spotify 429 back-off window is still in the future."""
+    try:
+        value = xbmcgui.Window(ADDON_WINDOW_ID).getProperty(KODI_PROPERTY_RATE_LIMITED_UNTIL)
+        if not value:
+            return False
+        return float(value) > (time.time() if now is None else now)
+    except Exception:
+        return False
+
+
+def install_spotipy_rate_limit_hook(spotipy_module) -> None:
+    """Route long-429 notifications from the vendored spotipy Retry into Kodi."""
+    try:
+        util_module = getattr(spotipy_module, "util", None)
+        if util_module is not None and hasattr(util_module, "on_long_rate_limit"):
+            util_module.on_long_rate_limit = set_rate_limited_until
+    except Exception:
+        pass
 
 
 def cache_value_in_kodi(kodi_property_id: str, value: Any):

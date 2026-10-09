@@ -24,6 +24,8 @@ class PluginAuthGatingTests(unittest.TestCase):
         self.pc.xbmcgui.Dialog = RecordingDialog
         self.end_calls = []
         self.pc.xbmcplugin.endOfDirectory = lambda *a, **kw: self.end_calls.append(kw)
+        original_get_token = self.pc.utils.get_cached_auth_token
+        self.addCleanup(setattr, self.pc.utils, "get_cached_auth_token", original_get_token)
         self.pc.utils.get_cached_auth_token = lambda: None
         self.auth_calls = []
 
