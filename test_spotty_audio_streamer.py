@@ -72,6 +72,13 @@ class FakeDownloader:
     def _trim_head_locked(self):
         return None
 
+    def advance_consumer_locked(self, consumer_id, position):
+        self._consumed_pos = max(self._consumed_pos, position)
+        if consumer_id in self._consumer_positions:
+            self._consumer_positions[consumer_id] = max(
+                self._consumer_positions[consumer_id], position
+            )
+
     def cleanup(self):
         self.aborted = True
 
@@ -545,6 +552,43 @@ class SpottyAudioStreamerTests(unittest.TestCase):
 
         self.assertEqual(65536, len(payload))
         self.assertEqual([], finished)
+
+    def test_generator_stops_when_downloader_aborted_without_data(self):
+        class AbortWhileWaitingDownloader(FakeDownloader):
+            def wait_for_bytes(self, target_bytes, timeout=None):
+                self.wait_targets.append(target_bytes)
+                if self.written_bytes < target_bytes:
+                    # The real wait_for_bytes() returns immediately once
+                    # aborted, so a missing aborted check would spin forever.
+                    self.aborted = True
+                return False
+
+        streamer = self.module.SpottyAudioStreamer(object())
+        streamer.set_track("track-1", 180)
+        wav_header, track_length = self.module.create_wav_header_for_duration(180)
+        pcm = bytes(range(256)) * (2 * 1024 * 1024 // 256)
+        downloader = AbortWhileWaitingDownloader(wav_header, pcm, auto_fill=False)
+        FakeSpottyCacheManager.downloader = downloader
+
+        chunks = []
+        generator = streamer.send_part_audio_stream(track_length, 0)
+
+        def consume():
+            for chunk in generator:
+                chunks.append(chunk)
+
+        consumer = threading.Thread(target=consume, daemon=True)
+        consumer.start()
+        consumer.join(timeout=3.0)
+        alive = consumer.is_alive()
+        if alive:
+            streamer.terminate_stream()
+            consumer.join(timeout=1.0)
+
+        self.assertFalse(alive, "generator kept spinning on an aborted downloader")
+        self.assertTrue(downloader.aborted)
+        self.assertEqual(wav_header + pcm, b"".join(chunks))
+        self.assertEqual({}, downloader._consumer_positions)
 
     def test_downloader_seeds_only_wav_header(self):
         sys.modules.pop("spotty_cache", None)
@@ -1271,6 +1315,318 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             downloader.real_pcm_bytes = 1
 
         self.assertTrue(prebuffer.PrebufferManager._has_real_pcm(downloader))
+
+
+class CountingFakeProcess(FakeProcess):
+    def __init__(self, payload, returncode=0):
+        super().__init__(payload, returncode)
+        self.kill_calls = 0
+
+    def kill(self):
+        self.kill_calls += 1
+
+
+class PatternSpotty:
+    """Serves slices of one PCM stream, honouring --start-position like Spotty."""
+
+    def __init__(self, pcm, limits, returncodes):
+        self.pcm = pcm
+        self.limits = list(limits)
+        self.returncodes = list(returncodes)
+        self.calls = []
+
+    def run_spotty(self, args):
+        index = len(self.calls)
+        self.calls.append(list(args))
+        start = 0
+        if "--start-position" in args:
+            start = int(args[args.index("--start-position") + 1]) * 176400
+        limit = self.limits[index]
+        end = len(self.pcm) if limit is None else start + limit
+        return CountingFakeProcess(self.pcm[start:end], self.returncodes[index])
+
+
+def _pattern_pcm(length):
+    import random
+
+    return random.Random(1234).randbytes(length)
+
+
+class SpottyBackpressureTests(unittest.TestCase):
+    HIGH = 128 * 1024
+    LOW = 64 * 1024
+
+    def setUp(self):
+        self.module = import_streamer()
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+
+        self.cache = spotty_cache
+        self.logs = []
+        spotty_cache.log_msg = lambda message, *args, **kwargs: self.logs.append(str(message))
+        spotty_cache._BP_HIGH_BYTES = self.HIGH
+        spotty_cache._BP_LOW_BYTES = self.LOW
+        spotty_cache._WATCHDOG_POLL_SECONDS = 0.005
+        spotty_cache.SpottyDownloader._RETRY_DELAYS = [0.0, 0.0, 0.0]
+        self.downloaders = []
+
+    def tearDown(self):
+        for downloader in self.downloaders:
+            downloader.abort()
+            if downloader.thread is not None:
+                downloader.thread.join(timeout=2.0)
+        self.cache.SpottyCacheManager._instances.clear()
+        self.cache.SpottyCacheManager._recent_tracks.clear()
+        for module_name in ("spotty_audio_streamer", "spotty_cache", "utils", "spotty", "xbmc"):
+            sys.modules.pop(module_name, None)
+
+    def _make(self, spotty, duration=2):
+        wav_header, track_length = self.module.create_wav_header_for_duration(duration)
+        downloader = self.cache.SpottyDownloader(
+            spotty=spotty,
+            track_id="bp-track",
+            duration_sec=duration,
+            start_byte=0,
+            bitrate="320",
+            normalization="off",
+            volume=35,
+            wav_header=wav_header,
+            track_length=track_length,
+        )
+        self.downloaders.append(downloader)
+        return downloader, wav_header, track_length
+
+    @staticmethod
+    def _wait_until(predicate, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.005)
+        return predicate()
+
+    def _wait_paused(self, downloader):
+        def paused():
+            with downloader.cond:
+                return downloader._bp_paused
+
+        self.assertTrue(self._wait_until(paused), "writer never paused")
+
+    @staticmethod
+    def _read_until_finished(downloader, consumer_id, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        with downloader.cond:
+            while (
+                not downloader.is_finished
+                and not downloader.error
+                and time.monotonic() < deadline
+            ):
+                downloader.advance_consumer_locked(consumer_id, downloader.written_bytes)
+                downloader.cond.wait(0.02)
+            downloader.advance_consumer_locked(consumer_id, downloader.written_bytes)
+
+    def test_high_water_mark_stays_below_unread_tail_cap(self):
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+
+        self.assertLess(spotty_cache._BP_LOW_BYTES, spotty_cache._BP_HIGH_BYTES)
+        self.assertLess(
+            spotty_cache._BP_HIGH_BYTES + 1024 * 1024 + 64 * 1024,
+            spotty_cache.SpottyDownloader._MAX_UNREAD_TAIL_BYTES,
+        )
+
+    def test_writer_pauses_at_high_water_with_parked_reader(self):
+        process = ChunkThenBlockingProcess(bytes(1024 * 1024))
+        downloader, wav_header, _ = self._make(SequenceSpotty([process]), duration=30)
+        downloader._consumer_positions[0] = 0
+        downloader.start()
+
+        self._wait_paused(downloader)
+        time.sleep(0.1)
+
+        self.assertTrue(downloader.thread.is_alive())
+        self.assertEqual(0, process.kill_calls)
+        with downloader.cond:
+            self.assertGreaterEqual(downloader.written_bytes, self.HIGH)
+            self.assertLessEqual(downloader.written_bytes, self.HIGH + 64 * 1024)
+            self.assertFalse(downloader.is_finished)
+        self.assertTrue(any("backpressure pause" in line for line in self.logs))
+
+    def test_advancing_reader_resumes_writer_until_finished(self):
+        _, track_length = self.module.create_wav_header_for_duration(2)
+        pcm = _pattern_pcm(track_length - 44)
+        spotty = SequenceSpotty([CountingFakeProcess(pcm)])
+        downloader, wav_header, track_length = self._make(spotty, duration=2)
+        downloader._consumer_positions[0] = 0
+        downloader.start()
+
+        self._wait_paused(downloader)
+        self._read_until_finished(downloader, 0)
+        downloader.thread.join(timeout=2.0)
+
+        self.assertFalse(downloader.thread.is_alive())
+        self.assertTrue(downloader.is_finished)
+        self.assertFalse(downloader.error)
+        self.assertEqual(track_length, downloader.written_bytes)
+        self.assertEqual(
+            (wav_header + pcm)[downloader._trim_offset :],
+            bytes(downloader._buffer),
+        )
+        self.assertGreater(downloader._bp_paused_total, 0.0)
+        self.assertEqual(1, len(spotty.calls))
+        self.assertTrue(any("peak buffer MiB=" in line for line in self.logs))
+
+    def test_watchdog_does_not_kill_backpressure_paused_attempt(self):
+        self.cache._NO_PROGRESS_TIMEOUT_SECONDS = 0.05
+        self.cache._FIRST_REAL_PCM_TIMEOUT_SECONDS = 0.05
+        _, track_length = self.module.create_wav_header_for_duration(2)
+        process = CountingFakeProcess(bytes(track_length - 44))
+        spotty = SequenceSpotty([process])
+        downloader, _, track_length = self._make(spotty, duration=2)
+        downloader._consumer_positions[0] = 0
+        downloader.start()
+
+        self._wait_paused(downloader)
+        # Pause for many no-progress timeouts.
+        time.sleep(0.3)
+        self.assertTrue(downloader.thread.is_alive())
+        self.assertEqual(0, process.kill_calls)
+
+        self._read_until_finished(downloader, 0)
+        downloader.thread.join(timeout=2.0)
+
+        self.assertTrue(downloader.is_finished)
+        self.assertFalse(downloader.error)
+        self.assertEqual(track_length, downloader.written_bytes)
+        self.assertEqual(1, len(spotty.calls))
+        self.assertEqual(0, process.kill_calls)
+
+    def test_leading_reader_drives_writer_and_trim_respects_slowest(self):
+        _, track_length = self.module.create_wav_header_for_duration(4)
+        pcm = _pattern_pcm(track_length - 44)
+        downloader, wav_header, track_length = self._make(
+            SequenceSpotty([CountingFakeProcess(pcm)]), duration=4
+        )
+        slow_id, lead_id = 0, 1
+        downloader._consumer_positions[slow_id] = 0
+        downloader._consumer_positions[lead_id] = 0
+        downloader.start()
+
+        self._read_until_finished(downloader, lead_id)
+        downloader.thread.join(timeout=2.0)
+
+        self.assertTrue(downloader.is_finished)
+        self.assertFalse(downloader.error)
+        # The writer ran far past HIGH relative to the parked slow reader.
+        self.assertEqual(track_length, downloader.written_bytes)
+        self.assertGreater(track_length, 4 * self.HIGH)
+        self.assertLessEqual(downloader._trim_offset, downloader._consumer_positions[slow_id])
+        self.assertEqual(wav_header + pcm, bytes(downloader._buffer))
+
+    def test_prebuffer_without_reader_pauses_with_head_intact(self):
+        process = ChunkThenBlockingProcess(bytes(1024 * 1024))
+        manager = self.cache.SpottyCacheManager
+        manager._instances.clear()
+        manager._recent_tracks.clear()
+        wav_header, track_length = self.module.create_wav_header_for_duration(300)
+
+        def start():
+            return manager.get_or_start(
+                SequenceSpotty([process]),
+                "prebuffer-track",
+                300,
+                0,
+                "320",
+                "off",
+                35,
+                wav_header,
+                track_length,
+                allow_abort_others=False,
+            )
+
+        downloader = start()
+        self.downloaders.append(downloader)
+        self._wait_paused(downloader)
+
+        with downloader.cond:
+            self.assertEqual(0, downloader._trim_offset)
+            self.assertEqual(wav_header, bytes(downloader._buffer[: len(wav_header)]))
+            self.assertEqual(downloader.written_bytes, len(downloader._buffer))
+            self.assertGreaterEqual(downloader.written_bytes, self.HIGH)
+        self.assertEqual(0, process.kill_calls)
+        # A paused-but-untrimmed prebuffer is reused, not discarded/restarted.
+        self.assertIs(downloader, start())
+        self.assertFalse(downloader.aborted)
+
+    def test_abort_wakes_paused_writer_promptly(self):
+        process = CountingFakeProcess(bytes(1024 * 1024))
+        downloader, _, _ = self._make(SequenceSpotty([process]), duration=30)
+        downloader._consumer_positions[0] = 0
+        downloader.start()
+        self._wait_paused(downloader)
+
+        started = time.monotonic()
+        downloader.abort()
+        downloader.thread.join(timeout=0.5)
+
+        self.assertFalse(downloader.thread.is_alive())
+        # The paused wait polls once per second; only notify_all() is this fast.
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_spotty_exit_while_paused_retries_from_offset(self):
+        high = 256 * 1024
+        self.cache._BP_HIGH_BYTES = high
+        self.cache._BP_LOW_BYTES = 128 * 1024
+        self.cache._RETRY_BUDGET_RESET_BYTES = 64 * 1024
+        self.cache.SpottyDownloader._MAX_SESSION_RETRIES = 1
+        _, track_length = self.module.create_wav_header_for_duration(3)
+        pcm = _pattern_pcm(track_length - 44)
+        # Attempt 1 delivers exactly HIGH bytes then exits (rc=1) while the
+        # writer is paused. Attempt 2 makes progress and fails again; only the
+        # progress-based budget reset allows attempt 3 with one retry allowed.
+        spotty = PatternSpotty(pcm, limits=[high, 347888, None], returncodes=[1, 1, 0])
+        downloader, wav_header, track_length = self._make(spotty, duration=3)
+        downloader._consumer_positions[0] = 0
+        downloader.start()
+
+        self._wait_paused(downloader)
+        self.assertTrue(
+            self._wait_until(
+                lambda: any("exited while backpressure-paused" in m for m in self.logs)
+            )
+        )
+        self.assertEqual(1, len(spotty.calls))
+
+        self._read_until_finished(downloader, 0)
+        downloader.thread.join(timeout=2.0)
+
+        self.assertTrue(downloader.is_finished)
+        self.assertFalse(downloader.error)
+        self.assertEqual(3, len(spotty.calls))
+        self.assertNotIn("--start-position", spotty.calls[0])
+        for call, expected in ((spotty.calls[1], "1"), (spotty.calls[2], "2")):
+            self.assertEqual(expected, call[call.index("--start-position") + 1])
+        self.assertEqual(track_length, downloader.written_bytes)
+        self.assertEqual(wav_header + pcm, bytes(downloader._buffer))
+
+    def test_has_recent_progress_while_reader_paused(self):
+        downloader, _, _ = self._make(object(), duration=30)
+        downloader._download_loop = lambda: None
+        downloader.start()
+        with downloader.cond:
+            downloader.real_pcm_bytes = 1024 * 1024
+            downloader.last_progress_monotonic = time.monotonic() - 100.0
+            downloader._bp_paused = True
+            downloader._consumer_positions[0] = 0
+
+        self.assertTrue(downloader.has_recent_progress(1.0))
+        self.assertTrue(downloader.is_reader_paused())
+
+        with downloader.cond:
+            downloader._consumer_positions.clear()
+
+        self.assertFalse(downloader.has_recent_progress(1.0))
+        self.assertFalse(downloader.is_reader_paused())
 
 
 if __name__ == "__main__":

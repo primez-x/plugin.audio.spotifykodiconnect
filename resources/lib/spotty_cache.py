@@ -16,6 +16,18 @@ _STDERR_TAIL_LINES = 32
 _STDERR_LINE_MAX_CHARS = 512
 _STDERR_PENDING_MAX_CHARS = 8192
 
+# Writer-side backpressure.  The writer stops pulling Spotty stdout once it is
+# _BP_HIGH_BYTES ahead of the leading reader (or of the furthest consumed byte
+# when no reader is attached, e.g. a prebuffer) and resumes at _BP_LOW_BYTES.
+# A blocked Spotty that exits/drops its session while paused is recovered by
+# the offset retry (--start-position + byte skip from start_byte+written_bytes).
+_BP_HIGH_BYTES = 16 * 1024 * 1024
+_BP_LOW_BYTES = 12 * 1024 * 1024
+_STDOUT_READ_BYTES = 65536
+# An attempt that delivered at least this much real PCM made real progress;
+# its failure resets the consecutive-failure retry budget.
+_RETRY_BUDGET_RESET_BYTES = 1024 * 1024
+
 _SENSITIVE_DIAGNOSTIC_RE = re.compile(
     r"(?i)(?:"
     r"\b(?:authorization|proxy[_-]?authorization|cookie|set[_-]?cookie)\b\s*:|"
@@ -122,19 +134,24 @@ def _clamp_volume(value: int) -> int:
 class SpottyDownloader:
     """Downloads a single track from spotty into an in-memory buffer in the background."""
 
-    # Reclaim consumed bytes from the buffer head to bound memory WITHOUT ever
-    # stalling the spotty stdout drain.  The v1.0.17 backpressure cap blocked
-    # the writer via cond.wait, which stalled librespot's 64 KB stdout pipe and
-    # truncated streams (spotty session killed mid-track → partial-file skip).
-    # Head-trimming instead releases bytes the consumer has already read; the
-    # writer always pulls from spotty immediately.
+    # Memory is bounded on two sides:
     #
-    # _TRIM_BATCH_BYTES: only reclaim ≥1 MB at a time to amortize the O(n)
+    # * Writer backpressure (_wait_for_room): the writer pauses reading Spotty
+    #   stdout once it is _BP_HIGH_BYTES ahead of the leading reader and
+    #   resumes at _BP_LOW_BYTES.  The v1.0.17 cap was reverted because a
+    #   blocked Spotty that exited early truncated the track; since attempts
+    #   now resume from start_byte + written_bytes (--start-position + byte
+    #   skip), a Spotty that dies while paused is simply restarted.
+    # * Head trimming: bytes every active reader has already consumed are
+    #   reclaimed in batched, frame-aligned slices (never past the slowest
+    #   reader).
+    #
+    # _TRIM_BATCH_BYTES: only reclaim >=1 MB at a time to amortize the O(n)
     # bytearray memmove.
-    # _MAX_UNREAD_TAIL_BYTES: safety valve — if the writer drifts >~2 min of
-    # PCM ahead of every consumer (stalled consumer / pathological burst), the
-    # oldest unread bytes are dropped.  Late range requests for dropped bytes
-    # fall through to get_or_start (the existing seek path).
+    # _MAX_UNREAD_TAIL_BYTES: insurance only -- with no reader attached the
+    # oldest bytes beyond this cap are dropped.  Backpressure keeps the buffer
+    # below it (see the import-time assertion after this class).  Late range
+    # requests for dropped bytes fall through to get_or_start (the seek path).
     _TRIM_BATCH_BYTES = 1024 * 1024
     _MAX_UNREAD_TAIL_BYTES = 24 * 1024 * 1024
 
@@ -179,6 +196,10 @@ class SpottyDownloader:
         self.aborted = False
         self.process = None
         self.thread = None
+        # Backpressure diagnostics/state (guarded by self.cond).
+        self._bp_paused = False
+        self._bp_paused_total = 0.0
+        self._peak_buffer_bytes = 0
 
     def start(self):
         with self.cond:
@@ -206,10 +227,99 @@ class SpottyDownloader:
                 return False
             if self.is_finished:
                 return True
+            if self._bp_paused and self._consumer_positions:
+                # Reader-limited, not dead: the writer is deliberately idle
+                # until an attached reader consumes more of the buffer.
+                return True
             last_progress = self.last_progress_monotonic
         if last_progress is None:
             return False
         return (time.monotonic() - last_progress) <= max(0.0, float(max_idle_seconds))
+
+    def is_reader_paused(self) -> bool:
+        """True while the writer is backpressure-paused by an attached reader."""
+        with self.cond:
+            return (
+                self._bp_paused
+                and bool(self._consumer_positions)
+                and not self.error
+                and not self.aborted
+            )
+
+    def _bp_reference_locked(self) -> int:
+        """Position the writer's lead is measured from.  Caller holds self.cond.
+
+        The LEADING reader drives the writer so one parked range reader cannot
+        stall playback; trimming still never passes the slowest reader.  With
+        no reader attached (prebuffer, or between Kodi range requests) the
+        furthest consumed byte is used (0 for an unread prebuffer).
+        """
+        if self._consumer_positions:
+            return max(self._consumer_positions.values())
+        return self._consumed_pos
+
+    def _bytes_ahead_locked(self) -> int:
+        return self.written_bytes - self._bp_reference_locked()
+
+    def advance_consumer_locked(self, consumer_id, position: int) -> None:
+        """Record that a reader consumed up to *position*.  Caller holds self.cond.
+
+        Updates the furthest-consumed mark and the reader's own position,
+        reclaims the buffer head and wakes a backpressure-paused writer once
+        it has dropped to the low-water mark.
+        """
+        if position > self._consumed_pos:
+            self._consumed_pos = position
+        if consumer_id in self._consumer_positions:
+            if position > self._consumer_positions[consumer_id]:
+                self._consumer_positions[consumer_id] = position
+        self._trim_head_locked()
+        if self._bp_paused and self._bytes_ahead_locked() <= _BP_LOW_BYTES:
+            self.cond.notify_all()
+
+    def _wait_for_room(self, attempt_state, attempt_state_lock) -> None:
+        """Block the writer while it is too far ahead of the readers.
+
+        Called before each stdout read (never inside the pcm_skip discard
+        loop).  While paused, the attempt watchdog ignores the lack of PCM
+        output; Spotty simply blocks on its full stdout pipe.  If Spotty exits
+        meanwhile, the next read returns EOF and the offset retry restarts it.
+        """
+        with self.cond:
+            if self.aborted:
+                return
+            ahead = self._bytes_ahead_locked()
+            if ahead < _BP_HIGH_BYTES:
+                return
+            readers = len(self._consumer_positions)
+            self._bp_paused = True
+        with attempt_state_lock:
+            attempt_state["bp_paused"] = True
+        paused_at = time.monotonic()
+        log_msg(
+            f"Spotty backpressure pause track={self.track_id} ahead={ahead} readers={readers}",
+            LOGDEBUG,
+        )
+        with self.cond:
+            try:
+                while not self.aborted and self._bytes_ahead_locked() > _BP_LOW_BYTES:
+                    self.cond.wait(1.0)
+            finally:
+                self._bp_paused = False
+                paused_for = time.monotonic() - paused_at
+                self._bp_paused_total += paused_for
+        with attempt_state_lock:
+            # Restart both watchdog clocks: a retry attempt can pause before
+            # its first read, so its first-PCM window must not include the
+            # time spent waiting for readers.
+            now = time.monotonic()
+            attempt_state["bp_paused"] = False
+            attempt_state["last_output_at"] = now
+            attempt_state["started_at"] = now
+        log_msg(
+            f"Spotty backpressure resume track={self.track_id} after {paused_for:.1f}s",
+            LOGDEBUG,
+        )
 
     def wait_for_real_pcm(self, target_real_pcm_bytes: int, timeout: float = None) -> bool:
         """Wait for actual Spotty PCM, excluding the generated WAV header."""
@@ -275,7 +385,14 @@ class SpottyDownloader:
     def _download_loop(self):
         log_msg(f"Starting background download for {self.track_id} at {self.start_byte}")
 
-        for attempt in range(self._MAX_SESSION_RETRIES + 1):
+        # Consecutive-failure budget: an attempt that delivered real progress
+        # (>= _RETRY_BUDGET_RESET_BYTES of PCM) resets it, so a long track
+        # whose paused Spotty is restarted several times is not limited to
+        # _MAX_SESSION_RETRIES restarts in total.
+        attempt = -1
+        failures = 0
+        while True:
+            attempt += 1
             if self.aborted:
                 return
 
@@ -289,6 +406,7 @@ class SpottyDownloader:
                 "last_output_at": None,
                 "has_real_pcm": False,
                 "timeout_reason": "",
+                "bp_paused": False,
             }
             watchdog_thread = None
             stderr_tail = None
@@ -311,6 +429,7 @@ class SpottyDownloader:
                 # This watchdog kills only this attempt's process, unblocking the
                 # read without allowing a stale attempt to kill a newer retry.
                 def _watch_attempt(attempt_process=attempt_process):
+                    exit_logged = False
                     while not attempt_done.wait(_WATCHDOG_POLL_SECONDS):
                         if self.aborted:
                             return
@@ -318,6 +437,30 @@ class SpottyDownloader:
                         with attempt_state_lock:
                             if attempt_state["timeout_reason"]:
                                 return
+                            bp_paused = attempt_state["bp_paused"]
+                        if bp_paused:
+                            # Reader-limited pause: Spotty is blocked on a full
+                            # stdout pipe by design. The writer discovers an
+                            # exit (EOF) on resume and the offset retry
+                            # restarts Spotty, so never kill here.
+                            if not exit_logged:
+                                try:
+                                    exited = attempt_process.poll() is not None
+                                except Exception:
+                                    exited = False
+                                if exited:
+                                    exit_logged = True
+                                    log_msg(
+                                        f"Spotty exited while backpressure-paused for "
+                                        f"{self.track_id}; will restart on resume.",
+                                        LOGDEBUG,
+                                    )
+                            continue
+                        with attempt_state_lock:
+                            if attempt_state["timeout_reason"]:
+                                return
+                            if attempt_state["bp_paused"]:
+                                continue
                             if attempt_state["has_real_pcm"]:
                                 last_output = attempt_state["last_output_at"] or now
                                 elapsed = now - last_output
@@ -354,7 +497,10 @@ class SpottyDownloader:
                             attempt_state["last_output_at"] = time.monotonic()
 
                 while not self.aborted:
-                    chunk = process.stdout.read(65536)
+                    self._wait_for_room(attempt_state, attempt_state_lock)
+                    if self.aborted:
+                        break
+                    chunk = process.stdout.read(_STDOUT_READ_BYTES)
                     if not chunk:
                         break
                     if self.aborted:
@@ -367,6 +513,8 @@ class SpottyDownloader:
                         self._buffer.extend(chunk)
                         self.written_bytes += len(chunk)
                         self._record_real_pcm_locked(len(chunk))
+                        if len(self._buffer) > self._peak_buffer_bytes:
+                            self._peak_buffer_bytes = len(self._buffer)
                         self._trim_head_locked()
                         self.cond.notify_all()
 
@@ -422,8 +570,16 @@ class SpottyDownloader:
                     f"{diagnostics}",
                     LOGWARNING,
                 )
-            if retryable_finish and attempt < self._MAX_SESSION_RETRIES:
-                delay = self._RETRY_DELAYS[min(attempt, len(self._RETRY_DELAYS) - 1)]
+            if retryable_finish and failures and pcm_bytes_read >= _RETRY_BUDGET_RESET_BYTES:
+                log_msg(
+                    f"Spotty attempt {attempt + 1} for {self.track_id} delivered "
+                    f"{pcm_bytes_read} PCM bytes; resetting retry budget.",
+                    LOGDEBUG,
+                )
+                failures = 0
+            if retryable_finish and failures < self._MAX_SESSION_RETRIES:
+                delay = self._RETRY_DELAYS[min(failures, len(self._RETRY_DELAYS) - 1)]
+                failures += 1
                 if timeout_reason:
                     reason = timeout_reason
                 elif attempt_exception is not None:
@@ -437,7 +593,7 @@ class SpottyDownloader:
                 log_msg(
                     f"Spotty {reason} for {self.track_id} "
                     f"(rc={rc}, transient stream failure). "
-                    f"Retry {attempt + 1}/{self._MAX_SESSION_RETRIES} after {delay}s.",
+                    f"Retry {failures}/{self._MAX_SESSION_RETRIES} after {delay}s.",
                     LOGWARNING,
                 )
                 # Use condition wait so abort() can interrupt the delay.
@@ -499,8 +655,13 @@ class SpottyDownloader:
                     self.process = None
                 self.is_finished = True
                 self.cond.notify_all()
+                peak_mib = self._peak_buffer_bytes / (1024 * 1024)
+                paused_total = self._bp_paused_total
                 if not self.error:
-                    log_msg(f"Finished background download for {self.track_id}")
+                    log_msg(
+                        f"Finished background download for {self.track_id} "
+                        f"(peak buffer MiB={peak_mib:.1f}, paused_total={paused_total:.1f}s)"
+                    )
             return
 
     def abort(self):
@@ -516,10 +677,10 @@ class SpottyDownloader:
     def _trim_head_locked(self):
         """Drop consumed/surplus bytes from the buffer head.  Caller holds self.cond.
 
-        Never blocks — the writer always drains spotty stdout immediately.
-        Reclaims bytes every consumer has already read, in batched frame-aligned
-        slices to amortize the bytearray memmove.  The unread-tail cap is a
-        safety valve for stalled-consumer scenarios.
+        Never blocks (writer pacing is _wait_for_room's job).  Reclaims bytes
+        every active consumer has already read, in batched frame-aligned slices
+        to amortize the bytearray memmove.  The unread-tail cap is insurance
+        for the no-reader case; backpressure keeps the buffer below it.
         """
         safe_consumed_pos = (
             min(self._consumer_positions.values())
@@ -567,6 +728,17 @@ class SpottyDownloader:
                 else:
                     self.cond.wait(1.0)
             return self.written_bytes >= target_bytes or self.is_finished
+
+
+# With no reader attached the buffer holds at most HIGH (+ one stdout read)
+# unread bytes plus < one trim batch of consumed bytes, so the insurance cap
+# must never be what bounds a paused prebuffer (it would drop its head and
+# force a discard/restart when playback begins).
+assert (
+    _BP_LOW_BYTES < _BP_HIGH_BYTES
+    and _BP_HIGH_BYTES + SpottyDownloader._TRIM_BATCH_BYTES + _STDOUT_READ_BYTES
+    < SpottyDownloader._MAX_UNREAD_TAIL_BYTES
+), "backpressure high-water mark must stay below the unread-tail cap"
 
 
 class SpottyCacheManager:

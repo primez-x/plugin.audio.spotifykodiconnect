@@ -344,6 +344,26 @@ class HTTPSpottyAudioStreamer:
         if finished_cleanly:
             finished_cleanly = self._downloader_has_real_pcm(downloader)
 
+        reader_paused = False
+        if not finished_cleanly:
+            # With writer backpressure a healthy downloader no longer finishes
+            # early in the track: it pauses ~16 MiB ahead of its reader and only
+            # completes during the last ~70-95 s of playback.  Before
+            # backpressure, a mid-track request for another track (manual skip
+            # while Kodi still reports the old track) almost always found the
+            # old download complete and was allowed through.  Keep that
+            # behaviour: a downloader paused by an attached reader is healthy
+            # and is safe to hand off.  Kodi's natural QueueNextFileEx preload
+            # (~5 s before the end) still finds the download complete.
+            is_reader_paused = getattr(downloader, "is_reader_paused", None)
+            if callable(is_reader_paused):
+                try:
+                    reader_paused = bool(is_reader_paused())
+                except Exception:
+                    reader_paused = False
+            if reader_paused:
+                reader_paused = self._downloader_has_real_pcm(downloader)
+
         if finished_cleanly:
             log_msg(
                 f"QueueNextFileEx detected: {previous_track_id} download complete, "
@@ -351,6 +371,13 @@ class HTTPSpottyAudioStreamer:
                 f"transition to {next_track_id}.",
                 LOGDEBUG,
             )
+        elif reader_paused:
+            log_msg(
+                f"QueueNextFileEx handoff allowed: {previous_track_id} downloader is "
+                f"healthy and paused by its reader (backpressure) before {next_track_id}.",
+                LOGDEBUG,
+            )
+            return True
         else:
             log_msg(
                 f"QueueNextFileEx handoff deferred without waiting: {previous_track_id} "
