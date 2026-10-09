@@ -8,6 +8,12 @@ import test_playlist_fastpath as fp
 
 class RecordingDialog:
     notifications = []
+    yesno_answer = False
+    yesno_calls = []
+
+    def yesno(self, *args, **kwargs):
+        RecordingDialog.yesno_calls.append(args)
+        return RecordingDialog.yesno_answer
 
     def notification(self, *args, **kwargs):
         RecordingDialog.notifications.append(args)
@@ -21,6 +27,8 @@ class PluginAuthGatingTests(unittest.TestCase):
         self.pc = fp.import_plugin_content()
         fp.FakeWindow.windows.clear()
         RecordingDialog.notifications = []
+        RecordingDialog.yesno_answer = False
+        RecordingDialog.yesno_calls = []
         self.pc.xbmcgui.Dialog = RecordingDialog
         self.end_calls = []
         self.pc.xbmcplugin.endOfDirectory = lambda *a, **kw: self.end_calls.append(kw)
@@ -42,12 +50,30 @@ class PluginAuthGatingTests(unittest.TestCase):
         return content
 
     def test_credentials_exist_notifies_connecting_without_pairing(self):
-        content = self.build(creds=True)
+        content = self.build(action="browse_main_library", creds=True)
         self.assertFalse(content.check_auth_and_refresh_spotipy())
         self.assertEqual([], self.auth_calls)
         self.assertEqual(1, len(RecordingDialog.notifications))
         self.assertIn(f"str-{self.pc.SPOTIFY_CONNECTING_STR_ID}", RecordingDialog.notifications[0])
         self.assertEqual([{"handle": 1, "succeeded": False}], self.end_calls)
+
+    def test_root_menu_with_credentials_asks_before_pairing(self):
+        content = self.build(creds=True)
+        self.assertFalse(content.check_auth_and_refresh_spotipy())
+        self.assertEqual(1, len(RecordingDialog.yesno_calls))
+        self.assertEqual([], self.auth_calls)
+        self.assertEqual([{"handle": 1, "succeeded": False}], self.end_calls)
+
+    def test_root_menu_with_credentials_pairs_when_confirmed(self):
+        RecordingDialog.yesno_answer = True
+        content = self.build(creds=True)
+        content.check_auth_and_refresh_spotipy()
+        self.assertEqual([1], self.auth_calls)
+
+    def test_widget_with_credentials_never_asks(self):
+        content = self.build(creds=True, folder="", is_media=False)
+        content.check_auth_and_refresh_spotipy()
+        self.assertEqual([], RecordingDialog.yesno_calls)
 
     def test_widget_without_credentials_is_silent(self):
         content = self.build(creds=False, folder="", is_media=False)

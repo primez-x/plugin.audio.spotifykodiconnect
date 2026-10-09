@@ -361,3 +361,7 @@ msgstr ""
 msgctxt "#11150"
 msgid "Spotify is connecting…"
 msgstr ""
+
+msgctxt "#11151"
+msgid "Spotify is still connecting. If this keeps happening your login may have expired. Authenticate again now?"
+msgstr ""
