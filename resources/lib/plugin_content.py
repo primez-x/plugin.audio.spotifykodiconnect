@@ -304,6 +304,14 @@ class PluginContent:
             self.authenticate_plugin_after_login_failure()
             if self.__spotipy is not None:
                 return True
+        elif interactive and not self.__action:
+            # Root menu: it hosts the only "Authenticate" entry, so a revoked
+            # login must not lock the user out. Ask instead of forcing a re-pair.
+            log_msg("No Spotify auth token yet at root menu; offering re-auth.", LOGINFO)
+            if self.__confirm_reauthenticate():
+                self.authenticate_plugin_after_login_failure()
+                if self.__spotipy is not None:
+                    return True
         elif interactive:
             log_msg("No Spotify auth token yet; service is still connecting.", LOGINFO)
             self.__notify(self.__addon.getLocalizedString(SPOTIFY_CONNECTING_STR_ID))
@@ -345,6 +353,18 @@ class PluginContent:
         except Exception as exc:
             log_exception(exc, "interactive request detection")
         return True
+
+    def __confirm_reauthenticate(self) -> bool:
+        try:
+            return bool(
+                xbmcgui.Dialog().yesno(
+                    self.__addon.getAddonInfo("name"),
+                    self.__addon.getLocalizedString(SPOTIFY_REAUTH_PROMPT_STR_ID),
+                )
+            )
+        except Exception as exc:
+            log_exception(exc, "re-authenticate prompt")
+            return False
 
     def __notify(self, message: str) -> None:
         try:
