@@ -6,7 +6,7 @@ We serve standard HTTP range semantics so Kodi's cache/buffer settings take effe
 import threading
 import time
 import uuid
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import bottle
 import spotipy
@@ -257,6 +257,52 @@ class HTTPSpottyAudioStreamer:
             return max(0, int(start)) if start else 0
         except (ValueError, IndexError):
             return 0
+
+    @staticmethod
+    def _parse_byte_range(request_range: str, file_size: int) -> Optional[Tuple[int, int]]:
+        """Parse a single ``bytes=`` range into ``(begin, end_exclusive)``.
+
+        The last-byte-pos is inclusive (RFC 7233): ``bytes=0-99`` is 100 bytes.
+        Open-ended ``bytes=N-`` (what Kodi normally sends) runs to the end.
+        Returns None when unsatisfiable (first-byte-pos >= size, or an empty
+        suffix). Malformed ranges fall back to the whole file.
+        """
+        try:
+            spec = (request_range or "").strip().split("bytes=", 1)[1]
+            start_s, end_s = (part.strip() for part in spec.split("-", 1))
+            if not start_s:
+                if not end_s.isdigit():
+                    raise ValueError(request_range)
+                suffix = int(end_s)
+                if suffix <= 0 or file_size <= 0:
+                    return None
+                return max(0, file_size - suffix), file_size
+            range_begin = int(start_s)
+            if range_begin < 0:
+                raise ValueError(request_range)
+            if range_begin >= file_size:
+                return None
+            if end_s.isdigit():
+                last_byte = int(end_s)
+                if last_byte < range_begin:
+                    raise ValueError(request_range)
+                return range_begin, min(last_byte + 1, file_size)
+            return range_begin, file_size
+        except (ValueError, IndexError):
+            return 0, file_size
+
+    @staticmethod
+    def _range_not_satisfiable_response(request_range: str, file_size: int):
+        bottle.response.status = 416
+        bottle.response.content_type = "text/plain"
+        bottle.response.content_length = 0
+        bottle.response.headers["Accept-Ranges"] = "bytes"
+        bottle.response.headers["Content-Range"] = f"bytes */{file_size}"
+        log_msg(
+            f"Range '{request_range}' not satisfiable for {file_size} bytes; returning 416.",
+            LOGDEBUG,
+        )
+        return ""
 
     @staticmethod
     def _downloader_has_real_pcm(downloader) -> bool:
@@ -956,22 +1002,20 @@ class HTTPSpottyAudioStreamer:
             log_msg(f"Full request, content length = {range_end - range_begin}.", LOGDEBUG)
         else:
             status = "206 Partial Content"
-            try:
-                parts = bottle.request.headers["Range"].strip().split("bytes=", 1)[1].split("-", 1)
-                start_s = parts[0].strip() if parts else ""
-                end_s = parts[1].strip() if len(parts) > 1 else ""
-                if not start_s and end_s.isdigit():
-                    suffix = int(end_s)
-                    range_begin = max(0, file_size - suffix)
-                    range_end = file_size
-                else:
-                    range_begin = int(start_s) if start_s else 0
-                    range_end = int(end_s) if end_s.isdigit() else file_size
-                range_begin = max(0, min(range_begin, file_size))
-                range_end = max(range_begin, min(range_end, file_size))
-            except (ValueError, IndexError, KeyError):
-                range_begin = 0
-                range_end = file_size
+            byte_range = self._parse_byte_range(request_range, file_size)
+            if byte_range is None:
+                if is_new_track:
+                    self._abort_initialization(
+                        track_id or "",
+                        request_id or "",
+                        previous_track_id,
+                        previous_request_id,
+                        previous_was_streaming,
+                        previous_stream_spec,
+                        previous_stream_preserved,
+                    )
+                return self._range_not_satisfiable_response(request_range, file_size)
+            range_begin, range_end = byte_range
             # Content-Range end is inclusive — use range_end - 1
             content_range = f"bytes {range_begin}-{range_end - 1}/{file_size}"
             if not is_new_track and range_begin > 0:

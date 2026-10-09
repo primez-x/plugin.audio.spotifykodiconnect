@@ -137,6 +137,8 @@ def install_stubs(info_labels, settings=None):
     utils.PROXY_HOST = "127.0.0.1"
     utils.PROXY_PORT = 52309
     utils.get_cached_auth_token = lambda: None
+    utils.clear_expired_cached_auth_token = lambda now=None: False
+    utils.set_auth_renew_failing = lambda failures: None
     utils.install_spotipy_rate_limit_hook = lambda module: None
     utils.is_rate_limited = lambda now=None: False
     utils.log_exception = lambda *args, **kwargs: None
@@ -354,6 +356,61 @@ class TokenRenewBackoffTests(unittest.TestCase):
             import time as _time
 
             main_service.time.time = _time.time
+
+    def test_failed_renewals_are_published_and_cleared_on_success(self):
+        main_service = import_main_service({})
+        published = []
+        main_service.utils.set_auth_renew_failing = published.append
+        service = object.__new__(main_service.MainService)
+        service._MainService__renew_failures = 0
+        service._MainService__next_renew_attempt_at = 0.0
+        service._MainService__welcome_msg = False
+
+        class _FailingAuth:
+            def renew_token(self):
+                raise RuntimeError("revoked")
+
+        class _OkAuth:
+            def renew_token(self):
+                pass
+
+        service._MainService__spotty_auth = _FailingAuth()
+        service._MainService__renew_token()
+        service._MainService__renew_token()
+        service._MainService__spotty_auth = _OkAuth()
+        main_service.utils.get_cached_auth_token_expires_at = lambda: "4600"
+        service._MainService__renew_token()
+        self.assertEqual([1, 2, 0], published)
+
+    def test_expired_token_is_cleared_without_touching_renewal_backoff(self):
+        main_service = import_main_service({})
+        cleared = []
+        main_service.utils.clear_expired_cached_auth_token = lambda now=None: (
+            cleared.append(1) or True
+        )
+        service = object.__new__(main_service.MainService)
+        service._MainService__auth_token_expires_at = "1000"
+        service._MainService__renew_failures = 3
+        service._MainService__next_renew_attempt_at = 5000.0
+
+        service._MainService__drop_expired_token()
+
+        self.assertEqual([1], cleared)
+        # The renewal loop still sees the old expiry (so it renews once the
+        # back-off window ends) and the back-off schedule is unchanged.
+        self.assertEqual("1000", service._MainService__auth_token_expires_at)
+        self.assertEqual(3, service._MainService__renew_failures)
+        self.assertEqual(5000.0, service._MainService__next_renew_attempt_at)
+
+    def test_drop_expired_token_survives_helper_errors(self):
+        main_service = import_main_service({})
+
+        def boom(now=None):
+            raise RuntimeError("window gone")
+
+        main_service.utils.clear_expired_cached_auth_token = boom
+        service = object.__new__(main_service.MainService)
+        service._MainService__drop_expired_token()
 
 
 class SpotifyAutoplayGatingTests(unittest.TestCase):

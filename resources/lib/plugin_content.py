@@ -289,12 +289,16 @@ class PluginContent:
         comes from an interactive foreground listing. If credentials exist the
         service is merely (re)connecting, so we notify and end the listing
         instead of forcing a re-pair. Widgets never get dialogs.
+
+        The token is read once without waiting: a missing or expired token
+        ends widget requests immediately instead of blocking every home
+        widget (and silently returning 401-empty listings after expiry).
         """
         if self.__action == "authenticate_plugin_request":
             # Explicit user request: the handler runs the pairing flow itself.
             return True
 
-        auth_token: str = utils.get_cached_auth_token()
+        auth_token: str = utils.get_valid_cached_auth_token()
         if auth_token:
             self.init_spotipy(auth_token)
             return True
@@ -304,9 +308,11 @@ class PluginContent:
             self.authenticate_plugin_after_login_failure()
             if self.__spotipy is not None:
                 return True
-        elif interactive and not self.__action:
+        elif interactive and not self.__action and utils.auth_renew_failing():
             # Root menu: it hosts the only "Authenticate" entry, so a revoked
-            # login must not lock the user out. Ask instead of forcing a re-pair.
+            # login must not lock the user out. Ask instead of forcing a re-pair,
+            # and only once the service has actually failed a renewal (not
+            # while it is still connecting, e.g. right after boot).
             log_msg("No Spotify auth token yet at root menu; offering re-auth.", LOGINFO)
             if self.__confirm_reauthenticate():
                 self.authenticate_plugin_after_login_failure()
@@ -387,7 +393,7 @@ class PluginContent:
             log_exception(exc, "endOfDirectory")
 
     def refresh_spotipy(self):
-        auth_token: str = utils.get_cached_auth_token()
+        auth_token: str = utils.get_valid_cached_auth_token()
         if not auth_token:
             xbmcplugin.endOfDirectory(handle=self.__addon_handle)
             return

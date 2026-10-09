@@ -517,6 +517,19 @@ class RenewalRobustnessTests(unittest.TestCase):
         self.assertEqual([True], seen)
         self.assertEqual("new", self.cached["token"])
 
+    def test_renew_publishes_expiry_before_token(self):
+        order = []
+        spotty_auth.utils.cache_auth_token = lambda v: order.append(("token", v))
+        spotty_auth.utils.cache_auth_token_expires_at = lambda v: order.append(("expires", v))
+        self.auth._SpottyAuth__get_retry_auth_token = lambda: {  # type: ignore
+            "access_token": "new",
+            "expires_at": 12345,
+        }
+        self.auth.renew_token()
+        # A reader (or the service's expired-token sweep) must never see the
+        # new token paired with the previous, already-expired expiry.
+        self.assertEqual([("expires", "12345"), ("token", "new")], order)
+
     def test_restore_skipped_while_zeroconf_pairing(self):
         with open(self.spotty.cred_backup, "w") as f:
             f.write("{}")
