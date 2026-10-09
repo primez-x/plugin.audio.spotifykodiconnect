@@ -62,6 +62,8 @@ PREBUFFER_RELEASE_DELAY_MIN = 2.0
 PREBUFFER_RELEASE_DELAY_MAX = 15.0
 PREBUFFER_RELEASE_DELAY_STEP_UP = 2.0
 PREBUFFER_RELEASE_DELAY_STEP_DOWN = 0.5
+TOKEN_RENEW_BACKOFF_INITIAL_SECS = 5.0
+TOKEN_RENEW_BACKOFF_MAX_SECS = 300.0
 
 # Artist fanart for Music OSD (single largest image URL; no rotation – Spotify only provides same image in multiple sizes)
 _artist_fanart_urls = []  # type: list
@@ -366,6 +368,10 @@ class MainService:
         self.__spotty_auth.restore_credentials_from_backup_if_needed()
         self.__auth_token_expires_at = ""
         self.__welcome_msg = True
+        # Exponential back-off across service loop iterations for failed
+        # token renewals (5s doubling to 300s, reset on success).
+        self.__renew_failures = 0
+        self.__next_renew_attempt_at = 0.0
 
         normalization_setting = (
             (SPOTIFY_ADDON.getSetting("spotify_normalization") or "auto").strip().lower()
@@ -801,7 +807,14 @@ class MainService:
                 self.__prebuffer_manager.cancel_prebuffer()
             self.__prebuffer_enabled = prebuffer_enabled_now
 
-            if self.__auth_token_expires_at == "":
+            if self.__auth_token_expires_at == "" and utils.cached_auth_token_is_unexpired():
+                # A token appeared from elsewhere (e.g. the plugin finished a
+                # zeroconf pairing) or survived a failed renewal: adopt it.
+                # Back-off state is left alone: only a successful renewal resets it.
+                self.__auth_token_expires_at = utils.peek_cached_auth_token_expires_at()
+            if time.time() < self.__next_renew_attempt_at:
+                pass  # Backing off after a failed renewal.
+            elif self.__auth_token_expires_at == "":
                 log_msg("Spotify not yet authorized. Refreshing auth token now.")
                 self.__renew_token()
             elif (int(self.__auth_token_expires_at) - 60) <= int(time.time()):
@@ -842,12 +855,24 @@ class MainService:
         try:
             self.__spotty_auth.renew_token()
             self.__auth_token_expires_at = utils.get_cached_auth_token_expires_at()
+            self.__renew_failures = 0
+            self.__next_renew_attempt_at = 0.0
             if self.__welcome_msg:
                 self.__welcome_msg = False
                 self.__show_welcome_notification()
         except Exception as exc:
             log_exception(exc, "Could not renew Spotify auth token")
             self.__auth_token_expires_at = ""
+            delay = self.compute_renew_backoff(self.__renew_failures)
+            self.__renew_failures += 1
+            self.__next_renew_attempt_at = time.time() + delay
+            log_msg(f"Next Spotify token renewal attempt in {delay:.0f}s.", LOGWARNING)
+
+    @staticmethod
+    def compute_renew_backoff(previous_failures: int) -> float:
+        """5s, 10s, 20s ... capped at 300s."""
+        exponent = min(max(int(previous_failures), 0), 16)
+        return min(TOKEN_RENEW_BACKOFF_MAX_SECS, TOKEN_RENEW_BACKOFF_INITIAL_SECS * (2**exponent))
 
     def __show_welcome_notification(self) -> None:
         try:

@@ -33,6 +33,11 @@ PROXY_HOST = "127.0.0.1"
 
 KODI_PROPERTY_SPOTIFY_AUTH_TOKEN = "spotifykodiconnect-auth-token"
 KODI_PROPERTY_AUTH_TOKEN_EXPIRES_AT = "spotifykodiconnect-auth-token-expires-at"
+# Epoch seconds at which an in-progress zeroconf pairing was started by the
+# plugin. While set (and not stale) the service must not restore
+# credentials.json from the .bak the pairing flow just moved aside.
+KODI_PROPERTY_ZEROCONF_PAIRING_SINCE = "Spotify.ZeroconfPairingSince"
+ZEROCONF_PAIRING_STALE_SECS = 600
 
 
 def _debug_logging_enabled() -> bool:
@@ -169,6 +174,42 @@ def cache_auth_token_expires_at(auth_token: str) -> None:
 
 def get_cached_auth_token_expires_at() -> str:
     return get_cached_value_from_kodi(KODI_PROPERTY_AUTH_TOKEN_EXPIRES_AT)
+
+
+def peek_cached_auth_token_expires_at() -> str:
+    """Non-blocking read of the cached token expiry ("" when unset)."""
+    return xbmcgui.Window(ADDON_WINDOW_ID).getProperty(KODI_PROPERTY_AUTH_TOKEN_EXPIRES_AT) or ""
+
+
+def cached_auth_token_is_unexpired(now: float = None) -> bool:
+    """True when a cached token exists and its expiry is still in the future."""
+    win = xbmcgui.Window(ADDON_WINDOW_ID)
+    if not win.getProperty(KODI_PROPERTY_SPOTIFY_AUTH_TOKEN):
+        return False
+    try:
+        expires_at = int(float(win.getProperty(KODI_PROPERTY_AUTH_TOKEN_EXPIRES_AT) or 0))
+    except (TypeError, ValueError):
+        return False
+    return expires_at > (time.time() if now is None else now)
+
+
+def mark_zeroconf_pairing(active: bool) -> None:
+    win = xbmcgui.Window(ADDON_WINDOW_ID)
+    if active:
+        win.setProperty(KODI_PROPERTY_ZEROCONF_PAIRING_SINCE, str(int(time.time())))
+    else:
+        win.clearProperty(KODI_PROPERTY_ZEROCONF_PAIRING_SINCE)
+
+
+def zeroconf_pairing_in_progress(now: float = None) -> bool:
+    value = xbmcgui.Window(ADDON_WINDOW_ID).getProperty(KODI_PROPERTY_ZEROCONF_PAIRING_SINCE)
+    if not value:
+        return False
+    try:
+        started = float(value)
+    except (TypeError, ValueError):
+        return False
+    return ((time.time() if now is None else now) - started) < ZEROCONF_PAIRING_STALE_SECS
 
 
 def cache_value_in_kodi(kodi_property_id: str, value: Any):

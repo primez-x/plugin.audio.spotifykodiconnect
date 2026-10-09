@@ -216,9 +216,10 @@ class PluginContent:
             # on ARM Linux, with no timeout — can hang on slow devices).
             self.__spotty: Optional[spotty.Spotty] = None
 
-            self.check_auth_and_refresh_spotipy()
-
             self.parse_params()
+
+            if not self.check_auth_and_refresh_spotipy():
+                return
             self.__navigation_token = str(time.time())
             self.__win.setProperty(PRECACHE_NAVIGATION_TOKEN_PROP, self.__navigation_token)
 
@@ -241,13 +242,90 @@ class PluginContent:
             log_exception(exc, "PluginContent init error")
             xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
-    def check_auth_and_refresh_spotipy(self):
+    def check_auth_and_refresh_spotipy(self) -> bool:
+        """Ensure a Spotify client exists. Returns False when the request was ended.
+
+        Zeroconf pairing (which moves credentials.json aside) is only started
+        automatically when no stored credentials exist at all and the request
+        comes from an interactive foreground listing. If credentials exist the
+        service is merely (re)connecting, so we notify and end the listing
+        instead of forcing a re-pair. Widgets never get dialogs.
+        """
+        if self.__action == "authenticate_plugin_request":
+            # Explicit user request: the handler runs the pairing flow itself.
+            return True
+
         auth_token: str = utils.get_cached_auth_token()
         if auth_token:
             self.init_spotipy(auth_token)
-            return
+            return True
 
-        self.authenticate_plugin_after_login_failure()
+        interactive = not self.__is_non_interactive_request()
+        if interactive and not self.__has_stored_credentials():
+            self.authenticate_plugin_after_login_failure()
+            if self.__spotipy is not None:
+                return True
+        elif interactive:
+            log_msg("No Spotify auth token yet; service is still connecting.", LOGINFO)
+            self.__notify(self.__addon.getLocalizedString(SPOTIFY_CONNECTING_STR_ID))
+        else:
+            log_msg("No Spotify auth token yet; ending non-interactive request quietly.")
+
+        self.__end_directory(succeeded=False)
+        return False
+
+    @staticmethod
+    def __has_stored_credentials() -> bool:
+        try:
+            # Path helpers only; no SpottyHelper binary self-test needed.
+            return SpottyAuth(spotty.Spotty()).has_stored_credentials()
+        except Exception as exc:
+            log_exception(exc, "stored credentials check")
+            # Unknown: assume they exist so we never trigger a destructive re-pair.
+            return True
+
+    def __is_non_interactive_request(self) -> bool:
+        """Best-effort widget / background invocation detection.
+
+        Kodi gives no explicit widget flag. A request is treated as
+        interactive only when it has a directory handle and either Kodi is
+        already browsing this add-on or a media window (Music/Videos nav) is
+        active. Skin widgets are typically resolved from Home or custom
+        non-media windows while Container.FolderPath points elsewhere.
+        Any detection error is treated as non-interactive (no dialogs).
+        """
+        if self.__addon_handle < 0:
+            return True
+        try:
+            folder = xbmc.getInfoLabel("Container.FolderPath") or ""
+            if folder.startswith(f"plugin://{ADDON_ID}"):
+                return False
+            get_cond = getattr(xbmc, "getCondVisibility", None)
+            if callable(get_cond) and get_cond("Window.IsMedia"):
+                return False
+        except Exception as exc:
+            log_exception(exc, "interactive request detection")
+        return True
+
+    def __notify(self, message: str) -> None:
+        try:
+            xbmcgui.Dialog().notification(
+                self.__addon.getAddonInfo("name"),
+                message,
+                icon=self.__addon.getAddonInfo("icon"),
+                time=3000,
+                sound=False,
+            )
+        except Exception as exc:
+            log_exception(exc, "notification")
+
+    def __end_directory(self, succeeded: bool = True) -> None:
+        if self.__addon_handle < 0:
+            return
+        try:
+            xbmcplugin.endOfDirectory(handle=self.__addon_handle, succeeded=succeeded)
+        except Exception as exc:
+            log_exception(exc, "endOfDirectory")
 
     def refresh_spotipy(self):
         auth_token: str = utils.get_cached_auth_token()
@@ -295,17 +373,28 @@ class PluginContent:
             self.__spotty = spotty.get_spotty(SpottyHelper())
         spotty_auth = SpottyAuth(self.__spotty)
 
-        zeroconf_auth = spotty_auth.start_zeroconf_authenticate()
-        if zeroconf_auth is None:
-            dialog.ok(dialog_title, self.get_zeroconf_program_failed_msg(spotty_auth))
-            utils.kill_this_plugin()
-            return
+        # Tell the service not to restore credentials.json from the .bak we
+        # are about to create while the user is pairing.
+        utils.mark_zeroconf_pairing(True)
+        try:
+            zeroconf_auth = spotty_auth.start_zeroconf_authenticate()
+            if zeroconf_auth is None:
+                dialog.ok(dialog_title, self.get_zeroconf_program_failed_msg(spotty_auth))
+                utils.kill_this_plugin()
+                return
 
-        dialog.ok(dialog_title, instructions)
+            dialog.ok(dialog_title, instructions)
 
-        zeroconf_auth.terminate()
+            zeroconf_auth.terminate()
+            # Check before clearing the pairing flag so a concurrent service
+            # backup restore cannot masquerade as a successful pairing.
+            paired_ok = spotty_auth.zeroconf_authenticated_ok()
+        finally:
+            utils.mark_zeroconf_pairing(False)
 
-        if not spotty_auth.zeroconf_authenticated_ok():
+        if not paired_ok:
+            # Put the previous credentials back so playback keeps working.
+            spotty_auth.restore_credentials_from_backup_if_needed()
             dialog.ok(dialog_title, self.get_zeroconf_authentication_failed_msg(spotty_auth))
             utils.kill_this_plugin()
             return

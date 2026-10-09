@@ -302,6 +302,52 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
         self.assertEqual([("track-1", 180)], published)
 
 
+class TokenRenewBackoffTests(unittest.TestCase):
+    def tearDown(self):
+        for module_name in ("main_service", "playlist_next", "utils", "xbmc", "xbmcgui"):
+            sys.modules.pop(module_name, None)
+
+    def test_backoff_doubles_from_five_seconds_and_caps_at_300(self):
+        main_service = import_main_service({})
+        delays = [main_service.MainService.compute_renew_backoff(n) for n in range(10)]
+        self.assertEqual([5, 10, 20, 40, 80, 160, 300, 300, 300, 300], delays)
+
+    def test_failed_renew_schedules_next_attempt_and_success_resets(self):
+        main_service = import_main_service({})
+        service = object.__new__(main_service.MainService)
+        service._MainService__renew_failures = 0
+        service._MainService__next_renew_attempt_at = 0.0
+        service._MainService__welcome_msg = False
+
+        class _FailingAuth:
+            def renew_token(self):
+                raise RuntimeError("offline")
+
+        service._MainService__spotty_auth = _FailingAuth()
+        main_service.time.time = lambda: 1000.0
+        try:
+            service._MainService__renew_token()
+            self.assertEqual(1005.0, service._MainService__next_renew_attempt_at)
+            service._MainService__renew_token()
+            self.assertEqual(1010.0, service._MainService__next_renew_attempt_at)
+            self.assertEqual(2, service._MainService__renew_failures)
+
+            class _OkAuth:
+                def renew_token(self):
+                    pass
+
+            service._MainService__spotty_auth = _OkAuth()
+            main_service.utils.get_cached_auth_token_expires_at = lambda: "4600"
+            service._MainService__renew_token()
+            self.assertEqual(0, service._MainService__renew_failures)
+            self.assertEqual(0.0, service._MainService__next_renew_attempt_at)
+            self.assertEqual("4600", service._MainService__auth_token_expires_at)
+        finally:
+            import time as _time
+
+            main_service.time.time = _time.time
+
+
 class SpotifyAutoplayGatingTests(unittest.TestCase):
     """Regression coverage for the daylist autoplay-destroys-queue bug.
 

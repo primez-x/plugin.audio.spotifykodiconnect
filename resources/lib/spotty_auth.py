@@ -5,6 +5,7 @@ import subprocess
 import time
 from typing import Dict, Union
 
+import xbmc
 import xbmcaddon
 from xbmc import LOGDEBUG, LOGERROR, LOGWARNING
 
@@ -14,6 +15,9 @@ from string_ids import AUTHENTICATE_FAILED_STR_ID, AUTHENTICATION_PROGRAM_FAILED
 from utils import log_msg, log_exception, ADDON_ID
 
 ZEROCONF_PORT = 10001
+TOKEN_FETCH_MAX_RETRIES = 3
+TOKEN_FETCH_RETRY_DELAY_SECS = 1
+TOKEN_FETCH_TIMEOUT_SECS = 15
 
 CLIENT_ID = "2eb96f9b37494be1824999d58028a305"
 SPOTTY_SCOPE = [
@@ -59,6 +63,12 @@ class SpottyAuth:
         if os.path.exists(cred_file):
             return False
 
+        if utils.zeroconf_pairing_in_progress():
+            # The plugin moved credentials.json aside on purpose and is waiting
+            # for the user to pair; restoring now would fake a pairing success.
+            log_msg("Zeroconf pairing in progress; not restoring credentials backup.", LOGDEBUG)
+            return False
+
         if not os.path.exists(backup_file):
             log_msg(
                 "Spotify credentials file missing and no backup available; "
@@ -77,6 +87,12 @@ class SpottyAuth:
         except OSError as exc:
             log_exception(exc, "Failed to restore credentials file from backup")
             return False
+
+    def has_stored_credentials(self) -> bool:
+        """True when a credentials blob (live or backup) exists on disk."""
+        return os.path.exists(self.__spotty.get_spotty_credentials_file()) or os.path.exists(
+            self.__spotty.get_spotty_credentials_backup_file()
+        )
 
     def start_zeroconf_authenticate(self) -> Union[None, subprocess.Popen]:
         try:
@@ -129,10 +145,17 @@ class SpottyAuth:
     def renew_token(self) -> None:
         log_msg("Retrieving auth token....", LOGDEBUG)
 
+        # A previous interrupted credential rotation may have left only the
+        # .bak on disk; recover it before every attempt, not just at startup.
+        self.restore_credentials_from_backup_if_needed()
+
         auth_token = self.__get_retry_auth_token()
         if not auth_token:
-            utils.cache_auth_token("")
-            utils.cache_auth_token_expires_at("")
+            # Keep a still-valid token: a transient renewal failure (network
+            # blip, Spotify hiccup) must not log the plugin out early.
+            if not utils.cached_auth_token_is_unexpired():
+                utils.cache_auth_token("")
+                utils.cache_auth_token_expires_at("")
             raise Exception(
                 f"Could not get Spotify auth token for" f" user '{utils.get_username()}'."
             )
@@ -148,14 +171,18 @@ class SpottyAuth:
 
     def __get_retry_auth_token(self) -> Dict[str, str]:
         auth_token = None
-        max_retries = 20
         count = 0
-        while count < max_retries:
+        monitor = xbmc.Monitor()
+        while count < TOKEN_FETCH_MAX_RETRIES:
             auth_token = self.__get_token()
             if auth_token:
                 break
-            time.sleep(1)
             count += 1
+            if count >= TOKEN_FETCH_MAX_RETRIES:
+                break
+            if monitor.waitForAbort(TOKEN_FETCH_RETRY_DELAY_SECS):
+                log_msg("Abort requested; stopping auth token retries.", LOGDEBUG)
+                break
 
         if count > 0:
             log_msg(f"Took {count} retries to get authorization token.", LOGWARNING)
@@ -182,8 +209,16 @@ class SpottyAuth:
             ]
             spotty = self.__spotty.run_spotty(extra_args=args)
 
-            stdout, stderr = spotty.communicate(timeout=30)
-            # done.set()
+            try:
+                spotty.communicate(timeout=TOKEN_FETCH_TIMEOUT_SECS)
+            except subprocess.TimeoutExpired:
+                log_msg(
+                    f"Spotty token fetch timed out after {TOKEN_FETCH_TIMEOUT_SECS}s;"
+                    " killing it.",
+                    loglevel=LOGWARNING,
+                )
+                self._kill_and_reap(spotty)
+                return None
 
             with open(self.__spotty.get_spotty_token_file()) as f:
                 json_token = json.load(f)
@@ -227,6 +262,18 @@ class SpottyAuth:
             log_exception(exc, "Get Spotify token error")
 
         return token_info
+
+    @staticmethod
+    def _kill_and_reap(proc) -> None:
+        """Kill a hung spotty child and reap it so it does not linger as a zombie."""
+        try:
+            proc.kill()
+        except Exception as exc:
+            log_exception(exc, "Failed to kill hung spotty token process")
+        try:
+            proc.communicate(timeout=5)
+        except Exception as exc:
+            log_exception(exc, "Failed to reap hung spotty token process")
 
     @staticmethod
     def _token_response_is_valid(json_token) -> bool:
