@@ -48,26 +48,30 @@ class SimpleCache(object):
         if not self._exit:
             self.close()
 
-    def get(self, endpoint, checksum="", json_data=False):
+    def get(self, endpoint, checksum="", json_data=False, mem_cache=True):
         '''
             get object from cache and return the results
             endpoint: the (unique) name of the cache object as reference
             checkum: optional argument to check if the checksum in the cacheobject matches the checkum provided
+            mem_cache: False keeps this entry database-only (no window property copy),
+                       for large collections that would otherwise be serialised twice
         '''
         checksum = self._get_checksum(checksum)
         cur_time = self._get_timestamp(datetime.datetime.now())
         result = None
+        use_mem = self.enable_mem_cache and mem_cache
         # 1: try memory cache first
-        if self.enable_mem_cache:
+        if use_mem:
             result = self._get_mem_cache(endpoint, checksum, cur_time, json_data)
 
         # 2: fallback to _database cache
         if result is None:
-            result = self._get_db_cache(endpoint, checksum, cur_time, json_data)
+            result = self._get_db_cache(endpoint, checksum, cur_time, json_data, use_mem)
 
         return result
 
-    def set(self, endpoint, data, checksum="", expiration=datetime.timedelta(days=30), json_data=False):
+    def set(self, endpoint, data, checksum="", expiration=datetime.timedelta(days=30), json_data=False,
+            mem_cache=True):
         '''
             set data in cache
         '''
@@ -77,8 +81,11 @@ class SimpleCache(object):
         expires = self._get_timestamp(datetime.datetime.now() + expiration)
 
         # memory cache: write to window property
-        if self.enable_mem_cache and not self._exit:
+        if self.enable_mem_cache and mem_cache and not self._exit:
             self._set_mem_cache(endpoint, checksum, expires, data, json_data)
+        elif not mem_cache and not self._exit:
+            # database-only entry: drop any stale window-property copy
+            self._win.clearProperty(endpoint)
 
         # db cache
         if not self._exit:
@@ -134,7 +141,7 @@ class SimpleCache(object):
         self._win.setProperty(endpoint, cachedata_str)
 
 
-    def _get_db_cache(self, endpoint, checksum, cur_time, json_data):
+    def _get_db_cache(self, endpoint, checksum, cur_time, json_data, use_mem=True):
         '''get cache data from sqllite _database'''
         result = None
         query = "SELECT expires, data, checksum FROM simplecache WHERE id = ?"
@@ -150,7 +157,7 @@ class SimpleCache(object):
                             "DELETE FROM simplecache WHERE id = ?", (endpoint,)
                         )
                         return None
-                    if self.enable_mem_cache:
+                    if self.enable_mem_cache and use_mem:
                         self._set_mem_cache(endpoint, checksum, cache_data[0], result, json_data)
         return result
 

@@ -141,7 +141,7 @@ class FakeCache:
     def __init__(self):
         self.values = {}
 
-    def get(self, key, checksum=None):
+    def get(self, key, checksum=None, **kwargs):
         item = self.values.get(key)
         if not item:
             return None
@@ -152,6 +152,8 @@ class FakeCache:
 
     def set(self, key, value, checksum=None, **kwargs):
         self.values[key] = (value, checksum)
+        self.set_calls = getattr(self, "set_calls", [])
+        self.set_calls.append((key, kwargs))
 
 
 def install_kodi_stubs():
@@ -799,6 +801,50 @@ class PlaylistFastPathTests(unittest.TestCase):
             if key.startswith(self.plugin_content.DYNAMIC_PAGING_BUSY_PREFIX)
         ]
         self.assertEqual([], busy_props, "busy flag must be cleared after the worker")
+
+    def _run_playlist_continuation(self, spotify):
+        content = self.build_content(spotify)
+        content._PluginContent__params = {
+            "action": ["browse_playlist"],
+            "playlistid": ["playlist-1"],
+        }
+        content._PluginContent__action = "browse_playlist"
+        self.set_active_listing(content)
+        content.browse_playlist()
+        content.cache.set_calls = []
+        try:
+            DeferredThread.started_targets[0]()
+        except RuntimeError:
+            pass
+        key = "spotify.playlistdetails.playlist-1"
+        writes = [kwargs for k, kwargs in content.cache.set_calls if k == key]
+        return content, key, writes
+
+    def test_background_paging_writes_every_five_pages_and_at_end(self):
+        # 50 on the first page + 12 continuation pages.
+        spotify = FakeSpotify(RecordingPlayer.events, total=650)
+        content, key, writes = self._run_playlist_continuation(spotify)
+
+        self.assertEqual(3, len(writes), "pages 5 and 10 plus the final write")
+        self.assertTrue(all(w.get("mem_cache") is False for w in writes))
+        cached = content.cache.values[key][0]
+        self.assertEqual(650, len(cached["tracks"]["items"]))
+        self.assertTrue(cached["tracks"]["_dynamic_paging_complete"])
+
+    def test_background_paging_persists_progress_when_a_page_fails(self):
+        class FailingThirdPage(FakeSpotify):
+            def playlist_items(self, playlist_id, market=None, fields="", limit=50, offset=0):
+                if offset >= 150:
+                    raise RuntimeError("network")
+                return super().playlist_items(playlist_id, market, fields, limit, offset)
+
+        spotify = FailingThirdPage(RecordingPlayer.events, total=650)
+        content, key, writes = self._run_playlist_continuation(spotify)
+
+        self.assertEqual(1, len(writes))
+        cached = content.cache.values[key][0]
+        self.assertEqual(150, len(cached["tracks"]["items"]))
+        self.assertFalse(cached["tracks"]["_dynamic_paging_complete"])
 
     def test_continuation_skips_while_rate_limited(self):
         events = RecordingPlayer.events
