@@ -67,6 +67,11 @@ DAYLIST_TITLE_BUCKET_SECONDS = 300
 DAYLIST_TITLE_BUCKET_KEY = "_daylist_title_bucket"
 DAYLIST_TITLE_RETRY_DELAYS_MS = (1000, 2500, 5000)
 LEGACY_CATEGORY_ALIASES = {"made-for-you": "Made For You"}
+# While the plugin is still building a directory Kodi's Container.FolderPath
+# usually still points at the parent, so dynamic continuations wait briefly
+# for the listing to resolve before deciding whether it is the active one.
+ACTIVE_LISTING_WAIT_SECS = 3.0
+ACTIVE_LISTING_POLL_SECS = 0.25
 
 # Spotify DJ playlist ID - not supported by third-party clients (librespot issue #1604)
 DJ_PLAYLIST_ID = "37i9dQZF1EYkqdzj48dyYq"
@@ -619,11 +624,28 @@ class PluginContent:
         except Exception as exc:
             log_exception(exc, "dynamic listing refresh")
 
+    def __wait_for_active_listing(self, target_url: str) -> bool:
+        """Poll (abort-aware) until target_url is Kodi's active folder or time runs out."""
+        if not target_url:
+            return False
+        monitor = xbmc.Monitor()
+        attempts = max(1, int(ACTIVE_LISTING_WAIT_SECS / ACTIVE_LISTING_POLL_SECS))
+        for attempt in range(attempts + 1):
+            if self.__is_active_listing(target_url):
+                return True
+            if attempt >= attempts:
+                break
+            if monitor.waitForAbort(ACTIVE_LISTING_POLL_SECS):
+                return False
+        return False
+
     def __start_dynamic_page_continuation(
         self, busy_key: str, target_url: str, worker: Callable[[], None]
     ) -> None:
-        if not self.__is_active_listing(target_url):
-            return
+        # Do not check Container.FolderPath here: during first navigation the
+        # directory has not resolved yet and FolderPath is still the parent.
+        # The worker waits for the listing to become active instead, and
+        # bails out (e.g. hidden widgets) if it never does.
         prop_key = f"{DYNAMIC_PAGING_BUSY_PREFIX}{busy_key}"
         if self.__win.getProperty(prop_key):
             return
@@ -631,6 +653,9 @@ class PluginContent:
 
         def _run():
             try:
+                if not self.__wait_for_active_listing(target_url):
+                    cache_log(f"Dynamic continuation {busy_key} skipped; listing not active.")
+                    return
                 worker()
             except Exception as exc:
                 log_exception(exc, f"dynamic page continuation {busy_key}")
