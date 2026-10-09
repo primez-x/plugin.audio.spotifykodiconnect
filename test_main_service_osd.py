@@ -1,6 +1,10 @@
 import os
 import sys
 import threading
+
+# import_main_service patches main_service.threading.Thread, which is the
+# global threading module; restore it so later test modules get real threads.
+_REAL_THREAD = threading.Thread
 import types
 import unittest
 
@@ -158,6 +162,7 @@ def import_main_service(info_labels, settings=None):
 
 class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
     def tearDown(self):
+        threading.Thread = _REAL_THREAD
         FakeWindow.windows.clear()
         for module_name in (
             "main_service",
@@ -306,6 +311,7 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
 
 class TokenRenewBackoffTests(unittest.TestCase):
     def tearDown(self):
+        threading.Thread = _REAL_THREAD
         for module_name in ("main_service", "playlist_next", "utils", "xbmc", "xbmcgui"):
             sys.modules.pop(module_name, None)
 
@@ -360,6 +366,7 @@ class SpotifyAutoplayGatingTests(unittest.TestCase):
     """
 
     def tearDown(self):
+        threading.Thread = _REAL_THREAD
         FakeWindow.windows.clear()
         for module_name in (
             "main_service",

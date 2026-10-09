@@ -225,6 +225,9 @@ def import_plugin_content():
         sys.path.insert(0, LIB_DIR)
     sys.argv = ["plugin://plugin.audio.spotifykodiconnect", "1", "?"]
     sys.modules.pop("plugin_content", None)
+    # Other test modules install partial string_ids stubs; use the real one.
+    if not hasattr(sys.modules.get("string_ids"), "SPOTIFY_CONNECTING_STR_ID"):
+        sys.modules.pop("string_ids", None)
     import plugin_content
 
     plugin_content.threading.Thread = DeferredThread
