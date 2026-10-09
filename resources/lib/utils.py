@@ -40,6 +40,9 @@ KODI_PROPERTY_ZEROCONF_PAIRING_SINCE = "Spotify.ZeroconfPairingSince"
 ZEROCONF_PAIRING_STALE_SECS = 600
 # Epoch seconds until which Spotify told us (429 Retry-After) to back off.
 KODI_PROPERTY_RATE_LIMITED_UNTIL = "Spotify.RateLimitedUntil"
+# Set by the service while its token renewals keep failing (cleared on success),
+# so the plugin can tell a stuck login from a service that is still connecting.
+KODI_PROPERTY_AUTH_RENEW_FAILING = "Spotify.AuthRenewFailing"
 
 
 def _debug_logging_enabled() -> bool:
@@ -193,6 +196,58 @@ def cached_auth_token_is_unexpired(now: float = None) -> bool:
     except (TypeError, ValueError):
         return False
     return expires_at > (time.time() if now is None else now)
+
+
+def get_valid_cached_auth_token(now: float = None) -> str:
+    """Non-blocking read of the cached token; "" when missing or expired.
+
+    Plugin invocations must never wait for the service: an empty or expired
+    token is reported immediately so callers can end the listing (widgets) or
+    tell the user Spotify is connecting (interactive navigation).
+    """
+    win = xbmcgui.Window(ADDON_WINDOW_ID)
+    token = win.getProperty(KODI_PROPERTY_SPOTIFY_AUTH_TOKEN) or ""
+    if not token:
+        return ""
+    try:
+        expires_at = int(float(win.getProperty(KODI_PROPERTY_AUTH_TOKEN_EXPIRES_AT) or 0))
+    except (TypeError, ValueError):
+        return ""
+    if expires_at <= (time.time() if now is None else now):
+        return ""
+    return token
+
+
+def clear_expired_cached_auth_token(now: float = None) -> bool:
+    """Drop a cached token that is past its expiry. Returns True if it was cleared.
+
+    A failed renewal keeps a still-valid token, but once it expires consumers
+    would only get 401s; clearing it makes them treat Spotify as connecting.
+    """
+    win = xbmcgui.Window(ADDON_WINDOW_ID)
+    if not win.getProperty(KODI_PROPERTY_SPOTIFY_AUTH_TOKEN):
+        return False
+    if cached_auth_token_is_unexpired(now):
+        return False
+    win.setProperty(KODI_PROPERTY_SPOTIFY_AUTH_TOKEN, "")
+    win.setProperty(KODI_PROPERTY_AUTH_TOKEN_EXPIRES_AT, "")
+    return True
+
+
+def set_auth_renew_failing(failures: int) -> None:
+    win = xbmcgui.Window(ADDON_WINDOW_ID)
+    if failures > 0:
+        win.setProperty(KODI_PROPERTY_AUTH_RENEW_FAILING, str(int(failures)))
+    else:
+        win.setProperty(KODI_PROPERTY_AUTH_RENEW_FAILING, "")
+
+
+def auth_renew_failing() -> bool:
+    """True once the service has reported at least one failed token renewal."""
+    try:
+        return bool(xbmcgui.Window(ADDON_WINDOW_ID).getProperty(KODI_PROPERTY_AUTH_RENEW_FAILING))
+    except Exception:
+        return False
 
 
 def mark_zeroconf_pairing(active: bool) -> None:

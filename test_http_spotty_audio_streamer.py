@@ -882,5 +882,114 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
             recovered.close()
 
 
+class HTTPRangeTests(unittest.TestCase):
+    """RFC 7233 byte ranges: the last-byte-pos is inclusive."""
+
+    TRACK_SIZE = 44 + 180 * 176400  # FakeStreamSpec length for "180.wav"
+
+    def tearDown(self):
+        for module_name in (
+            "http_spotty_audio_streamer",
+            "spotty_audio_streamer",
+            "spotty_cache",
+            "utils",
+            "spotty",
+            "spotipy",
+            "xbmc",
+            "xbmcaddon",
+            "xbmcgui",
+            "bottle",
+        ):
+            sys.modules.pop(module_name, None)
+
+    def _request(self, range_header, track_id="range-track"):
+        module = import_http_streamer()
+        streamer = module.HTTPSpottyAudioStreamer(object())
+        fake_streamer = streamer._HTTPSpottyAudioStreamer__spotty_streamer
+        sent = []
+        original_send = fake_streamer.send_part_audio_stream
+
+        def recording_send(range_len, range_begin, stream_spec=None):
+            sent.append((range_begin, range_len))
+            return original_send(range_len, range_begin, stream_spec=stream_spec)
+
+        fake_streamer.send_part_audio_stream = recording_send
+        if range_header is not None:
+            module.bottle.request.headers = {"Range": range_header}
+        result = streamer.spotty_stream_audio_track(track_id, "180.wav")
+        if hasattr(result, "close"):
+            self.addCleanup(result.close)
+        return module, streamer, result, sent
+
+    def test_parse_byte_range(self):
+        module = import_http_streamer()
+        parse = module.HTTPSpottyAudioStreamer._parse_byte_range
+        self.assertEqual((0, 100), parse("bytes=0-99", 1000))
+        self.assertEqual((0, 1), parse("bytes=0-0", 1000))
+        self.assertEqual((500, 1000), parse("bytes=500-", 1000))
+        self.assertEqual((44, 1000), parse("bytes=44-", 1000))
+        self.assertEqual((900, 1000), parse("bytes=900-5000", 1000))
+        self.assertEqual((999, 1000), parse("bytes=999-999", 1000))
+        self.assertEqual((900, 1000), parse("bytes=-100", 1000))
+        self.assertEqual((0, 1000), parse("bytes=-5000", 1000))
+        self.assertIsNone(parse("bytes=1000-", 1000))
+        self.assertIsNone(parse("bytes=1500-1600", 1000))
+        self.assertIsNone(parse("bytes=-0", 1000))
+        # Malformed ranges are ignored (whole file), as before.
+        self.assertEqual((0, 1000), parse("bytes=abc-", 1000))
+        self.assertEqual((0, 1000), parse("bytes=50-10", 1000))
+        self.assertEqual((0, 1000), parse("items=0-10", 1000))
+
+    def test_closed_range_returns_inclusive_length(self):
+        _module, _streamer, result, sent = self._request("bytes=0-99")
+        response = FakeBottleState.response
+        self.assertEqual("206 Partial Content", response.status)
+        self.assertEqual(100, response.content_length)
+        self.assertEqual(f"bytes 0-99/{self.TRACK_SIZE}", response.headers["Content-Range"])
+        self.assertEqual(b"x" * 16, next(result))
+        self.assertEqual([(0, 100)], sent)
+
+    def test_closed_range_is_clamped_to_file_size(self):
+        start = self.TRACK_SIZE - 10
+        _module, _streamer, _result, sent = self._request(f"bytes={start}-{self.TRACK_SIZE + 500}")
+        response = FakeBottleState.response
+        self.assertEqual(10, response.content_length)
+        self.assertEqual(
+            f"bytes {start}-{self.TRACK_SIZE - 1}/{self.TRACK_SIZE}",
+            response.headers["Content-Range"],
+        )
+        self.assertEqual([(start, 10)], sent)
+
+    def test_open_ended_range_unchanged(self):
+        _module, _streamer, _result, sent = self._request("bytes=1000-")
+        response = FakeBottleState.response
+        self.assertEqual("206 Partial Content", response.status)
+        self.assertEqual(self.TRACK_SIZE - 1000, response.content_length)
+        self.assertEqual(
+            f"bytes 1000-{self.TRACK_SIZE - 1}/{self.TRACK_SIZE}",
+            response.headers["Content-Range"],
+        )
+        self.assertEqual([(1000, self.TRACK_SIZE - 1000)], sent)
+
+    def test_full_request_without_range_is_200(self):
+        _module, _streamer, _result, _sent = self._request(None)
+        response = FakeBottleState.response
+        self.assertEqual(200, response.status)
+        self.assertEqual(self.TRACK_SIZE, response.content_length)
+        self.assertNotIn("Content-Range", response.headers)
+
+    def test_start_past_end_returns_416_and_releases_initialization(self):
+        _module, streamer, result, sent = self._request(f"bytes={self.TRACK_SIZE}-")
+        response = FakeBottleState.response
+        self.assertEqual(416, response.status)
+        self.assertEqual(f"bytes */{self.TRACK_SIZE}", response.headers["Content-Range"])
+        self.assertEqual(0, response.content_length)
+        self.assertEqual("", result)
+        self.assertEqual([], sent)
+        self.assertEqual([], streamer._HTTPSpottyAudioStreamer__spotty_streamer.prepare_calls)
+        self.assertFalse(streamer._HTTPSpottyAudioStreamer__init_in_progress)
+        self.assertTrue(streamer._HTTPSpottyAudioStreamer__init_event.is_set())
+
+
 if __name__ == "__main__":
     unittest.main()

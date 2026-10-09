@@ -165,9 +165,11 @@ class SpottyAuth:
             f" Expires at {utils.get_time_str(int(auth_token['expires_at']))}."
         )
 
-        # Cache auth token for easy access by the plugin.
-        utils.cache_auth_token(str(auth_token["access_token"]))
+        # Cache auth token for easy access by the plugin. Publish the expiry
+        # first so a concurrent reader (or the service's expired-token sweep)
+        # never pairs the new token with the previous, already-expired expiry.
         utils.cache_auth_token_expires_at(str(auth_token["expires_at"]))
+        utils.cache_auth_token(str(auth_token["access_token"]))
 
     def __get_retry_auth_token(self) -> Dict[str, str]:
         auth_token = None

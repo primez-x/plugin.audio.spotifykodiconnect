@@ -800,6 +800,7 @@ class MainService:
                 self.__prebuffer_manager.cancel_prebuffer()
             self.__prebuffer_enabled = prebuffer_enabled_now
 
+            self.__drop_expired_token()
             if self.__auth_token_expires_at == "" and utils.cached_auth_token_is_unexpired():
                 # A token appeared from elsewhere (e.g. the plugin finished a
                 # zeroconf pairing) or survived a failed renewal: adopt it.
@@ -844,12 +845,23 @@ class MainService:
         v = (SPOTIFY_ADDON.getSetting("spotify_bitrate") or "320").strip()
         return v if v in ("96", "160", "320") else "320"
 
+    def __drop_expired_token(self) -> None:
+        """Clear a cached token once it is past expiry (e.g. while backing off
+        after failed renewals) so consumers see "connecting" instead of 401s.
+        Renewal scheduling is untouched: an expired expiry still triggers it."""
+        try:
+            if utils.clear_expired_cached_auth_token():
+                log_msg("Cached Spotify token expired; cleared it until renewal succeeds.")
+        except Exception as exc:
+            log_exception(exc, "Could not clear expired Spotify auth token")
+
     def __renew_token(self) -> None:
         try:
             self.__spotty_auth.renew_token()
             self.__auth_token_expires_at = utils.get_cached_auth_token_expires_at()
             self.__renew_failures = 0
             self.__next_renew_attempt_at = 0.0
+            self.__publish_renew_failures()
             if self.__welcome_msg:
                 self.__welcome_msg = False
                 self.__show_welcome_notification()
@@ -859,7 +871,14 @@ class MainService:
             delay = self.compute_renew_backoff(self.__renew_failures)
             self.__renew_failures += 1
             self.__next_renew_attempt_at = time.time() + delay
+            self.__publish_renew_failures()
             log_msg(f"Next Spotify token renewal attempt in {delay:.0f}s.", LOGWARNING)
+
+    def __publish_renew_failures(self) -> None:
+        try:
+            utils.set_auth_renew_failing(self.__renew_failures)
+        except Exception as exc:
+            log_exception(exc, "Could not publish token renewal state")
 
     @staticmethod
     def compute_renew_backoff(previous_failures: int) -> float:
