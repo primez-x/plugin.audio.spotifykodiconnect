@@ -490,6 +490,64 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
 
         self.assertTrue(streamer._previous_stream_has_confirmed_playback("current-track"))
 
+    def test_backpressure_paused_downloader_is_healthy_and_handoff_safe(self):
+        module = import_http_streamer()
+        # The real downloader needs a few extra stub attributes.
+        sys.modules["xbmc"].LOGWARNING = 2
+        sys.modules["xbmc"].LOGERROR = 3
+        sys.modules["utils"].log_exception = lambda *args, **kwargs: None
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+
+        downloader = spotty_cache.SpottyDownloader(
+            spotty=object(),
+            track_id="current-track",
+            duration_sec=600,
+            start_byte=0,
+            bitrate="320",
+            normalization="off",
+            volume=35,
+            wav_header=b"0" * 44,
+            track_length=44 + 600 * 176400,
+        )
+        downloader._download_loop = lambda: None
+        downloader.start()
+        with downloader.cond:
+            downloader.written_bytes = 44 + 16 * 1024 * 1024
+            downloader.real_pcm_bytes = 16 * 1024 * 1024
+            # Last write long ago: only the reader-limited pause explains it.
+            downloader.last_progress_monotonic = time.monotonic() - 600.0
+            downloader._bp_paused = True
+            downloader._consumer_positions[0] = 0
+
+        manager = spotty_cache.SpottyCacheManager
+        manager._instances[("current-track", 0)] = downloader
+        try:
+            streamer = module.HTTPSpottyAudioStreamer(object())
+            self.assertTrue(
+                module.HTTPSpottyAudioStreamer._downloader_has_healthy_progress(downloader)
+            )
+            self.assertTrue(
+                streamer._previous_downloader_finished_for_handoff(
+                    "current-track", "queued-track"
+                )
+            )
+
+            # Without an attached reader the same idle downloader is stale.
+            with downloader.cond:
+                downloader._consumer_positions.clear()
+            self.assertFalse(
+                module.HTTPSpottyAudioStreamer._downloader_has_healthy_progress(downloader)
+            )
+            self.assertFalse(
+                streamer._previous_downloader_finished_for_handoff(
+                    "current-track", "queued-track"
+                )
+            )
+        finally:
+            manager._instances.clear()
+            manager._recent_tracks.clear()
+
     def test_finished_healthy_downloader_allows_queued_handoff(self):
         module = import_http_streamer()
         downloader = ActiveDownloader(is_finished=True)

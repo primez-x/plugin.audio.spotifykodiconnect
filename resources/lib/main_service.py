@@ -615,7 +615,9 @@ class MainService:
                         )
                         return
 
-                dl = SpottyCacheManager.find_best_downloader(track_id, 0)
+                # find_active_downloader also finds a post-seek playing
+                # downloader (start_byte > 0) and one whose head was trimmed.
+                dl = SpottyCacheManager.find_active_downloader(track_id)
                 if dl is not None and not dl.is_finished:
                     with dl.cond:
                         while not dl.is_finished and not dl.error and not dl.aborted:

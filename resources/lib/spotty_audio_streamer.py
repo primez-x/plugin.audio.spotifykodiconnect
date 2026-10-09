@@ -470,6 +470,8 @@ class SpottyAudioStreamer:
                 consumer_id = downloader._next_consumer_id
                 downloader._next_consumer_id += 1
                 downloader._consumer_positions[consumer_id] = max(0, buf_offset)
+                # A reader starting ahead may move the backpressure reference.
+                downloader.cond.notify_all()
 
             ready = self._prime_startup_real_pcm(
                 downloader,
@@ -508,6 +510,15 @@ class SpottyAudioStreamer:
                             msg="Background downloader hit an error",
                         )
                         break
+                    if downloader.aborted and available <= 0:
+                        # An aborted downloader will never write again; stop
+                        # instead of spinning on wait_for_bytes().
+                        self._log_transfer(
+                            "aborted",
+                            stream_track_id=track_id,
+                            msg="Background downloader was aborted",
+                        )
+                        break
                     is_finished = downloader.is_finished
                     if available > 0:
                         to_read = min(self.chunk_size, available, range_len - bytes_sent)
@@ -523,15 +534,18 @@ class SpottyAudioStreamer:
                             )
                             break
                         chunk = bytes(downloader._buffer[buf_idx : buf_idx + to_read])
-                        downloader._consumed_pos = max(
-                            downloader._consumed_pos, read_start + to_read
-                        )
-                        if consumer_id in downloader._consumer_positions:
-                            downloader._consumer_positions[consumer_id] = max(
-                                downloader._consumer_positions[consumer_id],
-                                read_start + to_read,
+                        if not chunk and downloader.aborted:
+                            # cleanup() cleared the buffer of an aborted
+                            # downloader; nothing more will ever arrive.
+                            self._log_transfer(
+                                "aborted",
+                                stream_track_id=track_id,
+                                msg="Background downloader buffer was released",
                             )
-                        downloader._trim_head_locked()
+                            break
+                        # Advances this reader, trims the head and wakes a
+                        # backpressure-paused writer when there is room.
+                        downloader.advance_consumer_locked(consumer_id, read_start + to_read)
 
                 if chunk:
                     yield chunk
@@ -617,6 +631,8 @@ class SpottyAudioStreamer:
                 with downloader.cond:
                     downloader._consumer_positions.pop(consumer_id, None)
                     downloader._trim_head_locked()
+                    # The backpressure reference may change with the reader set.
+                    downloader.cond.notify_all()
 
 
 def create_wav_header_for_duration(duration_sec: float) -> Tuple[bytes, int]:
