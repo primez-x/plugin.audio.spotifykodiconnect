@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<addon id="plugin.audio.spotifykodiconnect" version="1.0.40" name="SpotifyKodiConnect" provider-name="primez-x">
+<addon id="plugin.audio.spotifykodiconnect" version="1.0.41" name="SpotifyKodiConnect" provider-name="primez-x">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
         <import addon="xbmc.addon" version="18.9.701" />
@@ -19,7 +19,16 @@
         <description lang="en_GB">Unofficial Spotify music plugin for Kodi. Improves on the original Spotify addon with consistent album/artist art in all views (including playlists), correct metadata tags, and background loading so navigation and playback feel smooth. Requires Spotify Premium.</description>
         <disclaimer lang="en_GB">This product uses the SPOTIFY WEB API but is not endorsed, certified or otherwise approved in any way by Spotify. Spotify is the registered trademark of Spotify AB.</disclaimer>
         <source>https://github.com/primez-x/plugin.audio.spotifykodiconnect</source>
-        <news>v1.0.40
+        <news>v1.0.41
+- Never force a Spotify re-pair while the service is still connecting: show "Spotify is connecting…" instead, keep widgets silent, and only pair automatically when no stored credentials exist.
+- Make token renewal non-blocking: 15s spotty timeout with kill and reap, 3 abort-aware retries, exponential back-off up to 5 minutes, and keep a still-valid token after a failed renewal.
+- Start background paging on first navigation by waiting briefly for the listing to become active.
+- Fail fast on long Spotify rate limits and pause background work until the Retry-After window passes.
+- Stop library totals from invalidating album, artist and playlist caches; reflect likes and follows in cached listings directly.
+- Write background-paged collections every 5 pages, database-only, and close cache database connections.
+- Fix saved-tracks cache staleness, empty playlist playback sessions, and test isolation.
+
+v1.0.40
 - Package the reconciled paging and authentication fixes as an update newer than the layered CoreELEC build.
 
 v1.0.39
