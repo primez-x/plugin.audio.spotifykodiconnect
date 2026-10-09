@@ -1,5 +1,7 @@
+import json
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -60,6 +62,32 @@ PLAYLIST_COLLECTION_CACHE_EXPIRATION = datetime.timedelta(
 USER_PLAYLIST_CACHE_BUCKET_SECONDS = 300
 USER_PLAYLIST_CACHE_EXPIRATION = datetime.timedelta(seconds=USER_PLAYLIST_CACHE_BUCKET_SECONDS)
 RELATION_CACHE_EXPIRATION = datetime.timedelta(minutes=5)
+# Content listings (album, artist pages, playlist details) are cached without
+# depending on library totals; liked/followed state is overlaid at render time
+# from user-action overrides (see __apply_relation_overrides).
+ARTIST_CONTENT_CACHE_EXPIRATION = datetime.timedelta(days=1)
+TOP_ITEMS_CACHE_EXPIRATION = datetime.timedelta(days=1)
+RELATION_OVERRIDES_EXPIRATION = datetime.timedelta(days=30)
+RELATION_OVERRIDES_MAX_ITEMS = 500
+RELATION_SNAPSHOT_KEY = "_relts"
+# Library-totals checksum (3 Spotify calls) is memoised across plugin
+# processes in the home window for this long, and cleared by like/save/follow.
+LIBRARY_CHECKSUM_PROP = "Spotify.LibraryChecksum"
+LIBRARY_CHECKSUM_TTL_SECS = 60
+# Context-menu action -> (relation namespace, state the action implies is current).
+RELATION_CONTEXT_ACTIONS = {
+    "save_track": ("savedtrack", False),
+    "remove_track": ("savedtrack", True),
+    "follow_artist": ("followedartist", False),
+    "unfollow_artist": ("followedartist", True),
+    "save_album": ("savedalbum", False),
+    "remove_album": ("savedalbum", True),
+    "follow_playlist": ("followedplaylist", False),
+    "unfollow_playlist": ("followedplaylist", True),
+}
+RELATION_CONTEXT_COMMAND_RE = re.compile(
+    r"\?action=(\w+)&(?:trackid|artistid|albumid|playlistid)=([^&)]+)"
+)
 PRECACHE_NAVIGATION_TOKEN_PROP = "Spotify.PreCacheNavigationToken"
 PRECACHE_MAX_PLAYLISTS = 10
 PRECACHE_MAX_PLAYLIST_TRACKS = 250
@@ -536,7 +564,13 @@ class PluginContent:
         return int((followed_artists.get("artists") or {}).get("total") or 0)
 
     def __cache_checksum(self, opt_value: Any = None) -> str:
-        """Simple cache checksum based on library counts. Cached after first computation.
+        """Library-membership checksum based on library counts.
+
+        Only for listings whose *membership* depends on the library (saved
+        albums, saved artists). Computing it costs three Spotify calls, so it
+        is memoised per process and across plugin processes in a home-window
+        property for LIBRARY_CHECKSUM_TTL_SECS; like/save/follow actions clear
+        that memo (see __invalidate_library_checksum).
 
         Includes CACHE_SCHEMA_VERSION so that any change to the data shape
         (new API fields, serialisation format, etc.) automatically invalidates
@@ -544,21 +578,183 @@ class PluginContent:
         """
         result = self.__cached_checksum
         if not result:
+            generic_checksum = self.__addon.getSetting("cache_checksum")
+            result = self.__read_library_checksum_memo(generic_checksum)
+        if not result:
             saved_track_total = self.__get_saved_track_total()
             saved_album_total = self.__get_saved_album_total()
             followed_artist_total = self.__get_followed_artist_total()
-            generic_checksum = self.__addon.getSetting("cache_checksum")
             result = (
                 f"v{CACHE_SCHEMA_VERSION}"
                 f"-{saved_track_total}-{saved_album_total}-{followed_artist_total}"
                 f"-{generic_checksum}"
             )
-            self.__cached_checksum = result
+            self.__write_library_checksum_memo(result, generic_checksum)
+        self.__cached_checksum = result
 
         if opt_value:
             result += f"-{opt_value}"
 
         return result
+
+    def __read_library_checksum_memo(self, generic_checksum: str) -> str:
+        try:
+            raw = xbmcgui.Window(ADDON_WINDOW_ID).getProperty(LIBRARY_CHECKSUM_PROP)
+            if not raw:
+                return ""
+            memo = json.loads(raw)
+            if (
+                memo.get("user") != self.__userid
+                or memo.get("generic") != generic_checksum
+                or time.time() - float(memo.get("ts") or 0) >= LIBRARY_CHECKSUM_TTL_SECS
+            ):
+                return ""
+            return str(memo.get("value") or "")
+        except Exception:
+            return ""
+
+    def __write_library_checksum_memo(self, value: str, generic_checksum: str) -> None:
+        try:
+            xbmcgui.Window(ADDON_WINDOW_ID).setProperty(
+                LIBRARY_CHECKSUM_PROP,
+                json.dumps(
+                    {
+                        "user": self.__userid,
+                        "generic": generic_checksum,
+                        "ts": time.time(),
+                        "value": value,
+                    }
+                ),
+            )
+        except Exception as exc:
+            log_exception(exc, "library checksum memo")
+
+    def __invalidate_library_checksum(self) -> None:
+        self.__cached_checksum = ""
+        try:
+            xbmcgui.Window(ADDON_WINDOW_ID).clearProperty(LIBRARY_CHECKSUM_PROP)
+        except Exception:
+            pass
+
+    def __content_checksum(self, namespace: str, *parts: Any) -> str:
+        """Checksum for content whose items do not depend on library membership.
+
+        Schema version + the manual "Refresh listing" checksum only, so liking
+        a track or following an artist no longer invalidates album, artist or
+        playlist caches. Liked/followed state is overlaid when rendering.
+        """
+        suffix = "-".join(str(part) for part in parts if part is not None and part != "")
+        if suffix:
+            suffix = f"-{suffix}"
+        generic_checksum = self.__addon.getSetting("cache_checksum")
+        return f"v{CACHE_SCHEMA_VERSION}-content-{namespace}{suffix}-{generic_checksum}"
+
+    def __relation_overrides_key(self) -> str:
+        return f"spotify.relationoverrides.{self.__userid}"
+
+    def __load_relation_overrides(self) -> Dict[str, Any]:
+        try:
+            overrides = self.cache.get(
+                self.__relation_overrides_key(), checksum=CACHE_SCHEMA_VERSION
+            )
+        except Exception as exc:
+            log_exception(exc, "relation overrides load")
+            return {}
+        return overrides if isinstance(overrides, dict) else {}
+
+    def __record_relation_override(self, namespace: str, item_id: str, value: bool) -> None:
+        """Remember a user-made relation change so cached listings can reflect it."""
+        if not item_id:
+            return
+        overrides = self.__load_relation_overrides()
+        overrides[f"{namespace}:{item_id}"] = [bool(value), time.time()]
+        if len(overrides) > RELATION_OVERRIDES_MAX_ITEMS:
+            newest = sorted(overrides.items(), key=lambda kv: kv[1][1], reverse=True)
+            overrides = dict(newest[:RELATION_OVERRIDES_MAX_ITEMS])
+        self.cache.set(
+            self.__relation_overrides_key(),
+            overrides,
+            checksum=CACHE_SCHEMA_VERSION,
+            expiration=RELATION_OVERRIDES_EXPIRATION,
+        )
+
+    def __apply_relation_overrides(self, items: List[Dict[str, Any]]) -> None:
+        """Flip save/follow context entries for items changed after they were cached.
+
+        One cache read per render. An override only applies when it is newer
+        than the moment the item's relation state was computed (_relts), so
+        a later fresh lookup always wins over an older Kodi-side action.
+        """
+        if not items:
+            return
+        overrides = self.__load_relation_overrides()
+        if not overrides:
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            context_items = item.get("contextitems")
+            if not context_items:
+                continue
+            try:
+                item_ts = float(item.get(RELATION_SNAPSHOT_KEY) or 0)
+            except (TypeError, ValueError):
+                item_ts = 0.0
+            updated = None
+            for index, entry in enumerate(context_items):
+                try:
+                    command = entry[1]
+                except (IndexError, TypeError):
+                    continue
+                match = RELATION_CONTEXT_COMMAND_RE.search(command or "")
+                if not match:
+                    continue
+                action, item_id = match.group(1), match.group(2)
+                spec = RELATION_CONTEXT_ACTIONS.get(action)
+                if not spec:
+                    continue
+                namespace, current_state = spec
+                override = overrides.get(f"{namespace}:{item_id}")
+                if not override or float(override[1]) <= item_ts:
+                    continue
+                desired = bool(override[0])
+                if desired == current_state:
+                    continue
+                new_action, label_id = self.__relation_context_action(namespace, desired)
+                if updated is None:
+                    updated = list(context_items)
+                updated[index] = (
+                    self.__addon.getLocalizedString(label_id),
+                    command.replace(f"?action={action}&", f"?action={new_action}&", 1),
+                )
+            if updated is not None:
+                item["contextitems"] = updated
+
+    @staticmethod
+    def __relation_context_action(namespace: str, state: bool) -> Tuple[str, int]:
+        return {
+            ("savedtrack", True): ("remove_track", REMOVE_FROM_LIKED_SONGS_STR_ID),
+            ("savedtrack", False): ("save_track", ADD_TO_LIKED_SONGS_STR_ID),
+            ("followedartist", True): ("unfollow_artist", UNFOLLOW_ARTIST_STR_ID),
+            ("followedartist", False): ("follow_artist", FOLLOW_ARTIST_STR_ID),
+            ("savedalbum", True): ("remove_album", REMOVE_TRACKS_FROM_MY_MUSIC_STR_ID),
+            ("savedalbum", False): ("save_album", SAVE_TRACKS_TO_MY_MUSIC_STR_ID),
+            ("followedplaylist", True): ("unfollow_playlist", UNFOLLOW_PLAYLIST_STR_ID),
+            ("followedplaylist", False): ("follow_playlist", FOLLOW_PLAYLIST_STR_ID),
+        }[(namespace, state)]
+
+    def __after_relation_change(self, namespace: str, item_id: str, value: bool) -> None:
+        """Common bookkeeping after a like/save/follow action.
+
+        Updates the short-lived relation cache, records a durable override for
+        cached listings and invalidates the library-totals memo (membership
+        listings such as saved albums must recompute). Callers then refresh
+        the container. Unlike refresh_listing() it does not bump the global
+        cache checksum, so album/artist/playlist caches survive.
+        """
+        self.__set_relation_cache(namespace, item_id, value)
+        self.__record_relation_override(namespace, item_id, value)
+        self.__invalidate_library_checksum()
 
     def __paged_collection_checksum(
         self,
@@ -801,6 +997,7 @@ class PluginContent:
         dialog.ok(header, msg)
 
     def refresh_listing(self) -> None:
+        self.__invalidate_library_checksum()
         self.__addon.setSetting("cache_checksum", time.strftime("%Y%m%d%H%M%S", time.gmtime()))
         log_msg(f"New cache_checksum = '{self.__addon.getSetting('cache_checksum')}'")
         xbmc.executebuiltin("Container.Refresh")
@@ -831,9 +1028,13 @@ class PluginContent:
                 self.__set_relation_cache("savedtrack", track_id, True)
         except Exception as exc:
             log_exception(exc, "toggle_liked failed")
+        else:
+            self.__record_relation_override("savedtrack", track_id, not liked)
+            self.__invalidate_library_checksum()
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
     def __add_track_listitems(self, tracks, append_artist_to_label: bool = False) -> None:
+        self.__apply_relation_overrides(tracks)
         list_items = self.__get_track_list(tracks, append_artist_to_label)
         xbmcplugin.addDirectoryItems(self.__addon_handle, list_items, totalItems=len(list_items))
 
@@ -1094,7 +1295,7 @@ class PluginContent:
     def browse_top_artists(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "artists")
         cache_str = f"spotify.topartists.{self.__userid}"
-        checksum = self.__cache_checksum()
+        checksum = self.__content_checksum("topartists")
         artists = self.cache.get(cache_str, checksum=checksum)
         if artists:
             cache_log(f'Retrieved {len(artists)} cached top artists for user "{self.__userid}".')
@@ -1107,7 +1308,9 @@ class PluginContent:
                 ]
                 count += 50
             artists = self.__prepare_artist_listitems(result["items"])
-            self.cache.set(cache_str, artists, checksum=checksum)
+            self.cache.set(
+                cache_str, artists, checksum=checksum, expiration=TOP_ITEMS_CACHE_EXPIRATION
+            )
             cache_log(
                 f'Retrieved {_get_len(artists)} UNCACHED top artists for user "{self.__userid}".'
             )
@@ -1119,7 +1322,7 @@ class PluginContent:
     def browse_top_tracks(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "songs")
         cache_str = f"spotify.toptracks.{self.__userid}"
-        checksum = self.__cache_checksum()
+        checksum = self.__content_checksum("toptracks")
         tracks = self.cache.get(cache_str, checksum=checksum)
         if tracks:
             cache_log(f'Retrieved {len(tracks)} cached top tracks for user "{self.__userid}".')
@@ -1130,7 +1333,9 @@ class PluginContent:
                 results = self.__spotipy.next(results)
                 tracks.extend(results["items"])
             tracks = self.__prepare_track_listitems(tracks=tracks)
-            self.cache.set(cache_str, tracks, checksum=checksum)
+            self.cache.set(
+                cache_str, tracks, checksum=checksum, expiration=TOP_ITEMS_CACHE_EXPIRATION
+            )
             cache_log(
                 f'Retrieved {_get_len(tracks)} UNCACHED top tracks for user "{self.__userid}".'
             )
@@ -1210,7 +1415,7 @@ class PluginContent:
 
     def __get_album_tracks(self, album: Dict[str, Any]) -> List[Dict[str, Any]]:
         cache_str = f"spotify.albumtracks{album['id']}"
-        checksum = self.__cache_checksum()
+        checksum = self.__content_checksum("albumtracks")
 
         album_tracks = self.cache.get(cache_str, checksum=checksum)
         if album_tracks:
@@ -1240,7 +1445,7 @@ class PluginContent:
 
         # Performance optimization: check cache first to avoid API call
         cache_str = f"spotify.album.{self.__album_id}"
-        checksum = self.__cache_checksum()
+        checksum = self.__content_checksum("album")
         album = self.cache.get(cache_str, checksum=checksum)
 
         if not album:
@@ -1271,7 +1476,7 @@ class PluginContent:
 
         # Performance optimization: check cache first to avoid API call
         cache_str = f"spotify.artisttoptracks.{self.__artist_id}"
-        checksum = self.__cache_checksum()
+        checksum = self.__content_checksum("artisttoptracks", self.__user_country)
         tracks_data = self.cache.get(cache_str, checksum=checksum)
 
         if tracks_data:
@@ -1282,7 +1487,9 @@ class PluginContent:
                 self.__artist_id, country=self.__user_country
             )
             tracks = self.__prepare_track_listitems(tracks=tracks_result["tracks"])
-            self.cache.set(cache_str, tracks, checksum=checksum)
+            self.cache.set(
+                cache_str, tracks, checksum=checksum, expiration=ARTIST_CONTENT_CACHE_EXPIRATION
+            )
 
         self.__add_track_listitems(tracks)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
@@ -1300,14 +1507,16 @@ class PluginContent:
             self.__addon.getLocalizedString(RELATED_ARTISTS_STR_ID),
         )
         cache_str = f"spotify.relatedartists.{self.__artist_id}"
-        checksum = self.__cache_checksum()
+        checksum = self.__content_checksum("relatedartists")
         artists = self.cache.get(cache_str, checksum=checksum)
         if artists:
             cache_log(f'Retrieved {len(artists)} cached related artists for "{self.__artist_id}".')
         else:
             artists = self.__spotipy.artist_related_artists(self.__artist_id)
             artists = self.__prepare_artist_listitems(artists["artists"])
-            self.cache.set(cache_str, artists, checksum=checksum)
+            self.cache.set(
+                cache_str, artists, checksum=checksum, expiration=ARTIST_CONTENT_CACHE_EXPIRATION
+            )
             cache_log(
                 f'Retrieved {_get_len(artists)} UNCACHED related artists for "{self.__artist_id}".'
             )
@@ -1536,7 +1745,9 @@ class PluginContent:
         # or Daily Mixes behind a 30-day cache.
         curated_bucket = f"-curated-{int(time.time() // 300)}" if is_spotify_curated else ""
         playlist_checksum = f"{content_version}-{playlist.get('snapshot_id', '')}{curated_bucket}"
-        checksum = self.__cache_checksum(playlist_checksum)
+        # Keyed on the playlist's own version only (snapshot_id), not library
+        # totals: liking a track must not invalidate every playlist cache.
+        checksum = self.__content_checksum("playlist", playlist_checksum)
         playlist_details = self.cache.get(cache_str, checksum=checksum)
         expected_total = playlist["tracks"]["total"] or 0
         target_url = (
@@ -1819,9 +2030,9 @@ class PluginContent:
 
     def follow_playlist(self) -> None:
         self.__spotipy.current_user_follow_playlist(self.__playlist_id)
-        self.__set_relation_cache("followedplaylist", self.__playlist_id, True)
+        self.__after_relation_change("followedplaylist", self.__playlist_id, True)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        self.refresh_listing()
+        xbmc.executebuiltin("Container.Refresh")
 
     def add_track_to_playlist(self) -> None:
         xbmc.executebuiltin("ActivateWindow(busydialog)")
@@ -1855,49 +2066,50 @@ class PluginContent:
         self.__spotipy.playlist_remove_all_occurrences_of_items(
             self.__playlist_id, [self.__track_id]
         )
-        self.refresh_listing()
+        # The playlist snapshot_id changes, which invalidates its cached details.
+        xbmc.executebuiltin("Container.Refresh")
 
     def unfollow_playlist(self) -> None:
         self.__spotipy.current_user_unfollow_playlist(self.__playlist_id)
-        self.__set_relation_cache("followedplaylist", self.__playlist_id, False)
+        self.__after_relation_change("followedplaylist", self.__playlist_id, False)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        self.refresh_listing()
+        xbmc.executebuiltin("Container.Refresh")
 
     def follow_artist(self) -> None:
         self.__spotipy.user_follow_artists([self.__artist_id])
-        self.__set_relation_cache("followedartist", self.__artist_id, True)
+        self.__after_relation_change("followedartist", self.__artist_id, True)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        self.refresh_listing()
+        xbmc.executebuiltin("Container.Refresh")
 
     def unfollow_artist(self) -> None:
         self.__spotipy.user_unfollow_artists([self.__artist_id])
-        self.__set_relation_cache("followedartist", self.__artist_id, False)
+        self.__after_relation_change("followedartist", self.__artist_id, False)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        self.refresh_listing()
+        xbmc.executebuiltin("Container.Refresh")
 
     def save_album(self) -> None:
         self.__spotipy.current_user_saved_albums_add([self.__album_id])
-        self.__set_relation_cache("savedalbum", self.__album_id, True)
+        self.__after_relation_change("savedalbum", self.__album_id, True)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        self.refresh_listing()
+        xbmc.executebuiltin("Container.Refresh")
 
     def remove_album(self) -> None:
         self.__spotipy.current_user_saved_albums_delete([self.__album_id])
-        self.__set_relation_cache("savedalbum", self.__album_id, False)
+        self.__after_relation_change("savedalbum", self.__album_id, False)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        self.refresh_listing()
+        xbmc.executebuiltin("Container.Refresh")
 
     def save_track(self) -> None:
         self.__spotipy.current_user_saved_tracks_add([self.__track_id])
-        self.__set_relation_cache("savedtrack", self.__track_id, True)
+        self.__after_relation_change("savedtrack", self.__track_id, True)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        self.refresh_listing()
+        xbmc.executebuiltin("Container.Refresh")
 
     def remove_track(self) -> None:
         self.__spotipy.current_user_saved_tracks_delete([self.__track_id])
-        self.__set_relation_cache("savedtrack", self.__track_id, False)
+        self.__after_relation_change("savedtrack", self.__track_id, False)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
-        self.refresh_listing()
+        xbmc.executebuiltin("Container.Refresh")
 
     def __get_featured_playlists(self) -> Playlist:
         cache_str = "spotify.featuredplaylists"
@@ -2209,10 +2421,12 @@ class PluginContent:
             followed_artists = self.__get_followed_artist_ids_for_page(
                 [t.get("artistid") for t in new_tracks if t.get("artistid")]
             )
+            relation_ts = time.time()
             for track in new_tracks:
                 track["contextitems"] = self.__get_playlist_track_context_menu_items(
                     track, saved_track_ids, playlist_details, followed_artists
                 )
+                track[RELATION_SNAPSHOT_KEY] = relation_ts
         else:
             for track in new_tracks:
                 track["contextitems"] = []
@@ -2425,6 +2639,7 @@ class PluginContent:
         saved_albums = self.__get_saved_album_ids_for_page(
             [album.get("id") for album in albums if album and album.get("id")]
         )
+        relation_ts = time.time()
 
         # process listing
         for track in albums:
@@ -2448,6 +2663,7 @@ class PluginContent:
             track["artistid"] = (track.get("artists") or [{}])[0].get("id", "")
 
             track["contextitems"] = self.__get_album_track_context_menu_items(track, saved_albums)
+            track[RELATION_SNAPSHOT_KEY] = relation_ts
 
         return albums
 
@@ -2512,6 +2728,7 @@ class PluginContent:
         self, albums: List[Dict[str, Any]], append_artist_to_label: bool = False
     ) -> None:
         default_album_icon = os.path.join(self.__addon_icon_path, MUSIC_ALBUMS_ICON)
+        self.__apply_relation_overrides(albums)
         for track in albums:
             label = self.__get_track_name(track, append_artist_to_label)
             li = xbmcgui.ListItem(label, path=track["url"], offscreen=True)
@@ -2546,6 +2763,7 @@ class PluginContent:
                     if isinstance(a.get("artist") or a, dict)
                 ]
             )
+        relation_ts = time.time()
         for artist in artists:
             if artist.get("artist"):
                 artist = artist["artist"]
@@ -2569,6 +2787,7 @@ class PluginContent:
             artist["contextitems"] = self.__get_artist_context_menu_items(
                 artist, is_followed, followed_artists
             )
+            artist[RELATION_SNAPSHOT_KEY] = relation_ts
 
         return artists
 
@@ -2637,6 +2856,7 @@ class PluginContent:
 
     def __add_artist_listitems(self, artists: List[Dict[str, Any]]) -> None:
         default_artist_icon = os.path.join(self.__addon_icon_path, MUSIC_ARTISTS_ICON)
+        self.__apply_relation_overrides(artists)
         for item in artists:
             li = xbmcgui.ListItem(item["name"], path=item["url"], offscreen=True)
             tag = li.getMusicInfoTag()
@@ -2699,6 +2919,7 @@ class PluginContent:
             playlist["contextitems"] = self.__get_playlist_context_menu_items(
                 playlist, followed_playlist_states.get(playlist["id"])
             )
+            playlist[RELATION_SNAPSHOT_KEY] = time.time()
 
             playlists2.append(playlist)
 
@@ -2810,6 +3031,7 @@ class PluginContent:
     ) -> None:
         default_playlist_icon = os.path.join(self.__addon_icon_path, MUSIC_PLAYLISTS_ICON)
         addon_fanart = os.path.join(self.__addon_icon_path, "fanart.jpg")
+        self.__apply_relation_overrides(playlists)
         for item in playlists:
             if group_label:
                 item["label2"] = group_label
@@ -2852,7 +3074,7 @@ class PluginContent:
             xbmc.getLocalizedString(KODI_ALBUMS_STR_ID),
         )
         cache_str = f"spotify.artistalbums.{album_type}.{self.__artist_id}"
-        checksum = self.__cache_checksum()
+        checksum = self.__content_checksum("artistalbums", self.__user_country)
         albums = self.cache.get(cache_str, checksum=checksum)
 
         if albums:
@@ -2881,7 +3103,9 @@ class PluginContent:
             for album in artist_albums["items"]:
                 albumids.append(album["id"])
             albums = self.__prepare_album_listitems(albumids)
-            self.cache.set(cache_str, albums, checksum=checksum)
+            self.cache.set(
+                cache_str, albums, checksum=checksum, expiration=ARTIST_CONTENT_CACHE_EXPIRATION
+            )
 
         self.__add_album_listitems(albums)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_VIDEO_YEAR)
