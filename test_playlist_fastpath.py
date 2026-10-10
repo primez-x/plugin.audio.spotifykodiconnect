@@ -166,8 +166,42 @@ class FakeCache:
 
     def set_many(self, items, checksum=None, **kwargs):
         self.set_many_calls = getattr(self, "set_many_calls", 0) + 1
-        for key, value in dict(items).items():
+        items = dict(items)
+        self.set_many_log = getattr(self, "set_many_log", [])
+        self.set_many_log.append((list(items), kwargs))
+        for key, value in items.items():
             self.values[key] = (value, checksum)
+
+
+def read_chunked(cache, key):
+    """(head, items) of a chunked paged collection stored in a FakeCache."""
+    head = cache.values[key][0]
+    items = []
+    for index in range(head.get("_chunks") or 0):
+        items.extend(cache.values[f"{key}.chunk{index}"][0])
+    return head, items
+
+
+def rendered_context_items(plugin_content, content, kind, items, **kwargs):
+    """Render items through the plugin's add_*_listitems and return each
+    ListItem's context menu (menus are built at render time)."""
+    rendered = []
+    module = plugin_content.xbmcplugin
+    saved = (module.addDirectoryItem, module.addDirectoryItems)
+
+    def add_item(handle=None, url=None, listitem=None, isFolder=None, totalItems=None):
+        rendered.append(listitem)
+
+    def add_items(handle, items, totalItems=None):
+        rendered.extend(listitem for _url, listitem, _folder in items)
+
+    module.addDirectoryItem = add_item
+    module.addDirectoryItems = add_items
+    try:
+        getattr(content, f"_PluginContent__add_{kind}_listitems")(items, **kwargs)
+    finally:
+        module.addDirectoryItem, module.addDirectoryItems = saved
+    return [listitem.context_items for listitem in rendered]
 
 
 def install_kodi_stubs():
@@ -866,13 +900,13 @@ class PlaylistFastPathTests(unittest.TestCase):
         content._PluginContent__action = "browse_playlist"
         self.set_active_listing(content)
         content.browse_playlist()
-        content.cache.set_calls = []
+        content.cache.set_many_log = []
         try:
             DeferredThread.started_targets[0]()
         except RuntimeError:
             pass
         key = "spotify.playlistdetails.playlist-1"
-        writes = [kwargs for k, kwargs in content.cache.set_calls if k == key]
+        writes = [(keys, kwargs) for keys, kwargs in content.cache.set_many_log if key in keys]
         return content, key, writes
 
     def test_background_paging_writes_every_five_pages_and_at_end(self):
@@ -881,10 +915,17 @@ class PlaylistFastPathTests(unittest.TestCase):
         content, key, writes = self._run_playlist_continuation(spotify)
 
         self.assertEqual(3, len(writes), "pages 5 and 10 plus the final write")
-        self.assertTrue(all(w.get("mem_cache") is False for w in writes))
-        cached = content.cache.values[key][0]
-        self.assertEqual(650, len(cached["tracks"]["items"]))
-        self.assertTrue(cached["tracks"]["_dynamic_paging_complete"])
+        self.assertTrue(all(kwargs.get("mem_cache") is False for _keys, kwargs in writes))
+        # Only the chunk still filling is rewritten: 300 items -> chunk0,
+        # 550 -> chunk0 (now full) + chunk1, final 650 -> chunk1 only.
+        self.assertEqual(
+            [[f"{key}.chunk0"], [f"{key}.chunk0", f"{key}.chunk1"], [f"{key}.chunk1"]],
+            [[k for k in keys if k != key] for keys, _kwargs in writes],
+        )
+        head, items = read_chunked(content.cache, key)
+        self.assertEqual(650, len(items))
+        self.assertNotIn("items", head["tracks"])
+        self.assertTrue(head["tracks"]["_dynamic_paging_complete"])
 
     def test_background_paging_persists_progress_when_a_page_fails(self):
         class FailingThirdPage(FakeSpotify):
@@ -897,9 +938,9 @@ class PlaylistFastPathTests(unittest.TestCase):
         content, key, writes = self._run_playlist_continuation(spotify)
 
         self.assertEqual(1, len(writes))
-        cached = content.cache.values[key][0]
-        self.assertEqual(150, len(cached["tracks"]["items"]))
-        self.assertFalse(cached["tracks"]["_dynamic_paging_complete"])
+        head, items = read_chunked(content.cache, key)
+        self.assertEqual(150, len(items))
+        self.assertFalse(head["tracks"]["_dynamic_paging_complete"])
 
     def test_continuation_skips_while_rate_limited(self):
         events = RecordingPlayer.events
@@ -963,8 +1004,8 @@ class PlaylistFastPathTests(unittest.TestCase):
         self.assertEqual([], spotify.track_detail_requests)
         self.assertEqual([], spotify.saved_track_contains_requests)
         self.assertEqual(1, len(DeferredThread.started_targets))
-        cached = content.cache.values["spotify.savedtracks.user"][0]
-        self.assertEqual(50, len(cached["items"]))
+        cached, items = read_chunked(content.cache, "spotify.savedtracks.user")
+        self.assertEqual(50, len(items))
         self.assertFalse(cached["_dynamic_paging_complete"])
 
     def test_saved_tracks_continuation_hydrates_remaining_pages(self):
@@ -979,8 +1020,8 @@ class PlaylistFastPathTests(unittest.TestCase):
         DeferredThread.started_targets[0]()
 
         self.assertEqual([(50, 0, "US"), (50, 50, "US")], spotify.saved_track_requests)
-        cached = content.cache.values["spotify.savedtracks.user"][0]
-        self.assertEqual(75, len(cached["items"]))
+        cached, items = read_chunked(content.cache, "spotify.savedtracks.user")
+        self.assertEqual(75, len(items))
         self.assertTrue(cached["_dynamic_paging_complete"])
 
     def test_prepare_tracks_uses_page_local_relation_checks(self):
@@ -1018,9 +1059,8 @@ class PlaylistFastPathTests(unittest.TestCase):
         )
 
         self.assertEqual([], spotify.playlist_follow_requests)
-        self.assertTrue(
-            any("follow_playlist" in command for _label, command in playlists[0]["contextitems"])
-        )
+        menus = rendered_context_items(self.plugin_content, content, "playlist", playlists)
+        self.assertTrue(any("?action=follow_playlist&" in command for _label, command in menus[0]))
 
     def test_prepare_user_playlists_infers_external_items_are_followed_without_lookup(self):
         events = RecordingPlayer.events
@@ -1033,9 +1073,8 @@ class PlaylistFastPathTests(unittest.TestCase):
         )
 
         self.assertEqual([], spotify.playlist_follow_requests)
-        self.assertTrue(
-            any("unfollow_playlist" in command for _label, command in playlists[0]["contextitems"])
-        )
+        menus = rendered_context_items(self.plugin_content, content, "playlist", playlists)
+        self.assertTrue(any("unfollow_playlist" in command for _label, command in menus[0]))
 
     def test_prepare_daylist_uses_dynamic_title_and_daylist_subtitle(self):
         events = RecordingPlayer.events
