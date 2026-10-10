@@ -1022,6 +1022,11 @@ class PluginContent:
         except Exception as exc:
             log_exception(exc, "dynamic listing refresh")
 
+    def __refresh_listing_when_shown(self, target_url: str) -> None:
+        """Refresh target_url if it is (or within the wait becomes) the shown folder."""
+        if self.__wait_for_active_listing(target_url):
+            self.__refresh_active_listing(target_url)
+
     def __wait_for_active_listing(self, target_url: str) -> bool:
         """Poll (abort-aware) until target_url is Kodi's active folder or time runs out."""
         if not target_url:
@@ -1992,12 +1997,16 @@ class PluginContent:
                 self.__mark_dynamic_collection_state(playlist["tracks"], offset, total, True)
                 _persist()
                 unsaved_pages = 0
-                self.__refresh_active_listing(target_url)
+                self.__refresh_listing_when_shown(target_url)
             finally:
                 if unsaved_pages:
                     _persist()
 
-        self.__start_dynamic_page_continuation(cache_str, target_url, _continue_playlist_details)
+        # Completed even when the playlist is not on screen (home widgets,
+        # precache, a slow first render): the next visit shows every track.
+        self.__start_dynamic_page_continuation(
+            cache_str, target_url, _continue_playlist_details, require_active_listing=False
+        )
 
     def __start_playlist_collection_continuation(
         self,
@@ -3758,8 +3767,7 @@ class PluginContent:
                 unsaved_pages = 0
                 cache_log(f'Saved tracks for user "{self.__userid}" complete: {len(exact)}.')
                 if [t.get("id") for t in exact] != [t.get("id") for t in shown]:
-                    if self.__wait_for_active_listing(target_url):
-                        self.__refresh_active_listing(target_url)
+                    self.__refresh_listing_when_shown(target_url)
             finally:
                 if unsaved_pages:
                     _persist()
@@ -4226,9 +4234,9 @@ class PluginContent:
 
                 if self.__should_stop_precache(monitor, token):
                     return
-                saved_track_total = self.__get_saved_track_total()
-                if saved_track_total <= PRECACHE_MAX_LIBRARY_ITEMS:
-                    self.__get_saved_tracks()
+                # Any size: the rest pages in the background, and later visits
+                # only refetch the first page (see __merge_saved_tracks).
+                self.__get_saved_tracks()
                 completed = True
             finally:
                 if completed:
