@@ -7,7 +7,8 @@ import time
 import urllib.parse
 import datetime
 import hashlib
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import simplecache
@@ -79,6 +80,8 @@ MUSIC_SEARCH_ICON = "icon_music_search.png"
 MUSIC_EXPLORE_ICON = "icon_music_explore.png"
 CLEAR_CACHE_ICON = "icon_clear_cache.png"
 ARTIST_FANART_CACHE_MAX_ITEMS = 500
+_ARTIST_FANART_MEMO_LOCK = threading.Lock()
+_PAGE_FETCH_EXECUTOR = ThreadPoolExecutor
 DYNAMIC_PAGE_LIMIT = 50
 DYNAMIC_PAGING_COMPLETE_KEY = "_dynamic_paging_complete"
 DYNAMIC_PAGING_LOADED_KEY = "_dynamic_paging_loaded"
@@ -94,6 +97,9 @@ RELATION_CACHE_EXPIRATION = datetime.timedelta(minutes=5)
 # the end) instead of after every page; these collections are kept out of
 # simplecache's window-property mirror (database only).
 PAGED_CACHE_WRITE_EVERY_PAGES = 5
+# Background paging keeps this many page requests (fetch + prepare) in
+# flight; pages are still consumed and stored in order.
+PAGED_FETCH_WORKERS = 4
 # Content listings (album, artist pages, playlist details) are cached without
 # depending on library totals; liked/followed state is overlaid at render time
 # from user-action overrides (see __apply_relation_overrides).
@@ -111,6 +117,10 @@ LIBRARY_CHECKSUM_TTL_SECS = 60
 # rewrites the chunk that is still filling instead of the whole list.
 PAGED_CACHE_CHUNK_ITEMS = 500
 PAGED_CACHE_CHUNKS_KEY = "_chunks"
+# Saved tracks: items[:N] of a cached collection match Spotify, the rest is
+# the previous listing kept on screen until background paging replaces it.
+SAVED_TRACKS_EXACT_KEY = "_exact_items"
+SAVED_TRACKS_SOURCE_KEY = "_source"
 # Search: one /search call (all four types) per normalised query + market,
 # shared by the search menu and its four sub-listings (skin widgets).
 SEARCH_RESULT_LIMIT = 50
@@ -1028,12 +1038,17 @@ class PluginContent:
         return False
 
     def __start_dynamic_page_continuation(
-        self, busy_key: str, target_url: str, worker: Callable[[], None]
+        self,
+        busy_key: str,
+        target_url: str,
+        worker: Callable[[], None],
+        require_active_listing: bool = True,
     ) -> None:
         # Do not check Container.FolderPath here: during first navigation the
         # directory has not resolved yet and FolderPath is still the parent.
         # The worker waits for the listing to become active instead, and
-        # bails out (e.g. hidden widgets) if it never does.
+        # bails out (e.g. hidden widgets) if it never does, unless the
+        # collection is worth completing anyway (require_active_listing=False).
         prop_key = f"{DYNAMIC_PAGING_BUSY_PREFIX}{busy_key}"
         if self.__win.getProperty(prop_key):
             return
@@ -1044,7 +1059,7 @@ class PluginContent:
                 if utils.is_rate_limited():
                     cache_log(f"Dynamic continuation {busy_key} skipped; Spotify rate limited.")
                     return
-                if not self.__wait_for_active_listing(target_url):
+                if require_active_listing and not self.__wait_for_active_listing(target_url):
                     cache_log(f"Dynamic continuation {busy_key} skipped; listing not active.")
                     return
                 worker()
@@ -1062,6 +1077,41 @@ class PluginContent:
         collection[DYNAMIC_PAGING_LOADED_KEY] = int(loaded)
         collection[DYNAMIC_PAGING_COMPLETE_KEY] = bool(complete)
         collection["total"] = int(total)
+
+    @staticmethod
+    def __iter_pages_in_order(
+        start: int,
+        total: int,
+        fetch_page: Callable[[int], Any],
+        monitor: xbmc.Monitor,
+    ):
+        """Yield (offset, fetch_page(offset)) for start, start + page, ... < total.
+
+        Up to PAGED_FETCH_WORKERS pages are requested at once; results come
+        back in offset order, and a failed page raises when its turn comes.
+        Stops early on Kodi abort or when the consumer stops iterating.
+        """
+        offsets = iter(range(int(start), int(total), DYNAMIC_PAGE_LIMIT))
+        pool = _PAGE_FETCH_EXECUTOR(max_workers=PAGED_FETCH_WORKERS)
+        pending = deque()
+        try:
+            for offset in offsets:
+                pending.append((offset, pool.submit(fetch_page, offset)))
+                if len(pending) >= PAGED_FETCH_WORKERS:
+                    break
+            while pending:
+                if monitor.abortRequested():
+                    return
+                offset, future = pending.popleft()
+                result = future.result()
+                next_offset = next(offsets, None)
+                if next_offset is not None:
+                    pending.append((next_offset, pool.submit(fetch_page, next_offset)))
+                yield offset, result
+        finally:
+            for _offset, future in pending:
+                future.cancel()
+            pool.shutdown(wait=True)
 
     def __relation_cache_key(self, namespace: str, item_id: str) -> str:
         return f"spotify.relation.{namespace}.{self.__userid}.{item_id}"
@@ -1914,16 +1964,19 @@ class PluginContent:
                 )
                 persisted[0] = len(all_items)
 
+            def _fetch(page_offset: int):
+                raw = self.__get_playlist_items_page(
+                    playlist["id"], offset=page_offset, limit=DYNAMIC_PAGE_LIMIT
+                )
+                return raw, (self.__prepare_playlist_items_page(playlist, raw) if raw else [])
+
             try:
-                while total > offset:
-                    if monitor.abortRequested():
-                        return
-                    raw_items = self.__get_playlist_items_page(
-                        playlist["id"], offset=offset, limit=DYNAMIC_PAGE_LIMIT
-                    )
+                for _page_offset, (raw_items, prepared) in self.__iter_pages_in_order(
+                    loaded, total, _fetch, monitor
+                ):
                     if not raw_items:
                         break
-                    all_items += self.__prepare_playlist_items_page(playlist, raw_items)
+                    all_items += prepared
                     offset += len(raw_items)
                     playlist["tracks"]["items"] = all_items
                     self.__mark_dynamic_collection_state(
@@ -1934,6 +1987,8 @@ class PluginContent:
                         _persist()
                         unsaved_pages = 0
 
+                if monitor.abortRequested():
+                    return
                 self.__mark_dynamic_collection_state(playlist["tracks"], offset, total, True)
                 _persist()
                 unsaved_pages = 0
@@ -2796,19 +2851,21 @@ class PluginContent:
         artist_fanart_map: Dict[str, str] = {}
         if not artist_ids:
             return artist_fanart_map
-        if not hasattr(self, "_artist_fanart_cache"):
-            self._artist_fanart_cache = OrderedDict()
-        elif not isinstance(self._artist_fanart_cache, OrderedDict):
-            self._artist_fanart_cache = OrderedDict(self._artist_fanart_cache)
-        memo = self._artist_fanart_cache
+        # Background paging prepares pages on several threads at once.
+        with _ARTIST_FANART_MEMO_LOCK:
+            if not hasattr(self, "_artist_fanart_cache"):
+                self._artist_fanart_cache = OrderedDict()
+            elif not isinstance(self._artist_fanart_cache, OrderedDict):
+                self._artist_fanart_cache = OrderedDict(self._artist_fanart_cache)
+            memo = self._artist_fanart_cache
 
-        missing_artist_ids = []
-        for artist_id in artist_ids:
-            if artist_id in memo:
-                artist_fanart_map[artist_id] = memo[artist_id]
-                memo.move_to_end(artist_id)
-            else:
-                missing_artist_ids.append(artist_id)
+            missing_artist_ids = []
+            for artist_id in artist_ids:
+                if artist_id in memo:
+                    artist_fanart_map[artist_id] = memo[artist_id]
+                    memo.move_to_end(artist_id)
+                else:
+                    missing_artist_ids.append(artist_id)
 
         if missing_artist_ids:
             keys = {
@@ -2842,12 +2899,13 @@ class PluginContent:
                     except Exception as exc:
                         log_exception(exc, "artist fanart cache write")
                 found.update(fetched)
-            for artist_id, fanart in found.items():
-                artist_fanart_map[artist_id] = fanart
-                memo[artist_id] = fanart
-                memo.move_to_end(artist_id)
-            while len(memo) > ARTIST_FANART_CACHE_MAX_ITEMS:
-                memo.popitem(last=False)
+            with _ARTIST_FANART_MEMO_LOCK:
+                for artist_id, fanart in found.items():
+                    artist_fanart_map[artist_id] = fanart
+                    memo[artist_id] = fanart
+                    memo.move_to_end(artist_id)
+                while len(memo) > ARTIST_FANART_CACHE_MAX_ITEMS:
+                    memo.popitem(last=False)
 
         return artist_fanart_map
 
@@ -3603,6 +3661,35 @@ class PluginContent:
             known_saved_track_ids=saved_track_ids,
         )
 
+    def __saved_tracks_source(self) -> str:
+        """What a saved-tracks listing was built from. A listing cached under an
+        older checksum is only reused as a base when this still matches."""
+        return f"v{CACHE_SCHEMA_VERSION}-{self.__addon.getSetting('cache_checksum')}"
+
+    @staticmethod
+    def __merge_saved_tracks(
+        fresh: List[Dict[str, Any]], stale: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Lay the fresh first page over the previously cached listing.
+
+        Returns (items, reconciled). Reconciled means the old listing's head
+        sits inside the fresh page and the overlap matches, so only songs
+        liked (or re-liked, which moves them up) since then sit above it.
+        Otherwise the old items not on the fresh page follow it.
+        """
+        fresh_ids = [track.get("id") for track in fresh]
+        if stale:
+            head_id = stale[0].get("id")
+            if head_id in fresh_ids:
+                split = fresh_ids.index(head_id)
+                new_ids = set(fresh_ids[:split])
+                rest = [track for track in stale if track.get("id") not in new_ids]
+                overlap = fresh_ids[split:]
+                if [track.get("id") for track in rest[: len(overlap)]] == overlap:
+                    return list(fresh[:split]) + rest, True
+        seen = set(fresh_ids)
+        return list(fresh) + [track for track in stale if track.get("id") not in seen], False
+
     def __start_saved_tracks_continuation(
         self,
         cache_str: str,
@@ -3611,38 +3698,50 @@ class PluginContent:
         target_url: str,
     ) -> None:
         total = int(collection.get("total") or 0)
-        loaded = int(
-            collection.get(DYNAMIC_PAGING_LOADED_KEY) or len(collection.get("items") or [])
-        )
+        shown = list(collection.get("items") or [])
+        loaded = int(collection.get(DYNAMIC_PAGING_LOADED_KEY) or len(shown))
         if total <= loaded:
             return
+        exact_count = min(len(shown), int(collection.get(SAVED_TRACKS_EXACT_KEY, len(shown))))
 
         def _continue_saved_tracks():
             monitor = xbmc.Monitor()
-            all_items = list(collection.get("items") or [])
+            exact = shown[:exact_count]
+            exact_ids = {track.get("id") for track in exact}
+            # Previous listing kept below the fresh part until it is replaced.
+            stale_tail = shown[exact_count:]
             offset = loaded
             current_total = total
             unsaved_pages = 0
-            persisted = [len(all_items)]  # items already stored in the chunk rows
+            persisted = [len(exact)]  # leading items already stored in the chunk rows
 
             def _persist():
+                listing = exact + [t for t in stale_tail if t.get("id") not in exact_ids]
+                collection["items"] = listing
+                collection[SAVED_TRACKS_EXACT_KEY] = len(exact)
                 self.__store_saved_tracks(
-                    cache_str, collection, all_items, checksum, first_dirty_item=persisted[0]
+                    cache_str, collection, listing, checksum, first_dirty_item=persisted[0]
                 )
-                persisted[0] = len(all_items)
+                persisted[0] = len(exact)
+
+            def _fetch(page_offset: int):
+                page = self.__get_saved_tracks_page(offset=page_offset, limit=DYNAMIC_PAGE_LIMIT)
+                return page, self.__prepare_saved_track_items_page(page.get("items") or [])
 
             try:
-                while current_total > offset:
-                    if monitor.abortRequested():
-                        return
-                    page = self.__get_saved_tracks_page(offset=offset, limit=DYNAMIC_PAGE_LIMIT)
+                for _page_offset, (page, prepared) in self.__iter_pages_in_order(
+                    loaded, total, _fetch, monitor
+                ):
                     raw_items = page.get("items") or []
                     current_total = int(page.get("total") or current_total)
                     if not raw_items:
                         break
-                    all_items += self.__prepare_saved_track_items_page(raw_items)
+                    for track in prepared:
+                        # A like between two page requests shifts items by one.
+                        if track.get("id") not in exact_ids:
+                            exact_ids.add(track.get("id"))
+                            exact.append(track)
                     offset += len(raw_items)
-                    collection["items"] = all_items
                     self.__mark_dynamic_collection_state(
                         collection, offset, current_total, current_total <= offset
                     )
@@ -3650,16 +3749,26 @@ class PluginContent:
                     if unsaved_pages >= PAGED_CACHE_WRITE_EVERY_PAGES:
                         _persist()
                         unsaved_pages = 0
+                if monitor.abortRequested():
+                    return
 
                 self.__mark_dynamic_collection_state(collection, offset, current_total, True)
+                del stale_tail[:]
                 _persist()
                 unsaved_pages = 0
-                self.__refresh_active_listing(target_url)
+                cache_log(f'Saved tracks for user "{self.__userid}" complete: {len(exact)}.')
+                if [t.get("id") for t in exact] != [t.get("id") for t in shown]:
+                    if self.__wait_for_active_listing(target_url):
+                        self.__refresh_active_listing(target_url)
             finally:
                 if unsaved_pages:
                     _persist()
 
-        self.__start_dynamic_page_continuation(cache_str, target_url, _continue_saved_tracks)
+        # Completed even when the listing is not on screen (widgets, precache,
+        # a slow first render): the next visit then shows the whole list.
+        self.__start_dynamic_page_continuation(
+            cache_str, target_url, _continue_saved_tracks, require_active_listing=False
+        )
 
     def __get_saved_tracks(self):
         first_page = self.__get_saved_tracks_page(offset=0, limit=DYNAMIC_PAGE_LIMIT)
@@ -3687,13 +3796,38 @@ class PluginContent:
                     )
                 return tracks
 
-        tracks = self.__prepare_saved_track_items_page(raw_items)
-        collection = {"items": tracks}
+        fresh = self.__prepare_saved_track_items_page(raw_items)
+        tracks = fresh
         loaded = len(raw_items)
-        self.__mark_dynamic_collection_state(collection, loaded, total, total <= loaded)
+        complete = total <= loaded
+        source = self.__saved_tracks_source()
+        if not complete:
+            # A like or unlike changed the checksum: start from the previous
+            # listing instead of from the first page alone.
+            previous = self.__chunked_cache_get(cache_str, "")
+            if previous and previous[0].get(SAVED_TRACKS_SOURCE_KEY) == source:
+                previous_head, previous_items = previous
+                previous_exact = previous_head.get(DYNAMIC_PAGING_COMPLETE_KEY) and int(
+                    previous_head.get(SAVED_TRACKS_EXACT_KEY) or 0
+                ) >= len(previous_items)
+                tracks, reconciled = self.__merge_saved_tracks(fresh, previous_items)
+                if reconciled and previous_exact and len(tracks) == total:
+                    loaded = total
+                    complete = True
+                    fresh = tracks
+        collection = {
+            "items": tracks,
+            SAVED_TRACKS_EXACT_KEY: len(fresh),
+            SAVED_TRACKS_SOURCE_KEY: source,
+        }
+        self.__mark_dynamic_collection_state(collection, loaded, total, complete)
         self.__store_saved_tracks(cache_str, collection, tracks, checksum)
-        cache_log(f'Retrieved first {loaded}/{total} saved tracks for user "{self.__userid}".')
-        self.__start_saved_tracks_continuation(cache_str, checksum, collection, target_url)
+        cache_log(
+            f"Retrieved {len(tracks)} saved tracks ({len(fresh)} fresh) of {total} "
+            f'for user "{self.__userid}".'
+        )
+        if not complete:
+            self.__start_saved_tracks_continuation(cache_str, checksum, collection, target_url)
         return tracks
 
     def __store_saved_tracks(
