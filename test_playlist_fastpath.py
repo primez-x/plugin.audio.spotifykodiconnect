@@ -843,7 +843,7 @@ class PlaylistFastPathTests(unittest.TestCase):
         self.assertEqual(["fetch:0"], events)
         self.assertEqual(1, len(DeferredThread.started_targets))
 
-    def test_browse_playlist_skips_hidden_continuation_when_folder_is_not_active(self):
+    def test_browse_playlist_pages_hidden_playlist_without_refresh(self):
         for active_folder in ("", "plugin://plugin.audio.spotifykodiconnect/?action=other"):
             with self.subTest(active_folder=active_folder or "unknown"):
                 events = RecordingPlayer.events
@@ -860,11 +860,16 @@ class PlaylistFastPathTests(unittest.TestCase):
                     lambda label, active_folder=active_folder: active_folder
                 )
 
+                commands = []
+                self.plugin_content.xbmc.executebuiltin = commands.append
+
                 content.browse_playlist()
                 self.assertEqual(1, len(DeferredThread.started_targets))
                 DeferredThread.started_targets[0]()
 
-                self.assertEqual(["fetch:0"], events, "inactive listing must not page")
+                # Widgets: the rest is cached for the next visit, nothing refreshed.
+                self.assertEqual(["fetch:0", "fetch:50"], events)
+                self.assertEqual([], commands)
                 busy = [
                     key
                     for key in content._PluginContent__win.properties
@@ -900,6 +905,8 @@ class PlaylistFastPathTests(unittest.TestCase):
         def resolve():
             folder[0] = target_url
 
+        commands = []
+        self.plugin_content.xbmc.executebuiltin = commands.append
         FakeMonitor.wait_calls = 0
         FakeMonitor.on_wait = resolve
         try:
@@ -909,6 +916,7 @@ class PlaylistFastPathTests(unittest.TestCase):
 
         self.assertGreaterEqual(FakeMonitor.wait_calls, 1)
         self.assertEqual(["fetch:0", "fetch:50"], events)
+        self.assertEqual(["Container.Refresh"], commands)
         busy_props = [
             key
             for key in content._PluginContent__win.properties
@@ -987,7 +995,7 @@ class PlaylistFastPathTests(unittest.TestCase):
 
         self.assertEqual(["fetch:0"], events)
 
-    def test_continuation_gives_up_and_clears_busy_flag_when_never_active(self):
+    def test_refresh_wait_gives_up_and_clears_busy_flag_when_never_active(self):
         events = RecordingPlayer.events
         spotify = FakeSpotify(events, total=75)
         content = self.build_content(spotify)
@@ -998,11 +1006,15 @@ class PlaylistFastPathTests(unittest.TestCase):
         content._PluginContent__action = "browse_playlist"
         self.plugin_content.xbmc.getInfoLabel = lambda label: "addons://sources/audio/"
 
+        commands = []
+        self.plugin_content.xbmc.executebuiltin = commands.append
+
         content.browse_playlist()
         FakeMonitor.wait_calls = 0
         DeferredThread.started_targets[0]()
 
-        self.assertEqual(["fetch:0"], events)
+        self.assertEqual(["fetch:0", "fetch:50"], events)
+        self.assertEqual([], commands, "the refresh wait gives up on a hidden listing")
         expected_polls = int(
             self.plugin_content.ACTIVE_LISTING_WAIT_SECS
             / self.plugin_content.ACTIVE_LISTING_POLL_SECS
@@ -1779,6 +1791,26 @@ class SavedTracksPagingTests(unittest.TestCase):
 
         self.assertEqual(50, len(tracks))
         self.assertEqual(1, len(DeferredThread.started_targets))
+
+    def test_precache_loads_liked_songs_of_any_size(self):
+        spotify = LibrarySavedTracksSpotify(RecordingPlayer.events, range(1200))
+        content = self.build_content(spotify)
+        content._PluginContent__action = ""
+        content._PluginContent__navigation_token = "token"
+        content._PluginContent__win.setProperty(
+            self.plugin_content.PRECACHE_NAVIGATION_TOKEN_PROP, "token"
+        )
+        content._PluginContent__get_user_playlists = lambda userid: []
+        content._PluginContent__get_saved_album_total = lambda: 10 ** 6
+        content._PluginContent__get_followed_artist_total = lambda: 10 ** 6
+        self.plugin_content.xbmc.getInfoLabel = lambda label: ""
+
+        content._PluginContent__precache_library()
+        self.run_continuations()
+
+        head, items = read_chunked(content.cache, self.KEY)
+        self.assertEqual(1200, len(items))
+        self.assertTrue(head["_dynamic_paging_complete"])
 
     def test_pages_are_fetched_concurrently_and_consumed_in_order(self):
         import threading
