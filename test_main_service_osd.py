@@ -311,6 +311,124 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
         self.assertEqual([("track-1", 180)], published)
 
 
+class ServiceCacheAndFanartTests(unittest.TestCase):
+    def tearDown(self):
+        threading.Thread = _REAL_THREAD
+        FakeWindow.windows.clear()
+        for module_name in (
+            "main_service",
+            "playlist_next",
+            "simplecache",
+            "utils",
+            "xbmc",
+            "xbmcgui",
+        ):
+            sys.modules.pop(module_name, None)
+
+    def _install_fake_simplecache(self):
+        events = []
+
+        class FakeSimpleCache:
+            def __init__(self, addon_id):
+                events.append("open")
+
+            def vacuum_if_due(self):
+                events.append("vacuum")
+                return True
+
+            def close(self):
+                events.append("close")
+
+        module = types.ModuleType("simplecache")
+        module.SimpleCache = FakeSimpleCache
+        sys.modules["simplecache"] = module
+        return events
+
+    def test_cache_vacuum_skipped_while_playing(self):
+        main_service = import_main_service({})
+        events = self._install_fake_simplecache()
+        main_service.xbmc.Player = type("Playing", (), {"isPlaying": lambda self: True})
+
+        self.assertFalse(main_service._vacuum_plugin_cache_if_due())
+        self.assertEqual([], events)
+
+    def test_cache_vacuum_runs_when_idle_and_closes_cache(self):
+        main_service = import_main_service({})
+        events = self._install_fake_simplecache()
+        main_service.xbmc.Player = type("Idle", (), {"isPlaying": lambda self: False})
+
+        self.assertTrue(main_service._vacuum_plugin_cache_if_due())
+        self.assertEqual(["open", "vacuum", "close"], events)
+
+    def test_cache_keepalive_created_refreshed_and_reused(self):
+        main_service = import_main_service({})
+        events = self._install_fake_simplecache()
+
+        class FakeKeepAlive:
+            def __init__(self, addon_id):
+                events.append(("keepalive", addon_id))
+
+            def refresh(self):
+                events.append("refresh")
+                return True
+
+        sys.modules["simplecache"].WalKeepAlive = FakeKeepAlive
+        keepalive = main_service._refresh_cache_keepalive(None)
+        self.assertIs(keepalive, main_service._refresh_cache_keepalive(keepalive))
+        self.assertEqual([("keepalive", main_service.ADDON_ID), "refresh", "refresh"], events)
+
+    def _track_started_with(self, info_labels, current_item=None):
+        main_service = import_main_service(info_labels)
+        api_calls = []
+
+        class Client:
+            def __init__(self, auth=None):
+                pass
+
+            def track(self, track_id):
+                api_calls.append("track")
+                return {"artists": [{"id": "a1"}]}
+
+            def artist(self, artist_id):
+                api_calls.append("artist")
+                return {"images": [{"url": "https://api.example/a1.jpg"}]}
+
+            def current_user_saved_tracks_contains(self, ids):
+                return [False]
+
+        main_service.spotipy.Spotify = Client
+        main_service.get_cached_auth_token = lambda: "token"
+        main_service.get_next_playlist_item = lambda: (current_item, None)
+        service = object.__new__(main_service.MainService)
+        service._MainService__on_track_started("track-1", 180)
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        return api_calls, win.getProperty("Spotify.ArtistFanartCurrent")
+
+    def test_artist_fanart_read_from_player_art_without_api_calls(self):
+        api_calls, fanart = self._track_started_with(
+            {
+                "MusicPlayer.Property(spotifytrackid)": "track-1",
+                "Player.Art(artist.fanart)": "https://i.example/artist.jpg",
+            }
+        )
+        self.assertEqual([], api_calls)
+        self.assertEqual("https://i.example/artist.jpg", fanart)
+
+    def test_artist_fanart_read_from_queued_item_art(self):
+        item = {
+            "file": "http://127.0.0.1:52309/track/track-1/180.wav",
+            "art": {"artist.fanart": "image://https%3a%2f%2fi.example%2fq.jpg/"},
+        }
+        api_calls, fanart = self._track_started_with({}, current_item=item)
+        self.assertEqual([], api_calls)
+        self.assertEqual("https://i.example/q.jpg", fanart)
+
+    def test_artist_fanart_falls_back_to_api(self):
+        api_calls, fanart = self._track_started_with({})
+        self.assertEqual(["track", "artist"], api_calls)
+        self.assertEqual("https://api.example/a1.jpg", fanart)
+
+
 class TokenRenewBackoffTests(unittest.TestCase):
     def tearDown(self):
         threading.Thread = _REAL_THREAD

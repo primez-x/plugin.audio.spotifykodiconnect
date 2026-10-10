@@ -7,6 +7,7 @@ import math
 import os
 import threading
 import time
+import urllib.parse
 
 import bottle_manager
 import spotipy
@@ -65,6 +66,11 @@ PREBUFFER_RELEASE_DELAY_STEP_UP = 2.0
 PREBUFFER_RELEASE_DELAY_STEP_DOWN = 0.5
 TOKEN_RENEW_BACKOFF_INITIAL_SECS = 5.0
 TOKEN_RENEW_BACKOFF_MAX_SECS = 300.0
+# The plugin cache is compacted (VACUUM) only from the service: checked about
+# once an hour, run at most weekly (see SimpleCache.vacuum_if_due) and never
+# while Kodi is playing.
+CACHE_VACUUM_CHECK_EVERY_LOOPS = 600
+CACHE_KEEPALIVE_CHECK_EVERY_LOOPS = 10
 
 # Artist fanart for Music OSD (single largest image URL; no rotation – Spotify only provides same image in multiple sizes)
 _artist_fanart_urls = []  # type: list
@@ -275,6 +281,78 @@ def _refresh_playback_hooks(current_track_id: str, delay_ms: int = 0) -> None:
             log_exception(exc, "refreshing Spotify skin playback hooks failed")
 
     _start_daemon_thread(_run, task_name="playback hook refresh")
+
+
+def _decode_kodi_image_url(url: str) -> str:
+    """image://<url-encoded>/ (JSON-RPC art) -> plain URL; other values unchanged."""
+    url = (url or "").strip()
+    if url.startswith("image://"):
+        url = urllib.parse.unquote(url[len("image://") :])
+        if url.endswith("/"):
+            url = url[:-1]
+    return url
+
+
+def _queued_artist_fanart(track_id: str) -> str:
+    """artist.fanart the plugin set on the playing ListItem, if any."""
+    try:
+        if (xbmc.getInfoLabel("MusicPlayer.Property(spotifytrackid)") or "") in ("", track_id):
+            url = _decode_kodi_image_url(xbmc.getInfoLabel("Player.Art(artist.fanart)"))
+            if url:
+                return url
+        current_item, _next_item = get_next_playlist_item()
+        current_id, _duration = parse_track_url((current_item or {}).get("file") or "")
+        if current_id == track_id:
+            art = (current_item or {}).get("art") or {}
+            if isinstance(art, dict):
+                return _decode_kodi_image_url(art.get("artist.fanart") or "")
+    except Exception as exc:
+        log_exception(exc, "reading queued artist fanart")
+    return ""
+
+
+def _is_kodi_playing() -> bool:
+    try:
+        is_playing = getattr(xbmc.Player(), "isPlaying", None)
+        return bool(callable(is_playing) and is_playing())
+    except Exception:
+        return True
+
+
+def _vacuum_plugin_cache_if_due() -> bool:
+    """Compact the plugin's simplecache database when due and Kodi is idle."""
+    if _is_kodi_playing():
+        return False
+    cache = None
+    try:
+        import simplecache  # lazy: the service only needs it here
+
+        cache = simplecache.SimpleCache(ADDON_ID)
+        if _is_kodi_playing():
+            return False
+        return bool(cache.vacuum_if_due())
+    except Exception as exc:
+        log_exception(exc, "plugin cache vacuum")
+        return False
+    finally:
+        if cache is not None:
+            try:
+                cache.close()
+            except Exception:
+                pass
+
+
+def _refresh_cache_keepalive(keepalive):
+    """Hold one idle connection to the plugin cache (see simplecache.WalKeepAlive)."""
+    try:
+        if keepalive is None:
+            import simplecache  # lazy: the service only needs it here
+
+            keepalive = simplecache.WalKeepAlive(ADDON_ID)
+        keepalive.refresh()
+    except Exception as exc:
+        log_exception(exc, "plugin cache keepalive")
+    return keepalive
 
 
 def abort_app(timeout_in_secs: int) -> bool:
@@ -509,25 +587,29 @@ class MainService:
         def _fetch_artist_fanart_urls():
             global _artist_fanart_urls, _artist_fanart_index
             try:
-                if utils.is_rate_limited():
-                    return
-                token = get_cached_auth_token()
-                if not token:
-                    return
-                sp = spotipy.Spotify(auth=token)
-                track = sp.track(track_id)
-                artists = (track or {}).get("artists") or []
-                if not artists:
-                    return
-                artist_id = artists[0].get("id")
-                if not artist_id:
-                    return
-                artist = sp.artist(artist_id)
-                images = (artist or {}).get("images") or []
-                # Spotify returns same image in multiple sizes (640, 300, 64); use only largest
-                if not images:
-                    return
-                largest_url = images[0].get("url") or ""
+                # The plugin already put artist.fanart on the queued ListItem;
+                # only ask Spotify (track + artist calls) when it is missing.
+                largest_url = _queued_artist_fanart(track_id)
+                if not largest_url:
+                    if utils.is_rate_limited():
+                        return
+                    token = get_cached_auth_token()
+                    if not token:
+                        return
+                    sp = spotipy.Spotify(auth=token)
+                    track = sp.track(track_id)
+                    artists = (track or {}).get("artists") or []
+                    if not artists:
+                        return
+                    artist_id = artists[0].get("id")
+                    if not artist_id:
+                        return
+                    artist = sp.artist(artist_id)
+                    images = (artist or {}).get("images") or []
+                    # Spotify returns same image in multiple sizes (640, 300, 64); use only largest
+                    if not images:
+                        return
+                    largest_url = images[0].get("url") or ""
                 if not largest_url:
                     return
                 _artist_fanart_urls.clear()
@@ -787,6 +869,8 @@ class MainService:
         log_msg(f"Started bottle with port {PROXY_PORT}.")
 
         self.__renew_token()
+        # Keeps plugin processes' small cache writes from checkpointing the WAL.
+        self.__cache_keepalive = _refresh_cache_keepalive(None)
 
         loop_counter = 0
         loop_wait_in_secs = 6
@@ -822,6 +906,12 @@ class MainService:
                 )
                 self.__renew_token()
 
+            if (loop_counter % CACHE_KEEPALIVE_CHECK_EVERY_LOOPS) == 0:
+                # reopen after "Clear cache" deleted the database file
+                self.__cache_keepalive = _refresh_cache_keepalive(self.__cache_keepalive)
+            if (loop_counter % CACHE_VACUUM_CHECK_EVERY_LOOPS) == 0:
+                _start_daemon_thread(_vacuum_plugin_cache_if_due, task_name="cache vacuum")
+
             if abort_app(loop_wait_in_secs):
                 log_msg("Aborting the main service.")
                 break
@@ -833,6 +923,9 @@ class MainService:
         from spotty_cache import SpottyCacheManager
 
         SpottyCacheManager.cleanup_all()
+        keepalive = getattr(self, "_MainService__cache_keepalive", None)
+        if keepalive is not None:
+            keepalive.close()
         self.__prebuffer_manager.cancel_prebuffer()
         self.__http_spotty_streamer.stop()
         self.__spotty_helper.kill_all_spotties()
