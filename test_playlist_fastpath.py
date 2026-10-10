@@ -120,6 +120,27 @@ class RecordingPlayer:
         RecordingPlayer.events.append("play")
 
 
+class InlineExecutor:
+    """ThreadPoolExecutor stand-in that runs each page fetch at submit time."""
+
+    def __init__(self, max_workers=None):
+        self.submitted = 0
+
+    def submit(self, fn, *args):
+        from concurrent.futures import Future
+
+        self.submitted += 1
+        future = Future()
+        try:
+            future.set_result(fn(*args))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    def shutdown(self, wait=True):
+        pass
+
+
 class DeferredThread:
     started_targets = []
 
@@ -146,7 +167,8 @@ class FakeCache:
         if not item:
             return None
         value, item_checksum = item
-        if checksum is not None and item_checksum != checksum:
+        # Like simplecache: an empty checksum matches any row.
+        if checksum and item_checksum != checksum:
             return None
         return value
 
@@ -278,7 +300,10 @@ def import_plugin_content():
         sys.modules.pop("string_ids", None)
     import plugin_content
 
+    if plugin_content.threading.Thread is not DeferredThread:
+        DeferredThread.real_thread = plugin_content.threading.Thread
     plugin_content.threading.Thread = DeferredThread
+    plugin_content._PAGE_FETCH_EXECUTOR = InlineExecutor
     return plugin_content
 
 
@@ -1607,6 +1632,187 @@ class PlaylistFastPathTests(unittest.TestCase):
         self.assertEqual(1, spotify.saved_track_calls)
         self.assertEqual(1, spotify.saved_album_calls)
         self.assertEqual(1, spotify.followed_artist_calls)
+
+
+class LibrarySavedTracksSpotify(SavedTracksSpotify):
+    """Saved tracks backed by a mutable newest-first list of track indexes."""
+
+    def __init__(self, events, indexes):
+        super().__init__(events, saved_track_total=len(indexes))
+        self.indexes = list(indexes)
+
+    def current_user_saved_tracks(self, limit=50, offset=0, market=None):
+        self.saved_track_calls += 1
+        self.saved_track_requests.append((limit, offset, market))
+        return {
+            "total": len(self.indexes),
+            "items": [
+                {"added_at": f"t{index}", "track": spotify_track(index)}
+                for index in self.indexes[offset : offset + limit]
+            ],
+        }
+
+
+class SavedTracksPagingTests(unittest.TestCase):
+    KEY = "spotify.savedtracks.user"
+
+    def setUp(self):
+        self.plugin_content = import_plugin_content()
+        RecordingPlayer.events.clear()
+        DeferredThread.started_targets.clear()
+        FakeWindow.windows.clear()
+        self.commands = []
+        self.plugin_content.xbmc.executebuiltin = self.commands.append
+
+    build_content = PlaylistFastPathTests.build_content
+
+    def open_liked_songs(self, spotify, cache=None, active=True):
+        content = self.build_content(spotify)
+        if cache is not None:
+            content.cache = cache
+        content._PluginContent__params = {"action": ["browse_saved_tracks"]}
+        content._PluginContent__action = "browse_saved_tracks"
+        target_url = content._PluginContent__current_request_url()
+        folder = target_url if active else "addons://sources/audio/"
+        self.plugin_content.xbmc.getInfoLabel = lambda label: folder
+        DeferredThread.started_targets.clear()
+        tracks = content._PluginContent__get_saved_tracks()
+        return content, tracks
+
+    def run_continuations(self):
+        while DeferredThread.started_targets:
+            DeferredThread.started_targets.pop(0)()
+
+    def ids(self, tracks):
+        return [track["id"] for track in tracks]
+
+    def full_library(self, indexes):
+        spotify = LibrarySavedTracksSpotify(RecordingPlayer.events, indexes)
+        content, _tracks = self.open_liked_songs(spotify)
+        self.run_continuations()
+        self.commands.clear()
+        return spotify, content.cache
+
+    def test_large_library_loads_every_page(self):
+        spotify = LibrarySavedTracksSpotify(RecordingPlayer.events, range(2000))
+
+        content, tracks = self.open_liked_songs(spotify)
+        self.assertEqual(50, len(tracks))
+        self.run_continuations()
+
+        head, items = read_chunked(content.cache, self.KEY)
+        self.assertEqual([f"track-{i}" for i in range(2000)], self.ids(items))
+        self.assertTrue(head["_dynamic_paging_complete"])
+        self.assertEqual(2000, head["_exact_items"])
+        self.assertEqual(["Container.Refresh"], self.commands)
+        _content, reopened = self.open_liked_songs(spotify, content.cache)
+        self.assertEqual(2000, len(reopened))
+        self.assertEqual([], DeferredThread.started_targets)
+
+    def test_library_completes_while_listing_is_not_on_screen(self):
+        spotify = LibrarySavedTracksSpotify(RecordingPlayer.events, range(300))
+
+        content, _tracks = self.open_liked_songs(spotify, active=False)
+        self.run_continuations()
+
+        head, items = read_chunked(content.cache, self.KEY)
+        self.assertEqual(300, len(items))
+        self.assertTrue(head["_dynamic_paging_complete"])
+        self.assertEqual([], self.commands, "no refresh for a listing that is not shown")
+
+    def test_new_like_reuses_the_cached_library(self):
+        spotify, cache = self.full_library(range(1000))
+        spotify.indexes.insert(0, 5000)
+        spotify.saved_track_requests.clear()
+
+        _content, tracks = self.open_liked_songs(spotify, cache)
+
+        self.assertEqual(1001, len(tracks))
+        self.assertEqual(["track-5000", "track-0", "track-1"], self.ids(tracks)[:3])
+        self.assertEqual([(50, 0, "US")], spotify.saved_track_requests)
+        self.assertEqual([], DeferredThread.started_targets)
+        head, items = read_chunked(cache, self.KEY)
+        self.assertTrue(head["_dynamic_paging_complete"])
+        self.assertEqual(1001, len(items))
+
+    def test_reliked_song_moves_to_the_top_without_repaging(self):
+        spotify, cache = self.full_library(range(400))
+        spotify.indexes.remove(300)
+        spotify.indexes.insert(0, 300)
+
+        _content, tracks = self.open_liked_songs(spotify, cache)
+
+        self.assertEqual(400, len(tracks))
+        self.assertEqual("track-300", tracks[0]["id"])
+        self.assertEqual(1, self.ids(tracks).count("track-300"))
+        self.assertEqual([], DeferredThread.started_targets)
+
+    def test_unlike_keeps_the_old_list_until_repaged(self):
+        spotify, cache = self.full_library(range(400))
+        spotify.indexes.remove(250)
+
+        _content, tracks = self.open_liked_songs(spotify, cache)
+        self.assertEqual(400, len(tracks), "previous listing shown while repaging")
+        self.run_continuations()
+
+        head, items = read_chunked(cache, self.KEY)
+        self.assertEqual(399, len(items))
+        self.assertNotIn("track-250", self.ids(items))
+        self.assertTrue(head["_dynamic_paging_complete"])
+        self.assertEqual(["Container.Refresh"], self.commands)
+
+    def test_manual_refresh_does_not_reuse_the_cached_library(self):
+        spotify, cache = self.full_library(range(200))
+        spotify.indexes.insert(0, 900)
+
+        class RefreshedAddon(FakeAddon):
+            def getSetting(self, key):
+                return "manual-refresh" if key == "cache_checksum" else ""
+
+        content = self.build_content(spotify)
+        content.cache = cache
+        content._PluginContent__addon = RefreshedAddon()
+        content._PluginContent__params = {"action": ["browse_saved_tracks"]}
+        content._PluginContent__action = "browse_saved_tracks"
+        DeferredThread.started_targets.clear()
+        tracks = content._PluginContent__get_saved_tracks()
+
+        self.assertEqual(50, len(tracks))
+        self.assertEqual(1, len(DeferredThread.started_targets))
+
+    def test_pages_are_fetched_concurrently_and_consumed_in_order(self):
+        import threading
+        import time
+
+        real_thread = DeferredThread.real_thread
+        self.addCleanup(setattr, threading, "Thread", threading.Thread)
+        threading.Thread = real_thread
+        self.addCleanup(setattr, self.plugin_content, "_PAGE_FETCH_EXECUTOR",
+                        self.plugin_content._PAGE_FETCH_EXECUTOR)
+        from concurrent.futures import ThreadPoolExecutor
+
+        self.plugin_content._PAGE_FETCH_EXECUTOR = ThreadPoolExecutor
+        lock = threading.Lock()
+        state = {"running": 0, "peak": 0}
+
+        def fetch(offset):
+            with lock:
+                state["running"] += 1
+                state["peak"] = max(state["peak"], state["running"])
+            # Later pages finish first.
+            time.sleep(0.05 if offset % 100 == 0 else 0.01)
+            with lock:
+                state["running"] -= 1
+            return offset
+
+        pages = self.plugin_content.PluginContent._PluginContent__iter_pages_in_order(
+            50, 600, fetch, FakeMonitor()
+        )
+        results = [offset for offset, _result in pages]
+
+        self.assertEqual(list(range(50, 600, 50)), results)
+        self.assertGreater(state["peak"], 1)
+        self.assertLessEqual(state["peak"], self.plugin_content.PAGED_FETCH_WORKERS)
 
 
 if __name__ == "__main__":
