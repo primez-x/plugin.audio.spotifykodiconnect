@@ -1,0 +1,15 @@
+{
+  "branch": "master",
+  "tests": [
+    ["python3", "-m", "unittest", "test_cache_checksums"],
+    ["python3", "-m", "unittest", "test_http_spotty_audio_streamer"],
+    ["python3", "-m", "unittest", "test_main_service_osd"],
+    ["python3", "-m", "unittest", "test_play_queue"],
+    ["python3", "-m", "unittest", "test_playlist_fastpath"],
+    ["python3", "-m", "unittest", "test_plugin_auth"],
+    ["python3", "-m", "unittest", "test_simplecache"],
+    ["python3", "-m", "unittest", "test_spotipy_retry"],
+    ["python3", "-m", "unittest", "test_spotty_audio_streamer"],
+    ["python3", "-m", "unittest", "test_spotty_auth"]
+  ]
+}
