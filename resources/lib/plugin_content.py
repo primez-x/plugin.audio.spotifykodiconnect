@@ -11,6 +11,7 @@ from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
+import listing_timing
 import simplecache
 import spotty
 import utils
@@ -339,7 +340,12 @@ class PluginContent:
     __cached_checksum = ""
     __last_playlist_position = 0
 
-    def __init__(self):
+    def __init__(self, started_at: Optional[float] = None):
+        timer = listing_timing.ListingTimer(started_at)
+        timer.mark("import")
+        timing_enabled = self.__timing_log_enabled()
+        if timing_enabled:
+            listing_timing.count_directory_items(xbmcplugin, timer)
         try:
             # logging.basicConfig(level=logging.DEBUG)
 
@@ -353,7 +359,9 @@ class PluginContent:
 
             self.parse_params()
 
-            if not self.check_auth_and_refresh_spotipy():
+            authorized = self.check_auth_and_refresh_spotipy()
+            timer.mark("auth")
+            if not authorized:
                 return
             self.__navigation_token = str(time.time())
             self.__win.setProperty(PRECACHE_NAVIGATION_TOKEN_PROP, self.__navigation_token)
@@ -372,10 +380,20 @@ class PluginContent:
                 if self.__addon.getSetting("library_precache_enabled").lower() == "true":
                     precache_thread = threading.Thread(target=self.__precache_library, daemon=True)
                     precache_thread.start()
+            timer.mark("listing")
 
         except Exception as exc:
             log_exception(exc, "PluginContent init error")
             xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+        finally:
+            if timing_enabled:
+                log_msg(timer.line(listing_timing.label(self.__params)), LOGINFO)
+
+    def __timing_log_enabled(self) -> bool:
+        try:
+            return self.__addon.getSetting(listing_timing.SETTING_ID).lower() == "true"
+        except Exception:
+            return False
 
     def check_auth_and_refresh_spotipy(self) -> bool:
         """Ensure a Spotify client exists. Returns False when the request was ended.

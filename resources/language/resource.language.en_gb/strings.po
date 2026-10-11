@@ -365,3 +365,11 @@ msgstr ""
 msgctxt "#11151"
 msgid "Spotify is still connecting. If this keeps happening your login may have expired. Authenticate again now?"
 msgstr ""
+
+msgctxt "#11152"
+msgid "Log listing times"
+msgstr ""
+
+msgctxt "#11153"
+msgid "Write one line per Spotify listing (widgets and browsing) to the Kodi log with the time it took. Leave disabled unless you are measuring widget speed."
+msgstr ""

@@ -58,5 +58,14 @@
         >
           <control type="toggle" />
         </setting>
+        <setting
+            id="listing_timing_log"
+            type="bool"
+            default="false"
+            label="11152"
+            help="11153"
+        >
+          <control type="toggle" />
+        </setting>
     </category>
 </settings>
