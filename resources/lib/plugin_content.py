@@ -1454,7 +1454,10 @@ class PluginContent:
                 genres_list = [str(g) for g in genre if g]
 
         # Local playback by using proxy on this machine.
-        url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{track['id']}/{duration_sec}.wav"
+        # The URL carries milliseconds: it sets the WAV length, and whole seconds
+        # rounded up left up to a second of silence after the music.
+        url_duration = f"{max(1.0, (track.get('duration_ms') or 0) / 1000):.3f}"
+        url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{track['id']}/{url_duration}.wav"
 
         li = xbmcgui.ListItem(label, offscreen=True)
         li.setProperty("isPlayable", "true")

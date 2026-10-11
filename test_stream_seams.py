@@ -195,9 +195,9 @@ class StreamSeamTests(unittest.TestCase):
     def _server(self, spotty, prebuffer_manager=None):
         return self.http.HTTPSpottyAudioStreamer(spotty, prebuffer_manager=prebuffer_manager)
 
-    def _get(self, server, range_header=None):
+    def _get(self, server, range_header=None, duration=f"{DURATION}.wav"):
         self.http.bottle.request.headers = {"Range": range_header} if range_header else {}
-        body = server.spotty_stream_audio_track(TRACK, f"{DURATION}.wav")
+        body = server.spotty_stream_audio_track(TRACK, duration)
         self.assertTrue(hasattr(body, "__iter__"), self.http.bottle.response.status)
         self.open.append(body)
         return body
@@ -235,6 +235,14 @@ class StreamSeamTests(unittest.TestCase):
         served = self._read(self._get(self._server(spotty)))
         self._assert_served(served, 0)
         self.assertEqual([], spotty.seeks())
+
+    def test_millisecond_duration_ends_with_the_audio(self):
+        # A whole-second length (rounded up) padded silence after the music.
+        spotty = RampSpotty(cuts=[None])
+        served = self._read(self._get(self._server(spotty), duration="29.987.wav"))
+        frames = round(29.987 * FRAMES_PER_SEC)
+        self.assertEqual(len(self.header) + frames * 4, len(served))
+        self.assertEqual(RAMP[: frames * 4], served[len(self.header) :])
 
     def test_offset_retry_is_sample_exact(self):
         # Spotty dies mid-track; the retry resumes at a whole second.

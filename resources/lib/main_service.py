@@ -195,7 +195,7 @@ def _publish_track_hook(win, prefix: str, item, track_id: str = "", duration=Non
     file_url = item.get("file") or ""
     thumb = _item_art(item, "thumb", "poster", "icon", "fanart", "landscape")
     fanart = _item_art(item, "artist.fanart", "fanart", "landscape", "thumb", "poster")
-    duration_value = duration or item.get("duration") or item.get("runtime") or ""
+    duration_value = round(duration) if duration else item.get("duration") or item.get("runtime") or ""
 
     _set_or_clear(win, f"Spotify.{prefix}Id", track_id)
     _set_or_clear(win, f"Spotify.{prefix}Title", title)
@@ -815,7 +815,8 @@ class MainService:
                     images = album.get("images") or []
                     art_url = images[0].get("url") if images else ""
                     duration_sec = math.ceil(duration_ms / 1000) if duration_ms else 1
-                    url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{tid}/{duration_sec}.wav"
+                    url_duration = f"{max(1.0, duration_ms / 1000):.3f}"
+                    url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{tid}/{url_duration}.wav"
                     li = xbmcgui.ListItem(label=name)
                     li.setProperty("IsPlayable", "true")
                     li.setProperty("spotifytrackid", tid)

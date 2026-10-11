@@ -38,7 +38,7 @@ class SpottyStreamSpec:
     """Immutable track/settings snapshot used by one HTTP response."""
 
     track_id: str
-    track_duration: int
+    track_duration: float
     wav_header: bytes
     track_length: int
     bitrate: str
@@ -95,7 +95,7 @@ class SpottyAudioStreamer:
         self.chunk_size = _get_kodi_chunk_size()
 
         self.__track_id: str = ""
-        self.__track_duration: int = 0
+        self.__track_duration: float = 0
         self.__wav_header: bytes = bytes()
         self.__track_length: int = 0
 
@@ -115,7 +115,7 @@ class SpottyAudioStreamer:
         """Total byte length of the WAV stream (header + PCM) for the current track."""
         return self.__track_length
 
-    def get_track_duration(self) -> int:
+    def get_track_duration(self) -> float:
         """Track duration in seconds used for the WAV header."""
         return self.__track_duration
 
@@ -152,7 +152,7 @@ class SpottyAudioStreamer:
                 )
                 self.__track_duration = 1
             else:
-                self.__track_duration = int(track_duration)
+                self.__track_duration = float(track_duration)
         except (TypeError, ValueError):
             log_msg(
                 f"Warning: Could not parse track duration {track_duration} for track {track_id}. Using 1s fallback.",
@@ -639,7 +639,7 @@ def create_wav_header_for_duration(duration_sec: float) -> Tuple[bytes, int]:
     """Create a WAV header and total stream length for a given duration (no side effects)."""
     try:
         file = BytesIO()
-        num_samples = int(44100 * max(1.0, float(duration_sec)))
+        num_samples = round(44100 * max(1.0, float(duration_sec)))
         channels = 2
         sample_rate = 44100
         bits_per_sample = 16

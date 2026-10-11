@@ -24,7 +24,7 @@ PLAYLIST_MUSIC = 0
 # URL pattern for our track endpoint: http://127.0.0.1:PORT/track/TRACK_ID/DURATION.wav
 # Also matches legacy localhost URLs and optional .wav suffix for backwards compat.
 _TRACK_URL_PATTERN = re.compile(
-    r"^https?://(?:localhost|127\.0\.0\.1)(?::\d+)?/track/([^/]+)/(\d+)(?:\.wav)?(?:/)?$",
+    r"^https?://(?:localhost|127\.0\.0\.1)(?::\d+)?/track/([^/]+)/(\d+(?:\.\d+)?)(?:\.wav)?(?:/)?$",
     re.I,
 )
 
@@ -100,7 +100,7 @@ def parse_track_url(file_url):
         return None, None
     track_id, duration_str = m.group(1), m.group(2)
     try:
-        duration_sec = int(duration_str)
+        duration_sec = float(duration_str)
         return track_id, duration_sec
     except ValueError:
         return None, None

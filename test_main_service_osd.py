@@ -293,11 +293,11 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
 
     def test_confirmed_spotify_playback_publishes_current_track_hook(self):
         main_service = import_main_service(
-            {"Player.FileNameAndPath": "http://127.0.0.1:52309/track/track-1/180.wav"},
+            {"Player.FileNameAndPath": "http://127.0.0.1:52309/track/track-1/213.560.wav"},
             {"prebuffer_enabled": "false", "spotify_autoplay": "false"},
         )
         main_service.get_next_playlist_item = lambda: (
-            {"file": "http://127.0.0.1:52309/track/track-1/180.wav"},
+            {"file": "http://127.0.0.1:52309/track/track-1/213.560.wav"},
             None,
         )
         service = object.__new__(main_service.MainService)
@@ -308,7 +308,7 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
 
         service._MainService__on_spotify_playback_started("track-1")
 
-        self.assertEqual([("track-1", 180)], published)
+        self.assertEqual([("track-1", 213.56)], published)
 
 
 class ServiceCacheAndFanartTests(unittest.TestCase):
@@ -730,8 +730,8 @@ class SpotifyAutoplayGatingTests(unittest.TestCase):
         self.assertEqual([("recommendations", ("seed",), 49)], calls)
         self.assertEqual(
             [
-                "http://127.0.0.1:52309/track/rec-1/181.wav",
-                "http://127.0.0.1:52309/track/rec-3/181.wav",
+                "http://127.0.0.1:52309/track/rec-1/180.500.wav",
+                "http://127.0.0.1:52309/track/rec-3/180.500.wav",
             ],
             [url for url, _li in added],
         )
