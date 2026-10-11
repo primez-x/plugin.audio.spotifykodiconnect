@@ -363,6 +363,16 @@ class HTTPSpottyAudioStreamer:
         # Real PCM plus a non-error active state is the strongest safe fallback.
         return True
 
+    @staticmethod
+    def _downloader_is_paused(downloader) -> bool:
+        # Kodi's next range request often finds no reader attached: a parked
+        # writer is idle, and restarting it would seek Spotty mid-track.
+        is_paused = getattr(downloader, "is_paused", None)
+        try:
+            return callable(is_paused) and bool(is_paused())
+        except Exception:
+            return False
+
     def _previous_downloader_finished_for_handoff(
         self,
         previous_track_id: str,
@@ -516,7 +526,9 @@ class HTTPSpottyAudioStreamer:
 
             if reuse_request_id is not None:
                 downloader = self._find_downloader(track_id, request_byte)
-                healthy = self._downloader_has_healthy_progress(downloader)
+                healthy = self._downloader_has_healthy_progress(
+                    downloader
+                ) or self._downloader_is_paused(downloader)
                 with self.__stream_lock:
                     # State may have changed while downloader health was checked.
                     # Retry coordination instead of acting on a stale snapshot.

@@ -689,20 +689,18 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         dl._download_loop = lambda: None
         dl.start()
 
-        pcm = bytes(2 * 1024 * 1024)
+        pcm = bytes(dl._TRIM_RETAIN_BYTES + 2 * 1024 * 1024)
         with dl.cond:
             dl._buffer.extend(pcm)
             dl.written_bytes += len(pcm)
-
-        full_len = len(dl._buffer)
-        self.assertGreater(full_len, 2 * 1024 * 1024)
 
         with dl.cond:
             dl._consumed_pos = dl.written_bytes
             dl._trim_head_locked()
 
-        self.assertEqual(dl._trim_offset, dl.written_bytes)
-        self.assertLess(len(dl._buffer), dl._TRIM_BATCH_BYTES)
+        # Everything consumed is reclaimed except the retained history.
+        self.assertEqual(dl.written_bytes - dl._TRIM_RETAIN_BYTES, dl._trim_offset)
+        self.assertEqual(dl._TRIM_RETAIN_BYTES, len(dl._buffer))
 
     def test_trim_head_preserves_unconsumed_bytes(self):
         """_trim_head_locked must not drop bytes the consumer hasn't read."""
@@ -753,16 +751,17 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         dl._download_loop = lambda: None
         dl.start()
 
-        slow_reader_pos = 1536 * 1024
-        fast_reader_pos = 3 * 1024 * 1024
+        retain = dl._TRIM_RETAIN_BYTES
+        slow_reader_pos = retain + 1536 * 1024
+        fast_reader_pos = retain + 3 * 1024 * 1024
         with dl.cond:
-            dl._buffer.extend(bytes(4 * 1024 * 1024))
-            dl.written_bytes += 4 * 1024 * 1024
+            dl._buffer.extend(bytes(retain + 4 * 1024 * 1024))
+            dl.written_bytes += retain + 4 * 1024 * 1024
             dl._consumer_positions = {1: slow_reader_pos, 2: fast_reader_pos}
             dl._consumed_pos = fast_reader_pos
             dl._trim_head_locked()
 
-        self.assertEqual(slow_reader_pos, dl._trim_offset)
+        self.assertEqual(slow_reader_pos - retain, dl._trim_offset)
 
     def test_trim_head_does_not_overflow_drop_active_reader_bytes(self):
         """The unread-tail cap must not discard bytes from an active reader."""
@@ -814,10 +813,11 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         dl._download_loop = lambda: None
         dl.start()
 
+        written = dl._TRIM_RETAIN_BYTES + 2 * 1024 * 1024
         with dl.cond:
-            dl._buffer.extend(bytes(2 * 1024 * 1024))
-            dl.written_bytes += 2 * 1024 * 1024
-            dl.real_pcm_bytes = 2 * 1024 * 1024
+            dl._buffer.extend(bytes(written))
+            dl.written_bytes += written
+            dl.real_pcm_bytes = written
             dl.last_progress_monotonic = time.monotonic()
             dl._consumed_pos = dl.written_bytes
             dl._trim_head_locked()
@@ -1584,6 +1584,7 @@ class SpottyBackpressureTests(unittest.TestCase):
         # Attempt 1 delivers exactly HIGH bytes then exits (rc=1) while the
         # writer is paused. Attempt 2 makes progress and fails again; only the
         # progress-based budget reset allows attempt 3 with one retry allowed.
+        # Retries start one second before the resume point and align by content.
         spotty = PatternSpotty(pcm, limits=[high, 347888, None], returncodes=[1, 1, 0])
         downloader, wav_header, track_length = self._make(spotty, duration=3)
         downloader._consumer_positions[0] = 0
@@ -1604,8 +1605,6 @@ class SpottyBackpressureTests(unittest.TestCase):
         self.assertFalse(downloader.error)
         self.assertEqual(3, len(spotty.calls))
         self.assertNotIn("--start-position", spotty.calls[0])
-        for call, expected in ((spotty.calls[1], "1"), (spotty.calls[2], "2")):
-            self.assertEqual(expected, call[call.index("--start-position") + 1])
         self.assertEqual(track_length, downloader.written_bytes)
         self.assertEqual(wav_header + pcm, bytes(downloader._buffer))
 

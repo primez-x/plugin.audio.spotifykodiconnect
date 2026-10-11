@@ -10,6 +10,7 @@
     ["python3", "-m", "unittest", "test_simplecache"],
     ["python3", "-m", "unittest", "test_spotipy_retry"],
     ["python3", "-m", "unittest", "test_spotty_audio_streamer"],
-    ["python3", "-m", "unittest", "test_spotty_auth"]
+    ["python3", "-m", "unittest", "test_spotty_auth"],
+    ["python3", "-m", "unittest", "test_stream_seams"]
   ]
 }

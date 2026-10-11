@@ -1,7 +1,9 @@
 import re
 import threading
 import time
+from array import array
 from collections import deque
+from operator import sub
 
 from spotty import Spotty
 from utils import log_exception, log_msg
@@ -24,6 +26,19 @@ _STDERR_PENDING_MAX_CHARS = 8192
 _BP_HIGH_BYTES = 16 * 1024 * 1024
 _BP_LOW_BYTES = 12 * 1024 * 1024
 _STDOUT_READ_BYTES = 65536
+# Resuming a track after Spotty exits: --start-position lands on a decoder
+# packet boundary tens of milliseconds *before* the requested second (measured
+# 37-58 ms on CoreELEC), so a seconds offset plus a byte skip repeats audio.
+# Instead restart _RESUME_LEAD_SECONDS earlier and find the exact resume point
+# by matching the last _RESUME_REF_BYTES already written against the new
+# output.  The restarted decode equals the earlier one only up to dither, hence
+# the per-sample tolerance.
+_RESUME_LEAD_SECONDS = 1
+_RESUME_REF_BYTES = 8192
+_RESUME_SEARCH_BEFORE_BYTES = PCM_BYTES_PER_SEC // 4
+_RESUME_SEARCH_AFTER_BYTES = PCM_BYTES_PER_SEC
+_RESUME_SAMPLE_TOLERANCE = 8
+_RESUME_MIN_PEAK = 64
 # An attempt that delivered at least this much real PCM made real progress;
 # its failure resets the consecutive-failure retry budget.
 _RETRY_BUDGET_RESET_BYTES = 1024 * 1024
@@ -123,6 +138,38 @@ class _SpottyStderrTail:
             return " | ".join(self._lines)
 
 
+def _find_resume_offset(ref: bytes, data: bytes, lo: int, hi: int):
+    """Return the byte offset in *data* just past its best match of *ref*.
+
+    Candidates are frame-aligned end offsets in [lo, hi].  A candidate must be
+    within _RESUME_SAMPLE_TOLERANCE on every sample; the lowest total
+    difference wins.  Returns None for near-silent references (ambiguous) or
+    when nothing matches.
+    """
+    ref_samples = array("h", ref)
+    peak = max(ref_samples, key=abs, default=0)
+    if abs(peak) < _RESUME_MIN_PEAK:
+        return None
+    anchor = ref_samples.index(peak)
+    count = len(ref_samples)
+    data_samples = array("h", data[: len(data) - len(data) % 4])
+    tolerance = _RESUME_SAMPLE_TOLERANCE
+    best = None
+    best_cost = None
+    end = max(lo, len(ref)) // 4 * 4
+    last = min(hi, len(data_samples) * 2)
+    while end <= last:
+        first = (end - len(ref)) // 2
+        if abs(data_samples[first + anchor] - peak) <= tolerance:
+            diffs = list(map(abs, map(sub, data_samples[first : first + count], ref_samples)))
+            if max(diffs) <= tolerance:
+                cost = sum(diffs)
+                if best_cost is None or cost < best_cost:
+                    best, best_cost = end, cost
+        end += 4
+    return best
+
+
 def _clamp_volume(value: int) -> int:
     try:
         v = int(value)
@@ -152,7 +199,12 @@ class SpottyDownloader:
     # oldest bytes beyond this cap are dropped.  Backpressure keeps the buffer
     # below it (see the import-time assertion after this class).  Late range
     # requests for dropped bytes fall through to get_or_start (the seek path).
+    # _TRIM_RETAIN_BYTES: history kept behind the slowest reader.  Bytes we
+    # yielded may still sit in socket buffers when Kodi drops a connection;
+    # it resumes from what it actually received, which must stay readable or
+    # the request restarts Spotty at a seconds offset (an audible seam).
     _TRIM_BATCH_BYTES = 1024 * 1024
+    _TRIM_RETAIN_BYTES = 4 * 1024 * 1024
     _MAX_UNREAD_TAIL_BYTES = 24 * 1024 * 1024
 
     def __init__(
@@ -239,12 +291,19 @@ class SpottyDownloader:
     def is_reader_paused(self) -> bool:
         """True while the writer is backpressure-paused by an attached reader."""
         with self.cond:
-            return (
-                self._bp_paused
-                and bool(self._consumer_positions)
-                and not self.error
-                and not self.aborted
-            )
+            return bool(self._consumer_positions) and self._is_paused_locked()
+
+    def is_paused(self) -> bool:
+        """True while the writer is backpressure-paused, reader attached or not.
+
+        A prebuffer, or a stream between two of Kodi's range requests, parks
+        here for as long as nobody reads; that is idle, not stalled.
+        """
+        with self.cond:
+            return self._is_paused_locked()
+
+    def _is_paused_locked(self) -> bool:
+        return self._bp_paused and self.real_pcm_bytes > 0 and not self.error and not self.aborted
 
     def _bp_reference_locked(self) -> int:
         """Position the writer's lead is measured from.  Caller holds self.cond.
@@ -350,12 +409,13 @@ class SpottyDownloader:
             self.first_real_pcm_monotonic = now
         self.last_progress_monotonic = now
 
-    def _build_args(self, start_byte=None):
+    def _build_args(self, start_byte=None, lead_sec=0):
+        """Spotty args and the byte skip from its nominal start to *start_byte*."""
         # Calculate start position in seconds. 176400 bytes per second (44.1kHz, 16-bit, stereo)
         target_start_byte = self.start_byte if start_byte is None else int(start_byte)
         header_len = len(self.wav_header)
         pcm_target_offset = max(0, target_start_byte - header_len)
-        start_sec_wav = pcm_target_offset // PCM_BYTES_PER_SEC if pcm_target_offset > 0 else 0
+        start_sec_wav = max(0, pcm_target_offset // PCM_BYTES_PER_SEC - lead_sec)
 
         args = [
             "--disable-audio-cache",
@@ -374,7 +434,31 @@ class SpottyDownloader:
         args += ["--single-track", f"spotify:track:{self.track_id}"]
         if start_sec_wav > 0:
             args += ["--start-position", str(start_sec_wav)]
-        return args, (pcm_target_offset % PCM_BYTES_PER_SEC)
+        return args, pcm_target_offset - start_sec_wav * PCM_BYTES_PER_SEC
+
+    def _resume_reference_locked(self, resume_byte: int):
+        """Already-written real PCM ending at the frame boundary at/before
+        *resume_byte*, or None when not enough of it is buffered.  Caller
+        holds self.cond."""
+        header_len = len(self.wav_header)
+        frame_end = resume_byte - (resume_byte - header_len) % 4
+        ref_start = frame_end - _RESUME_REF_BYTES
+        buffer_start = self.start_byte + self._trim_offset
+        if ref_start < max(buffer_start, header_len, self.start_byte):
+            return None
+        index = ref_start - buffer_start
+        return bytes(self._buffer[index : index + _RESUME_REF_BYTES])
+
+    def _read_prefix(self, process, size, attempt_state, attempt_state_lock) -> bytes:
+        prefix = bytearray()
+        while len(prefix) < size and not self.aborted:
+            chunk = process.stdout.read(min(_STDOUT_READ_BYTES, size - len(prefix)))
+            if not chunk:
+                break
+            prefix += chunk
+            with attempt_state_lock:
+                attempt_state["last_output_at"] = time.monotonic()
+        return bytes(prefix)
 
     # Session/transient retry: when spotty exits before enough real PCM arrives,
     # keep the HTTP generator open and retry from the byte offset already buffered.
@@ -411,8 +495,17 @@ class SpottyDownloader:
             watchdog_thread = None
             stderr_tail = None
             try:
-                attempt_start_byte = self.start_byte + self.written_bytes
-                args, pcm_skip = self._build_args(attempt_start_byte)
+                with self.cond:
+                    attempt_start_byte = self.start_byte + self.written_bytes
+                    resume_ref = self._resume_reference_locked(attempt_start_byte)
+                lead_sec = _RESUME_LEAD_SECONDS if resume_ref is not None else 0
+                args, pcm_skip = self._build_args(attempt_start_byte, lead_sec)
+                log_msg(
+                    f"Spotty attempt {attempt + 1} for {self.track_id} at byte "
+                    f"{attempt_start_byte}: skip {pcm_skip}"
+                    f"{', content-aligned' if resume_ref is not None else ''}",
+                    LOGDEBUG,
+                )
                 process = self.spotty.run_spotty(args)
                 attempt_process = process
                 with attempt_state_lock:
@@ -486,21 +579,48 @@ class SpottyDownloader:
                 watchdog_thread = threading.Thread(target=_watch_attempt, daemon=True)
                 watchdog_thread.start()
 
-                if pcm_skip > 0:
-                    discarded = 0
-                    while discarded < pcm_skip and not self.aborted:
-                        chunk = process.stdout.read(min(8192, pcm_skip - discarded))
-                        if not chunk:
-                            break
-                        discarded += len(chunk)
-                        with attempt_state_lock:
-                            attempt_state["last_output_at"] = time.monotonic()
+                pending = b""
+                if resume_ref is not None:
+                    partial = (attempt_start_byte - len(self.wav_header)) % 4
+                    nominal = pcm_skip - partial
+                    prefix = self._read_prefix(
+                        process,
+                        pcm_skip + _RESUME_SEARCH_AFTER_BYTES,
+                        attempt_state,
+                        attempt_state_lock,
+                    )
+                    match = _find_resume_offset(
+                        resume_ref,
+                        prefix,
+                        nominal - _RESUME_SEARCH_BEFORE_BYTES,
+                        nominal + _RESUME_SEARCH_AFTER_BYTES,
+                    )
+                    if match is None:
+                        log_msg(
+                            f"Spotty resume for {self.track_id} at byte {attempt_start_byte}: "
+                            f"no content match, using nominal skip {pcm_skip}.",
+                            LOGWARNING,
+                        )
+                        cut = pcm_skip
+                    else:
+                        cut = match + partial
+                        log_msg(
+                            f"Spotty resume for {self.track_id} at byte {attempt_start_byte}: "
+                            f"aligned skip {cut} (seek landed {cut - pcm_skip} bytes early).",
+                            LOGDEBUG,
+                        )
+                    pending = prefix[cut:]
+                elif pcm_skip > 0:
+                    self._read_prefix(process, pcm_skip, attempt_state, attempt_state_lock)
 
                 while not self.aborted:
                     self._wait_for_room(attempt_state, attempt_state_lock)
                     if self.aborted:
                         break
-                    chunk = process.stdout.read(_STDOUT_READ_BYTES)
+                    if pending:
+                        chunk, pending = pending, b""
+                    else:
+                        chunk = process.stdout.read(_STDOUT_READ_BYTES)
                     if not chunk:
                         break
                     if self.aborted:
@@ -678,15 +798,16 @@ class SpottyDownloader:
         """Drop consumed/surplus bytes from the buffer head.  Caller holds self.cond.
 
         Never blocks (writer pacing is _wait_for_room's job).  Reclaims bytes
-        every active consumer has already read, in batched frame-aligned slices
-        to amortize the bytearray memmove.  The unread-tail cap is insurance
+        every active consumer has already read, less _TRIM_RETAIN_BYTES of
+        history, in batched frame-aligned slices to amortize the bytearray
+        memmove.  The unread-tail cap is insurance
         for the no-reader case; backpressure keeps the buffer below it.
         """
         safe_consumed_pos = (
             min(self._consumer_positions.values())
             if self._consumer_positions
             else self._consumed_pos
-        )
+        ) - self._TRIM_RETAIN_BYTES
         reclaimable = safe_consumed_pos - self._trim_offset
         if reclaimable >= self._TRIM_BATCH_BYTES:
             reclaim = reclaimable - (reclaimable % 4)
@@ -731,12 +852,16 @@ class SpottyDownloader:
 
 
 # With no reader attached the buffer holds at most HIGH (+ one stdout read)
-# unread bytes plus < one trim batch of consumed bytes, so the insurance cap
+# unread bytes plus the retained history and < one trim batch of consumed
+# bytes, so the insurance cap
 # must never be what bounds a paused prebuffer (it would drop its head and
 # force a discard/restart when playback begins).
 assert (
     _BP_LOW_BYTES < _BP_HIGH_BYTES
-    and _BP_HIGH_BYTES + SpottyDownloader._TRIM_BATCH_BYTES + _STDOUT_READ_BYTES
+    and _BP_HIGH_BYTES
+    + SpottyDownloader._TRIM_RETAIN_BYTES
+    + SpottyDownloader._TRIM_BATCH_BYTES
+    + _STDOUT_READ_BYTES
     < SpottyDownloader._MAX_UNREAD_TAIL_BYTES
 ), "backpressure high-water mark must stay below the unread-tail cap"
 
