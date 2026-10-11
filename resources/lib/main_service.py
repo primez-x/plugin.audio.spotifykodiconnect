@@ -293,6 +293,55 @@ def _decode_kodi_image_url(url: str) -> str:
     return url
 
 
+def _now_playing_is_bare(track_id: str) -> bool:
+    """True when Kodi plays this track's stream URL without the plugin's ListItem.
+
+    A skin's PlayMedia(<path>) (e.g. from a search widget) passes only the URL,
+    so the player has no tag and shows the URL's file name, the duration.
+    """
+    try:
+        if xbmc.getInfoLabel("MusicPlayer.Property(spotifytrackid)"):
+            return False
+        playing_id, _duration = parse_track_url(xbmc.getInfoLabel("Player.FilenameAndPath"))
+        return bool(track_id) and playing_id == track_id
+    except Exception as exc:
+        log_exception(exc, "checking the now-playing tag")
+        return False
+
+
+def _restore_now_playing_tag(track_id: str, track: dict) -> bool:
+    """Give a bare Spotify stream the title, artist, album and art the plugin's
+    ListItem would have carried."""
+    file_url = xbmc.getInfoLabel("Player.FilenameAndPath")
+    if parse_track_url(file_url)[0] != track_id:
+        return False  # the track changed while Spotify answered
+    album = track.get("album") or {}
+    artists = [a.get("name") for a in track.get("artists") or [] if a.get("name")]
+    title = track.get("name") or ""
+    li = xbmcgui.ListItem(title, path=file_url, offscreen=True)
+    tag = li.getMusicInfoTag()
+    tag.setTitle(title)
+    tag.setArtist(", ".join(artists))
+    tag.setAlbum(album.get("name") or "")
+    tag.setDuration(max(1, math.ceil((track.get("duration_ms") or 0) / 1000)))
+    tag.setTrack(int(track.get("track_number") or 0))
+    tag.setDisc(int(track.get("disc_number") or 1))
+    tag.setMediaType("song")
+    release_date = album.get("release_date") or ""
+    if release_date:
+        tag.setReleaseDate(release_date)
+        if release_date[:4].isdigit():
+            tag.setYear(int(release_date[:4]))
+    images = album.get("images") or []
+    if images and images[0].get("url"):
+        image = images[0]["url"]
+        li.setArt({"thumb": image, "poster": image, "fanart": image, "icon": image})
+    li.setProperty("spotifytrackid", track_id)
+    xbmc.Player().updateInfoTag(li)
+    log_msg(f"Restored the now-playing tag for {track_id} (played without its ListItem).", LOGDEBUG)
+    return True
+
+
 def _queued_artist_fanart(track_id: str) -> str:
     """artist.fanart the plugin set on the playing ListItem, if any."""
     try:
@@ -588,9 +637,11 @@ class MainService:
             global _artist_fanart_urls, _artist_fanart_index
             try:
                 # The plugin already put artist.fanart on the queued ListItem;
-                # only ask Spotify (track + artist calls) when it is missing.
+                # only ask Spotify (track + artist calls) when it is missing, or
+                # for the track's tag when it was played without its ListItem.
+                bare = _now_playing_is_bare(track_id)
                 largest_url = _queued_artist_fanart(track_id)
-                if not largest_url:
+                if not largest_url or bare:
                     if utils.is_rate_limited():
                         return
                     token = get_cached_auth_token()
@@ -598,6 +649,12 @@ class MainService:
                         return
                     sp = spotipy.Spotify(auth=token)
                     track = sp.track(track_id)
+                    if bare and track:
+                        try:
+                            _restore_now_playing_tag(track_id, track)
+                        except Exception as exc:
+                            log_exception(exc, "restoring the now-playing tag")
+                if not largest_url:
                     artists = (track or {}).get("artists") or []
                     if not artists:
                         return

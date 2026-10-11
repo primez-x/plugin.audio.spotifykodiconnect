@@ -429,6 +429,122 @@ class ServiceCacheAndFanartTests(unittest.TestCase):
         self.assertEqual("https://api.example/a1.jpg", fanart)
 
 
+class BareNowPlayingTagTests(unittest.TestCase):
+    """A skin's PlayMedia(<stream url>) plays the track without the plugin's
+    ListItem; the OSD then showed the URL's file name (the duration)."""
+
+    URL = "http://127.0.0.1:52309/track/track-1/238.wav"
+
+    def tearDown(self):
+        threading.Thread = _REAL_THREAD
+        FakeWindow.windows.clear()
+        for module_name in ("main_service", "playlist_next", "utils", "xbmc", "xbmcgui", "spotipy"):
+            sys.modules.pop(module_name, None)
+
+    def _start(self, info_labels, api_track=None):
+        main_service = import_main_service(info_labels)
+        updates, api_calls = [], []
+
+        class Tag:
+            def __init__(self):
+                self.values = {}
+
+            def __getattr__(self, name):
+                if name.startswith("set"):
+                    return lambda value: self.values.__setitem__(name[3:].lower(), value)
+                raise AttributeError(name)
+
+        class ListItem:
+            def __init__(self, label="", path="", offscreen=False):
+                self.label, self.path = label, path
+                self.tag, self.art, self.props = Tag(), {}, {}
+
+            def getMusicInfoTag(self):
+                return self.tag
+
+            def setArt(self, art):
+                self.art = art
+
+            def setProperty(self, key, value):
+                self.props[key] = value
+
+        class Player:
+            def updateInfoTag(self, item):
+                updates.append(item)
+
+        class Client:
+            def __init__(self, auth=None):
+                pass
+
+            def track(self, track_id):
+                api_calls.append("track")
+                return api_track
+
+            def artist(self, artist_id):
+                api_calls.append("artist")
+                return {"images": []}
+
+            def current_user_saved_tracks_contains(self, ids):
+                return [False]
+
+        main_service.xbmcgui.ListItem = ListItem
+        main_service.xbmc.Player = Player
+        main_service.spotipy.Spotify = Client
+        main_service.get_cached_auth_token = lambda: "token"
+        main_service.get_next_playlist_item = lambda: (None, None)
+        service = object.__new__(main_service.MainService)
+        service._MainService__on_track_started("track-1", 238)
+        return updates, api_calls
+
+    TRACK = {
+        "name": "Rich Baby Daddy",
+        "artists": [{"id": "a1", "name": "Drake"}, {"id": "a2", "name": "Sexyy Red"}],
+        "album": {
+            "name": "For All The Dogs",
+            "release_date": "2023-10-06",
+            "images": [{"url": "https://i.example/640.jpg"}],
+        },
+        "duration_ms": 319191,
+        "track_number": 23,
+        "disc_number": 1,
+    }
+
+    def test_bare_stream_gets_title_artist_album_and_art(self):
+        updates, api_calls = self._start({"Player.FilenameAndPath": self.URL}, self.TRACK)
+        self.assertEqual(1, len(updates))
+        item = updates[0]
+        self.assertEqual(self.URL, item.path)
+        values = item.tag.values
+        self.assertEqual("Rich Baby Daddy", values["title"])
+        self.assertEqual("Drake, Sexyy Red", values["artist"])
+        self.assertEqual("For All The Dogs", values["album"])
+        self.assertEqual(320, values["duration"])
+        self.assertEqual(2023, values["year"])
+        self.assertEqual("song", values["mediatype"])
+        self.assertEqual("https://i.example/640.jpg", item.art["thumb"])
+        self.assertEqual("track-1", item.props["spotifytrackid"])
+        self.assertEqual(1, api_calls.count("track"))
+
+    def test_plugin_listitem_playback_is_left_alone(self):
+        updates, api_calls = self._start(
+            {
+                "Player.FilenameAndPath": self.URL,
+                "MusicPlayer.Property(spotifytrackid)": "track-1",
+                "Player.Art(artist.fanart)": "https://i.example/artist.jpg",
+            },
+            self.TRACK,
+        )
+        self.assertEqual([], updates)
+        self.assertEqual([], api_calls)
+
+    def test_track_changed_before_spotify_answered_is_not_tagged(self):
+        updates, _ = self._start(
+            {"Player.FilenameAndPath": "http://127.0.0.1:52309/track/track-2/200.wav"},
+            self.TRACK,
+        )
+        self.assertEqual([], updates)
+
+
 class TokenRenewBackoffTests(unittest.TestCase):
     def tearDown(self):
         threading.Thread = _REAL_THREAD
