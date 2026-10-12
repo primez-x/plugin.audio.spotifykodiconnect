@@ -23,9 +23,13 @@ def _install_stubs():
     utils = types.ModuleType("utils")
     utils.LOGDEBUG = 0
     utils.PROXY_HOST = "127.0.0.1"
-    utils.log_msg = lambda *a, **k: None
+    utils.log_calls = []
+    utils.log_msg = lambda msg, loglevel=0, *a, **k: utils.log_calls.append((loglevel, msg))
     utils.log_exception = lambda *a, **k: None
     sys.modules["utils"] = utils
+    xbmc = types.ModuleType("xbmc")
+    xbmc.LOGWARNING = 2
+    sys.modules["xbmc"] = xbmc
 
 
 def _free_port():
@@ -36,7 +40,7 @@ def _free_port():
 
 class StopThreadReleasesPortTest(unittest.TestCase):
     def setUp(self):
-        self._saved = {name: sys.modules.get(name) for name in ("utils", "bottle", "bottle_manager")}
+        self._saved = {name: sys.modules.get(name) for name in ("utils", "xbmc", "bottle", "bottle_manager")}
         _install_stubs()
         sys.path[:0] = [LIB_DIR, os.path.join(LIB_DIR, "deps")]
         sys.modules.pop("bottle_manager", None)
@@ -116,6 +120,34 @@ class StopThreadReleasesPortTest(unittest.TestCase):
                 except OSError:
                     threading.Event().wait(0.1)
         self.assertEqual(stderr.getvalue(), "")
+
+    def test_requests_are_logged_at_debug_and_errors_at_warning_level(self):
+        def ping():
+            return "pong"
+
+        ping.route = "/ping"
+        self.bottle_manager.route_all(types.SimpleNamespace(ping=ping))
+        port = _free_port()
+        self.bottle_manager.start_thread(port)
+        self.addCleanup(self.bottle_manager.stop_thread)
+        log_calls = sys.modules["utils"].log_calls
+
+        for _ in range(50):
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/ping", timeout=5) as resp:
+                    resp.read()
+                break
+            except OSError:
+                threading.Event().wait(0.1)
+        # A request line wsgiref rejects with "code 400, message ..."
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            sock.sendall(b"not a http request\r\n\r\n")
+            sock.recv(1024)
+
+        access = [call for call in log_calls if "GET /ping" in call[1]]
+        self.assertEqual([level for level, _ in access], [0])
+        errors = [call for call in log_calls if "code 400" in call[1]]
+        self.assertEqual([level for level, _ in errors], [2])
 
 
 if __name__ == "__main__":

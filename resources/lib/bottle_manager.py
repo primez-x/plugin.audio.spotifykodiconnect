@@ -6,6 +6,7 @@ from wsgiref.simple_server import make_server
 
 import bottle
 from bottle import Bottle
+from xbmc import LOGWARNING
 from utils import log_msg, log_exception, LOGDEBUG, PROXY_HOST
 
 STREAMING_TIMEOUT_IN_SECS = 600
@@ -37,13 +38,16 @@ class MyWSGIRefServer(bottle.WSGIRefServer):
             def address_string(self) -> str:
                 return self.client_address[0]
 
-            def log_request(*args, **kw):
+            # wsgiref writes to stderr, which Kodi logs at error level. Log the
+            # access line of every request at debug level instead...
+            def log_request(handler, code="-", size="-"):
                 if not self.quiet:
-                    return WSGIRequestHandler.log_request(*args, **kw)
+                    log_msg(f'{handler.address_string()} - "{handler.requestline}" {code} {size}', LOGDEBUG)
 
-            # wsgiref writes to stderr, which Kodi logs at error level.
+            # ...and keep real errors (log_error, e.g. "code 400" or "Request
+            # timed out") visible at warning level.
             def log_message(handler, format, *args):
-                log_msg(f"{handler.address_string()} - {format % args}", LOGDEBUG)
+                log_msg(f"{handler.address_string()} - {format % args}", LOGWARNING)
 
         handler_cls = self.options.get("handler_class", FixedHandler)
         server_cls = self.options.get("server_class", ThreadedWSGIServer)
