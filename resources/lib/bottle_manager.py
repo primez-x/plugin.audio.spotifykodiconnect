@@ -19,7 +19,9 @@ bottle._stderr = __bottle_stderr
 
 
 class ThreadedWSGIServer(socketserver.ThreadingMixIn, WSGIServer):
-    pass
+    # A track stream can stay open for minutes; it must not keep the service
+    # alive (or the port bound) after Kodi asks the service to stop.
+    daemon_threads = True
 
 
 # Need this copy of 'bottle.WSGIRefServer' to add a 'shutdown' method, so we can do a
@@ -66,6 +68,8 @@ class MyWSGIRefServer(bottle.WSGIRefServer):
     def shutdown(self) -> None:
         log_msg("Shutdown wsgiref server requested...")
         self.__server.shutdown()
+        # Release the port so a restarted service can bind it again.
+        self.__server.server_close()
 
 
 __server: MyWSGIRefServer = MyWSGIRefServer()
