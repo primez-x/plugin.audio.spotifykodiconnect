@@ -41,6 +41,10 @@ class MyWSGIRefServer(bottle.WSGIRefServer):
                 if not self.quiet:
                     return WSGIRequestHandler.log_request(*args, **kw)
 
+            # wsgiref writes to stderr, which Kodi logs at error level.
+            def log_message(handler, format, *args):
+                log_msg(f"{handler.address_string()} - {format % args}", LOGDEBUG)
+
         handler_cls = self.options.get("handler_class", FixedHandler)
         server_cls = self.options.get("server_class", ThreadedWSGIServer)
 

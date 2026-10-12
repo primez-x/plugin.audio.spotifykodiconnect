@@ -83,6 +83,35 @@ CLEAR_CACHE_ICON = "icon_clear_cache.png"
 ARTIST_FANART_CACHE_MAX_ITEMS = 500
 _ARTIST_FANART_MEMO_LOCK = threading.Lock()
 _PAGE_FETCH_EXECUTOR = ThreadPoolExecutor
+# Background work started by this plugin invocation; plugin.py waits for it
+# with join_background_threads() before the script returns.
+_BACKGROUND_THREADS: List[threading.Thread] = []
+BACKGROUND_ABORT_GRACE_SECS = 3.0
+
+
+def _start_background_thread(target: Callable[[], None]) -> None:
+    thread = threading.Thread(target=target, daemon=True)
+    _BACKGROUND_THREADS.append(thread)
+    thread.start()
+
+
+def join_background_threads() -> None:
+    """Wait for this invocation's background work before the script returns.
+
+    Kodi tears down the Python interpreter once the script returns; threads
+    still running then race that teardown, which can crash Kodi. The work
+    stops at its next abortRequested() check when Kodi stops the script, so
+    on abort wait only a short grace, within Kodi's 5 s stop limit.
+    """
+    monitor = xbmc.Monitor()
+    abort_deadline = None
+    for thread in _BACKGROUND_THREADS:
+        while thread.is_alive():
+            if abort_deadline is None and monitor.abortRequested():
+                abort_deadline = time.monotonic() + BACKGROUND_ABORT_GRACE_SECS
+            if abort_deadline is not None and time.monotonic() >= abort_deadline:
+                return
+            thread.join(0.2)
 DYNAMIC_PAGE_LIMIT = 50
 DYNAMIC_PAGING_COMPLETE_KEY = "_dynamic_paging_complete"
 DYNAMIC_PAGING_LOADED_KEY = "_dynamic_paging_loaded"
@@ -378,8 +407,7 @@ class PluginContent:
                 log_msg("Browsing main.")
                 self.__browse_main()
                 if self.__addon.getSetting("library_precache_enabled").lower() == "true":
-                    precache_thread = threading.Thread(target=self.__precache_library, daemon=True)
-                    precache_thread.start()
+                    _start_background_thread(self.__precache_library)
             timer.mark("listing")
 
         except Exception as exc:
@@ -1091,7 +1119,7 @@ class PluginContent:
             finally:
                 self.__win.clearProperty(prop_key)
 
-        threading.Thread(target=_run, daemon=True).start()
+        _start_background_thread(_run)
 
     @staticmethod
     def __mark_dynamic_collection_state(
@@ -2351,8 +2379,7 @@ class PluginContent:
                 # original is still loading and autoplay never fires.
                 play_queue_mark_original_complete()
 
-        t = threading.Thread(target=add_remaining, daemon=True)
-        t.start()
+        _start_background_thread(add_remaining)
 
     def __get_category(self, categoryid: str) -> Playlist:
         categoryid = self.__resolve_category_id(categoryid)

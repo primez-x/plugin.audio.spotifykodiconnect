@@ -1,6 +1,7 @@
 {
   "branch": "master",
   "tests": [
+    ["python3", "-m", "unittest", "test_background_threads"],
     ["python3", "-m", "unittest", "test_bottle_manager"],
     ["python3", "-m", "unittest", "test_cache_checksums"],
     ["python3", "-m", "unittest", "test_http_spotty_audio_streamer"],

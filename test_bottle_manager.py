@@ -5,6 +5,8 @@ listening socket open, so the new service failed to bind with EADDRINUSE and
 every track request timed out until Kodi was restarted.
 """
 
+import contextlib
+import io
 import os
 import socket
 import sys
@@ -92,6 +94,28 @@ class StopThreadReleasesPortTest(unittest.TestCase):
         with socket.socket() as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("127.0.0.1", port))
+
+    def test_requests_are_not_logged_to_stderr(self):
+        # Kodi logs a Python add-on's stderr at error level.
+        def ping():
+            return "pong"
+
+        ping.route = "/ping"
+        self.bottle_manager.route_all(types.SimpleNamespace(ping=ping))
+        port = _free_port()
+        self.bottle_manager.start_thread(port)
+        self.addCleanup(self.bottle_manager.stop_thread)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            for _ in range(50):
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/ping", timeout=5) as resp:
+                        self.assertEqual(resp.read(), b"pong")
+                    break
+                except OSError:
+                    threading.Event().wait(0.1)
+        self.assertEqual(stderr.getvalue(), "")
 
 
 if __name__ == "__main__":
