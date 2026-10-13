@@ -17,6 +17,7 @@ import xbmc
 import xbmcaddon
 import xbmcgui
 from http_spotty_audio_streamer import HTTPSpottyAudioStreamer
+from like_actions import begin_like_request, notify_not_connected, set_current_track_liked
 from play_queue import clear as play_queue_clear
 from play_queue import should_fire_autoplay as play_queue_should_fire_autoplay
 from playlist_next import get_next_playlist_item, get_playlist_track_ids, parse_track_url
@@ -30,6 +31,7 @@ from utils import (
     PROXY_HOST,
     PROXY_PORT,
     get_cached_auth_token,
+    get_valid_cached_auth_token,
     log_exception,
     log_msg,
 )
@@ -114,19 +116,17 @@ class _SpotifyOSDServiceMonitor(xbmc.Monitor):
             if not track_id:
                 log_msg("ToggleLike: no current track id.", LOGWARNING)
                 return
-            token = get_cached_auth_token()
+            token = get_valid_cached_auth_token()
             if not token:
-                log_msg("ToggleLike: no auth token.", LOGWARNING)
+                notify_not_connected()
                 return
             # Use cached property for toggle direction — avoids an extra API round-trip.
             currently_liked = bool(win.getProperty("Spotify.CurrentTrackLiked"))
 
             # Optimistic update: flip the icon immediately so the UI feels instant.
             # The API call below confirms the change; reverted on failure.
-            if currently_liked:
-                win.clearProperty("Spotify.CurrentTrackLiked")
-            else:
-                win.setProperty("Spotify.CurrentTrackLiked", "true")
+            request = begin_like_request()
+            set_current_track_liked(track_id, not currently_liked, request)
 
             sp = spotipy.Spotify(auth=token)
             try:
@@ -137,11 +137,9 @@ class _SpotifyOSDServiceMonitor(xbmc.Monitor):
                     sp.current_user_saved_tracks_add([track_id])
                     log_msg(f"ToggleLike: liked {track_id}.", LOGDEBUG)
             except Exception as api_exc:
-                # Revert the optimistic update so the icon matches actual Spotify state.
-                if currently_liked:
-                    win.setProperty("Spotify.CurrentTrackLiked", "true")
-                else:
-                    win.clearProperty("Spotify.CurrentTrackLiked")
+                # Revert the optimistic update so the icon matches actual Spotify state
+                # (skipped if playback moved on or a newer toggle took over).
+                set_current_track_liked(track_id, currently_liked, request)
                 log_exception(api_exc, "ToggleLike API call failed, reverted icon")
                 return
 

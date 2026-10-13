@@ -24,6 +24,17 @@ class FakeAddon:
     def getSetting(self, key):
         return FAKE_SETTINGS.get(key, "")
 
+    def getLocalizedString(self, string_id):
+        return f"string-{string_id}"
+
+
+NOTIFICATIONS = []
+
+
+class FakeDialog:
+    def notification(self, heading, message, icon="", time=0, sound=True):
+        NOTIFICATIONS.append((heading, message))
+
 
 class FakeWindow:
     windows = {}
@@ -74,6 +85,22 @@ class FailingThread:
         raise RuntimeError("can't start new thread")
 
 
+class FakeSpotify:
+    instance = None
+
+    def __init__(self, on_delete=None):
+        self.on_delete = on_delete
+        self.deleted = []
+
+    def current_user_saved_tracks_delete(self, track_ids):
+        self.deleted.extend(track_ids)
+        if self.on_delete:
+            self.on_delete()
+
+    def current_user_saved_tracks_add(self, track_ids):
+        pass
+
+
 class FakeDownloader:
     def __init__(self, error=False, aborted=False):
         self.cond = threading.Condition()
@@ -85,6 +112,7 @@ class FakeDownloader:
 def install_stubs(info_labels, settings=None):
     FAKE_SETTINGS.clear()
     FAKE_SETTINGS.update(settings or {})
+    NOTIFICATIONS.clear()
 
     xbmc = types.ModuleType("xbmc")
     xbmc.LOGDEBUG = 0
@@ -101,6 +129,7 @@ def install_stubs(info_labels, settings=None):
 
     xbmcgui = types.ModuleType("xbmcgui")
     xbmcgui.Window = FakeWindow
+    xbmcgui.Dialog = FakeDialog
     sys.modules["xbmcgui"] = xbmcgui
 
     bottle_manager = types.ModuleType("bottle_manager")
@@ -108,7 +137,7 @@ def install_stubs(info_labels, settings=None):
     sys.modules["bottle_manager"] = bottle_manager
 
     spotipy = types.ModuleType("spotipy")
-    spotipy.Spotify = lambda auth=None: None
+    spotipy.Spotify = lambda auth=None: FakeSpotify.instance
     sys.modules["spotipy"] = spotipy
 
     spotty = types.ModuleType("spotty")
@@ -137,6 +166,7 @@ def install_stubs(info_labels, settings=None):
     utils.PROXY_HOST = "127.0.0.1"
     utils.PROXY_PORT = 52309
     utils.get_cached_auth_token = lambda: None
+    utils.get_valid_cached_auth_token = lambda: "token"
     utils.clear_expired_cached_auth_token = lambda now=None: False
     utils.set_auth_renew_failing = lambda failures: None
     utils.install_spotipy_rate_limit_hook = lambda module: None
@@ -147,6 +177,7 @@ def install_stubs(info_labels, settings=None):
 
     string_ids = types.ModuleType("string_ids")
     string_ids.WELCOME_AUTHENTICATED_STR_ID = 0
+    string_ids.SPOTIFY_CONNECTING_STR_ID = 11150
     sys.modules["string_ids"] = string_ids
 
 
@@ -154,7 +185,7 @@ def import_main_service(info_labels, settings=None):
     install_stubs(info_labels, settings=settings)
     if LIB_DIR not in sys.path:
         sys.path.insert(0, LIB_DIR)
-    for module_name in ("main_service", "playlist_next"):
+    for module_name in ("main_service", "playlist_next", "like_actions"):
         sys.modules.pop(module_name, None)
     import main_service
 
@@ -169,6 +200,7 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
         for module_name in (
             "main_service",
             "playlist_next",
+            "like_actions",
             "xbmc",
             "xbmcaddon",
             "xbmcgui",
@@ -543,6 +575,94 @@ class BareNowPlayingTagTests(unittest.TestCase):
             self.TRACK,
         )
         self.assertEqual([], updates)
+
+
+class ToggleLikeTests(unittest.TestCase):
+    def tearDown(self):
+        threading.Thread = _REAL_THREAD
+        FakeWindow.windows.clear()
+        FakeSpotify.instance = None
+        for module_name in (
+            "main_service",
+            "playlist_next",
+            "like_actions",
+            "xbmc",
+            "xbmcaddon",
+            "xbmcgui",
+            "bottle_manager",
+            "spotipy",
+            "spotty",
+            "http_spotty_audio_streamer",
+            "prebuffer",
+            "spotty_auth",
+            "spotty_helper",
+            "utils",
+            "string_ids",
+        ):
+            sys.modules.pop(module_name, None)
+
+    @staticmethod
+    def _toggle(main_service):
+        main_service._SpotifyOSDServiceMonitor._handle_toggle_like()
+
+    def test_failed_unlike_after_track_change_leaves_next_track_unliked(self):
+        main_service = import_main_service({})
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        win.setProperty("Spotify.CurrentTrackId", "track-a")
+        win.setProperty("Spotify.CurrentTrackLiked", "true")
+
+        def advance_then_fail():
+            win.setProperty("Spotify.CurrentTrackId", "track-b")
+            win.clearProperty("Spotify.CurrentTrackLiked")
+            raise RuntimeError("Spotify unavailable")
+
+        FakeSpotify.instance = FakeSpotify(on_delete=advance_then_fail)
+        self._toggle(main_service)
+
+        self.assertEqual(["track-a"], FakeSpotify.instance.deleted)
+        self.assertEqual("", win.getProperty("Spotify.CurrentTrackLiked"))
+
+    def test_failed_unlike_on_same_track_restores_liked_icon(self):
+        main_service = import_main_service({})
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        win.setProperty("Spotify.CurrentTrackId", "track-a")
+        win.setProperty("Spotify.CurrentTrackLiked", "true")
+
+        def fail():
+            raise RuntimeError("Spotify unavailable")
+
+        FakeSpotify.instance = FakeSpotify(on_delete=fail)
+        self._toggle(main_service)
+
+        self.assertEqual("true", win.getProperty("Spotify.CurrentTrackLiked"))
+
+    def test_failed_toggle_does_not_revert_over_a_newer_toggle_of_same_track(self):
+        main_service = import_main_service({})
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        win.setProperty("Spotify.CurrentTrackId", "track-a")
+        win.setProperty("Spotify.CurrentTrackLiked", "true")
+
+        def newer_toggle_then_fail():
+            request = main_service.begin_like_request()
+            main_service.set_current_track_liked("track-a", True, request)
+            raise RuntimeError("Spotify unavailable")
+
+        FakeSpotify.instance = FakeSpotify(on_delete=newer_toggle_then_fail)
+        self._toggle(main_service)
+
+        self.assertEqual("true", win.getProperty("Spotify.CurrentTrackLiked"))
+
+    def test_toggle_without_valid_token_notifies_immediately(self):
+        main_service = import_main_service({})
+        main_service.get_valid_cached_auth_token = lambda: ""
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        win.setProperty("Spotify.CurrentTrackId", "track-a")
+        main_service.xbmc.sleep = lambda millis: self.fail("must not wait for a token")
+
+        self._toggle(main_service)
+
+        self.assertEqual([("SpotifyKodiConnect", "string-11150")], NOTIFICATIONS)
+        self.assertEqual("", win.getProperty("Spotify.CurrentTrackLiked"))
 
 
 class TokenRenewBackoffTests(unittest.TestCase):

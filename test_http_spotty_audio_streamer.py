@@ -162,9 +162,15 @@ def install_stubs():
     utils.ADDON_ID = "plugin.audio.spotifykodiconnect"
     utils.ADDON_WINDOW_ID = 10000
     utils.LOGDEBUG = 0
-    utils.get_cached_auth_token = lambda: None
+    utils.get_valid_cached_auth_token = lambda: None
     utils.log_msg = lambda *args, **kwargs: None
     sys.modules["utils"] = utils
+
+    like_actions = types.ModuleType("like_actions")
+    like_actions.begin_like_request = lambda: 1
+    like_actions.notify_not_connected = lambda: None
+    like_actions.set_current_track_liked = lambda track_id, liked, request: True
+    sys.modules["like_actions"] = like_actions
 
     bottle = types.ModuleType("bottle")
     FakeBottleState.request = FakeRequest()
@@ -268,6 +274,7 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
             "spotty_audio_streamer",
             "spotty_cache",
             "utils",
+            "like_actions",
             "spotty",
             "spotipy",
             "xbmc",
@@ -893,6 +900,7 @@ class HTTPRangeTests(unittest.TestCase):
             "spotty_audio_streamer",
             "spotty_cache",
             "utils",
+            "like_actions",
             "spotty",
             "spotipy",
             "xbmc",

@@ -13,6 +13,7 @@ import spotipy
 import xbmc
 import xbmcaddon
 import xbmcgui
+from like_actions import begin_like_request, notify_not_connected, set_current_track_liked
 from spotty import Spotty
 from spotty_audio_streamer import (
     STARTUP_REAL_PCM_WAIT_SECONDS,
@@ -20,7 +21,7 @@ from spotty_audio_streamer import (
     SpottyStreamSpec,
     create_wav_header_for_duration,
 )
-from utils import ADDON_ID, ADDON_WINDOW_ID, LOGDEBUG, get_cached_auth_token, log_msg
+from utils import ADDON_ID, ADDON_WINDOW_ID, LOGDEBUG, get_valid_cached_auth_token, log_msg
 
 _settings_cache = {
     "bitrate": "320",
@@ -1151,10 +1152,13 @@ class HTTPSpottyAudioStreamer:
         """Toggle the liked status of a track in Spotify"""
         try:
             # Get the authentication token
-            token = get_cached_auth_token()
+            token = get_valid_cached_auth_token()
             if not token:
+                notify_not_connected()
                 bottle.response.status = 401
                 return "Unauthorized"
+
+            request = begin_like_request()
 
             # Create Spotify client
             sp = spotipy.Spotify(auth=token)
@@ -1173,22 +1177,18 @@ class HTTPSpottyAudioStreamer:
                 sp.current_user_saved_tracks_add([track_id])
                 liked_status = "true"
 
-            # Update the window property for the current track
+            # Update the window property, unless playback moved on to another track
             win = xbmcgui.Window(ADDON_WINDOW_ID)
-            if liked_status:
-                win.setProperty("Spotify.CurrentTrackLiked", liked_status)
-            else:
-                win.clearProperty("Spotify.CurrentTrackLiked")
+            if set_current_track_liked(track_id, bool(liked_status), request):
+                # Also update the window property to indicate the change occurred
+                win.setProperty("Spotify.TrackLikeChanged", "true")
 
-            # Also update the window property to indicate the change occurred
-            win.setProperty("Spotify.TrackLikeChanged", "true")
+                # Clear the change flag after a short delay to allow UI to react
+                def clear_flag():
+                    xbmc.sleep(100)
+                    win.clearProperty("Spotify.TrackLikeChanged")
 
-            # Clear the change flag after a short delay to allow UI to react
-            def clear_flag():
-                xbmc.sleep(100)
-                win.clearProperty("Spotify.TrackLikeChanged")
-
-            threading.Thread(target=clear_flag, daemon=True).start()
+                threading.Thread(target=clear_flag, daemon=True).start()
 
             # Return success response
             bottle.response.content_type = "application/json"

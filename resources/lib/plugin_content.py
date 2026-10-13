@@ -20,6 +20,7 @@ import xbmcaddon
 import xbmcgui
 import xbmcplugin
 import xbmcvfs
+from like_actions import begin_like_request, set_current_track_liked
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import *
@@ -1353,20 +1354,20 @@ class PluginContent:
             xbmcplugin.endOfDirectory(handle=self.__addon_handle)
             return
         self.__track_id = track_id
-        win = xbmcgui.Window(ADDON_WINDOW_ID)
         try:
             # Query Spotify directly for the authoritative liked state.
             # The window property may be stale or empty (e.g. during a buffering
             # reset), so relying on it would always toggle in the wrong direction.
+            request = begin_like_request()
             result = self.__spotipy.current_user_saved_tracks_contains([track_id])
             liked = bool(result and result[0])
             if liked:
                 self.__spotipy.current_user_saved_tracks_delete([track_id])
-                win.clearProperty("Spotify.CurrentTrackLiked")
+                set_current_track_liked(track_id, False, request)
                 self.__set_relation_cache("savedtrack", track_id, False)
             else:
                 self.__spotipy.current_user_saved_tracks_add([track_id])
-                win.setProperty("Spotify.CurrentTrackLiked", "true")
+                set_current_track_liked(track_id, True, request)
                 self.__set_relation_cache("savedtrack", track_id, True)
         except Exception as exc:
             log_exception(exc, "toggle_liked failed")
