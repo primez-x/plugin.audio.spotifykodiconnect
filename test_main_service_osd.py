@@ -636,22 +636,6 @@ class ToggleLikeTests(unittest.TestCase):
 
         self.assertEqual("true", win.getProperty("Spotify.CurrentTrackLiked"))
 
-    def test_failed_toggle_does_not_revert_over_a_newer_toggle_of_same_track(self):
-        main_service = import_main_service({})
-        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
-        win.setProperty("Spotify.CurrentTrackId", "track-a")
-        win.setProperty("Spotify.CurrentTrackLiked", "true")
-
-        def newer_toggle_then_fail():
-            request = main_service.begin_like_request()
-            main_service.set_current_track_liked("track-a", True, request)
-            raise RuntimeError("Spotify unavailable")
-
-        FakeSpotify.instance = FakeSpotify(on_delete=newer_toggle_then_fail)
-        self._toggle(main_service)
-
-        self.assertEqual("true", win.getProperty("Spotify.CurrentTrackLiked"))
-
     def test_toggle_without_valid_token_notifies_immediately(self):
         main_service = import_main_service({})
         main_service.get_valid_cached_auth_token = lambda: ""

@@ -17,7 +17,7 @@ import xbmc
 import xbmcaddon
 import xbmcgui
 from http_spotty_audio_streamer import HTTPSpottyAudioStreamer
-from like_actions import begin_like_request, notify_not_connected, set_current_track_liked
+from like_actions import notify_not_connected, set_current_track_liked
 from play_queue import clear as play_queue_clear
 from play_queue import should_fire_autoplay as play_queue_should_fire_autoplay
 from playlist_next import get_next_playlist_item, get_playlist_track_ids, parse_track_url
@@ -125,8 +125,7 @@ class _SpotifyOSDServiceMonitor(xbmc.Monitor):
 
             # Optimistic update: flip the icon immediately so the UI feels instant.
             # The API call below confirms the change; reverted on failure.
-            request = begin_like_request()
-            set_current_track_liked(track_id, not currently_liked, request)
+            set_current_track_liked(track_id, not currently_liked)
 
             sp = spotipy.Spotify(auth=token)
             try:
@@ -138,8 +137,8 @@ class _SpotifyOSDServiceMonitor(xbmc.Monitor):
                     log_msg(f"ToggleLike: liked {track_id}.", LOGDEBUG)
             except Exception as api_exc:
                 # Revert the optimistic update so the icon matches actual Spotify state
-                # (skipped if playback moved on or a newer toggle took over).
-                set_current_track_liked(track_id, currently_liked, request)
+                # (skipped if playback moved on to another track).
+                set_current_track_liked(track_id, currently_liked)
                 log_exception(api_exc, "ToggleLike API call failed, reverted icon")
                 return
 

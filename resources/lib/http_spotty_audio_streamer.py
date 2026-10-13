@@ -13,7 +13,7 @@ import spotipy
 import xbmc
 import xbmcaddon
 import xbmcgui
-from like_actions import begin_like_request, notify_not_connected, set_current_track_liked
+from like_actions import notify_not_connected, set_current_track_liked
 from spotty import Spotty
 from spotty_audio_streamer import (
     STARTUP_REAL_PCM_WAIT_SECONDS,
@@ -1158,8 +1158,6 @@ class HTTPSpottyAudioStreamer:
                 bottle.response.status = 401
                 return "Unauthorized"
 
-            request = begin_like_request()
-
             # Create Spotify client
             sp = spotipy.Spotify(auth=token)
 
@@ -1179,7 +1177,7 @@ class HTTPSpottyAudioStreamer:
 
             # Update the window property, unless playback moved on to another track
             win = xbmcgui.Window(ADDON_WINDOW_ID)
-            if set_current_track_liked(track_id, bool(liked_status), request):
+            if set_current_track_liked(track_id, bool(liked_status)):
                 # Also update the window property to indicate the change occurred
                 win.setProperty("Spotify.TrackLikeChanged", "true")
 
