@@ -12,6 +12,7 @@ Covers two hardening fixes added after a post-power-outage incident where:
 
 import json
 import os
+import subprocess
 import sys
 import types
 import unittest
@@ -117,6 +118,112 @@ class FakeSpotty:
 
     def get_spotty_credentials_backup_file(self):
         return self.cred_backup
+
+
+class ZeroconfPairingTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = "/tmp/test_spotty_auth_pairing_%d" % os.getpid()
+        os.makedirs(self._tmp, exist_ok=True)
+        self.spotty = FakeSpotty(self._tmp)
+        self.auth = SpottyAuth(self.spotty)
+
+    def tearDown(self):
+        for root, _dirs, files in os.walk(self._tmp, topdown=False):
+            for fname in files:
+                os.remove(os.path.join(root, fname))
+        os.rmdir(self._tmp)
+
+    def test_wait_for_zeroconf_credentials_polls_until_file_arrives(self):
+        class PairingProcess:
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+        progress = []
+
+        def update_progress(percent):
+            progress.append(percent)
+            with open(self.spotty.cred_file, "w") as credentials:
+                credentials.write('{"username":"u"}')
+            return False
+
+        result = self.auth.wait_for_zeroconf_credentials(
+            PairingProcess(),
+            timeout=30,
+            progress_callback=update_progress,
+        )
+
+        self.assertTrue(result)
+        self.assertEqual([0], progress)
+
+    def test_cancelled_pairing_process_is_terminated_and_reaped(self):
+        class PairingProcess:
+            def __init__(self):
+                self.returncode = None
+                self.terminate_calls = 0
+                self.kill_calls = 0
+                self.wait_calls = []
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminate_calls += 1
+
+            def kill(self):
+                self.kill_calls += 1
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                self.wait_calls.append(timeout)
+                if self.returncode is None:
+                    raise subprocess.TimeoutExpired("spotty", timeout)
+                return self.returncode
+
+        process = PairingProcess()
+        result = self.auth.wait_for_zeroconf_credentials(
+            process,
+            timeout=30,
+            progress_callback=lambda _percent: True,
+        )
+
+        self.auth.stop_zeroconf_authenticate(process)
+
+        self.assertFalse(result)
+        self.assertEqual(1, process.terminate_calls)
+        self.assertEqual(1, process.kill_calls)
+        self.assertEqual(2, len(process.wait_calls))
+
+    def test_pairing_cleanup_kills_child_after_wait_error(self):
+        class PairingProcess:
+            def __init__(self):
+                self.returncode = None
+                self.kill_calls = 0
+                self.wait_calls = 0
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                self.kill_calls += 1
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise OSError("wait interrupted")
+                return self.returncode
+
+        process = PairingProcess()
+
+        self.auth.stop_zeroconf_authenticate(process)
+
+        self.assertEqual(1, process.kill_calls)
+        self.assertEqual(2, process.wait_calls)
 
 
 VALID_TOKEN_PAYLOAD = {

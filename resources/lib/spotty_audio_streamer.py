@@ -22,8 +22,9 @@ _DEFAULT_GAIN_TYPE = "track"
 
 _PCM_BYTES_PER_SEC = 176400  # 44.1 kHz * 2 ch * 2 bytes/sample
 _WAV_HEADER_SIZE = 44
-_STARTUP_REAL_PCM_BUFFER_BYTES = 2097152
+_STARTUP_REAL_PCM_BUFFER_BYTES = 512 * 1024
 _THROTTLE_LEAD_BYTES = 2097152
+STARTUP_REAL_PCM_BUFFER_SECONDS = _STARTUP_REAL_PCM_BUFFER_BYTES / _PCM_BYTES_PER_SEC
 STARTUP_REAL_PCM_WAIT_SECONDS = 15.0
 
 # Maximum bytes of PCM silence to pad at the end of a stream when spotty exits
@@ -633,6 +634,9 @@ class SpottyAudioStreamer:
                     downloader._trim_head_locked()
                     # The backpressure reference may change with the reader set.
                     downloader.cond.notify_all()
+            from spotty_cache import SpottyCacheManager
+
+            SpottyCacheManager.enforce_memory_budget()
 
 
 def create_wav_header_for_duration(duration_sec: float) -> Tuple[bytes, int]:

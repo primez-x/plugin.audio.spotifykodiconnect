@@ -870,6 +870,68 @@ class SpottyCacheManager:
     _instances = {}
     _lock = threading.Lock()
     _recent_tracks = []
+    _MAX_CACHE_BYTES = 64 * 1024 * 1024
+
+    @classmethod
+    def _enforce_memory_budget_locked(cls, protected_keys=()):
+        total_bytes = 0
+        candidates = []
+        recent_order = {track_id: index for index, track_id in enumerate(cls._recent_tracks)}
+        protected_track = cls._recent_tracks[-1] if cls._recent_tracks else None
+
+        for key, inst in cls._instances.items():
+            cond = getattr(inst, "cond", None)
+            if cond is None:
+                continue
+            with cond:
+                buffer_size = len(getattr(inst, "_buffer", ()))
+                total_bytes += buffer_size
+                has_active_consumers = bool(
+                    getattr(inst, "_consumer_positions", {})
+                )
+                is_terminal = bool(
+                    inst.is_finished or inst.error or inst.aborted
+                )
+            if (
+                is_terminal
+                and not has_active_consumers
+                and key not in protected_keys
+                and key[0] != protected_track
+            ):
+                candidates.append(
+                    (recent_order.get(key[0], -1), key, inst, buffer_size)
+                )
+
+        candidates.sort(key=lambda candidate: candidate[0])
+        for _recent_index, key, inst, _buffer_size in candidates:
+            if total_bytes <= cls._MAX_CACHE_BYTES:
+                break
+            with inst.cond:
+                if cls._instances.get(key) is not inst:
+                    continue
+                if getattr(inst, "_consumer_positions", {}) or not (
+                    inst.is_finished or inst.error or inst.aborted
+                ):
+                    continue
+                buffer_size = len(getattr(inst, "_buffer", ()))
+                inst.aborted = True
+                if hasattr(inst, "_buffer"):
+                    inst._buffer.clear()
+                if hasattr(inst, "_trim_offset"):
+                    inst._trim_offset = 0
+                inst.cond.notify_all()
+                del cls._instances[key]
+            total_bytes -= buffer_size
+
+        active_ids = {key[0] for key in cls._instances}
+        cls._recent_tracks = [
+            track_id for track_id in cls._recent_tracks if track_id in active_ids
+        ]
+
+    @classmethod
+    def enforce_memory_budget(cls):
+        with cls._lock:
+            cls._enforce_memory_budget_locked()
 
     @classmethod
     def get_or_start(
@@ -954,6 +1016,7 @@ class SpottyCacheManager:
             # unbounded list growth and ensures stale track IDs can't skew eviction.
             active_ids = {k[0] for k in cls._instances}
             cls._recent_tracks = [t for t in cls._recent_tracks if t in active_ids]
+            cls._enforce_memory_budget_locked(protected_keys={key})
 
             return inst
 

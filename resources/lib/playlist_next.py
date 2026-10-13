@@ -54,6 +54,36 @@ def _get_active_audio_player_id():
     return None
 
 
+def _time_value_to_seconds(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, dict):
+        return None
+    try:
+        return (
+            int(value.get("hours", 0)) * 3600
+            + int(value.get("minutes", 0)) * 60
+            + int(value.get("seconds", 0))
+            + int(value.get("milliseconds", 0)) / 1000.0
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def get_current_playback_time_seconds():
+    """Return active audio playback time in seconds, or None when unavailable."""
+    playerid = _get_active_audio_player_id()
+    if playerid is None:
+        return None
+    result = _jsonrpc(
+        method="Player.GetProperties",
+        params={"playerid": playerid, "properties": ["time"]},
+    )
+    if not result or "result" not in result:
+        return None
+    return _time_value_to_seconds(result.get("result", {}).get("time"))
+
+
 def _get_current_playlist_position():
     """Return (playerid, position) for current item in music playlist, or (None, None)."""
     playerid = _get_active_audio_player_id()

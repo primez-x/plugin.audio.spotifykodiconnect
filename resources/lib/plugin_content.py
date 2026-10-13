@@ -584,20 +584,39 @@ class PluginContent:
         # Tell the service not to restore credentials.json from the .bak we
         # are about to create while the user is pairing.
         utils.mark_zeroconf_pairing(True)
+        process = None
+        progress = None
+        paired_ok = False
         try:
-            zeroconf_auth = spotty_auth.start_zeroconf_authenticate()
-            if zeroconf_auth is None:
+            process = spotty_auth.start_zeroconf_authenticate()
+            if process is None:
                 dialog.ok(dialog_title, self.get_zeroconf_program_failed_msg(spotty_auth))
                 utils.kill_this_plugin()
                 return
 
             dialog.ok(dialog_title, instructions)
+            progress = xbmcgui.DialogProgress()
+            progress.create(dialog_title, instructions)
 
-            zeroconf_auth.terminate()
-            # Check before clearing the pairing flag so a concurrent service
-            # backup restore cannot masquerade as a successful pairing.
+            def _update_pairing_progress(percent):
+                progress.update(percent)
+                return progress.iscanceled()
+
+            spotty_auth.wait_for_zeroconf_credentials(
+                process,
+                progress_callback=_update_pairing_progress,
+            )
+            spotty_auth.stop_zeroconf_authenticate(process)
+            process = None
             paired_ok = spotty_auth.zeroconf_authenticated_ok()
         finally:
+            if progress is not None:
+                try:
+                    progress.close()
+                except Exception as exc:
+                    log_exception(exc, "Closing Spotify pairing progress")
+            if process is not None:
+                spotty_auth.stop_zeroconf_authenticate(process)
             utils.mark_zeroconf_pairing(False)
 
         if not paired_ok:

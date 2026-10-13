@@ -99,6 +99,19 @@ class StopThreadReleasesPortTest(unittest.TestCase):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("127.0.0.1", port))
 
+    def test_bind_failure_is_reported_before_start_returns(self):
+        occupied = socket.socket()
+        self.addCleanup(occupied.close)
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen(1)
+        port = occupied.getsockname()[1]
+
+        started = self.bottle_manager.start_thread(port)
+
+        self.assertIs(False, started)
+        self.assertFalse(self.bottle_manager.is_healthy())
+        self.assertFalse(getattr(self.bottle_manager, "__manager_thread").is_alive())
+
     def test_requests_are_not_logged_to_stderr(self):
         # Kodi logs a Python add-on's stderr at error level.
         def ping():

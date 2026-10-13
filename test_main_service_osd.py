@@ -298,6 +298,44 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
         win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
         self.assertEqual("4.5", win.getProperty(main_service.PREBUFFER_RELEASE_DELAY_PROP))
 
+    def test_proxy_failure_retries_with_one_notification(self):
+        main_service = import_main_service({})
+        starts = []
+        main_service.bottle_manager.is_healthy = lambda: False
+        main_service.bottle_manager.start_thread = lambda port: starts.append(port) or False
+        main_service.bottle_manager.get_startup_error = lambda: OSError("port busy")
+        service = object.__new__(main_service.MainService)
+
+        self.assertFalse(service._MainService__ensure_proxy())
+        self.assertFalse(service._MainService__ensure_proxy())
+
+        self.assertEqual([main_service.PROXY_PORT, main_service.PROXY_PORT], starts)
+        self.assertEqual(1, len(NOTIFICATIONS))
+
+    def test_playback_time_is_read_from_active_audio_player(self):
+        main_service = import_main_service({})
+        calls = []
+
+        def execute_jsonrpc(payload):
+            request = __import__("json").loads(payload)
+            calls.append(request["method"])
+            if request["method"] == "Player.GetActivePlayers":
+                return '{"result": [{"playerid": 7, "type": "audio"}]}'
+            return '{"result": {"time": {"hours": 0, "minutes": 1, "seconds": 23, "milliseconds": 500}}}'
+
+        main_service.xbmc.executeJSONRPC = execute_jsonrpc
+
+        self.assertEqual(83.5, main_service.get_current_playback_time_seconds())
+        self.assertEqual(["Player.GetActivePlayers", "Player.GetProperties"], calls)
+
+    def test_prebuffer_waits_for_remaining_time_and_download_completion(self):
+        main_service = import_main_service({})
+
+        self.assertFalse(main_service._prebuffer_start_ready(90, True))
+        self.assertFalse(main_service._prebuffer_start_ready(30, False))
+        self.assertTrue(main_service._prebuffer_start_ready(30, True))
+        self.assertTrue(main_service._prebuffer_start_ready(None, True))
+
     def test_track_started_keeps_core_state_when_worker_thread_cannot_start(self):
         main_service = import_main_service({})
         main_service.threading.Thread = FailingThread

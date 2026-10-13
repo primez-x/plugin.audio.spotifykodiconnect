@@ -21,7 +21,12 @@ from http_spotty_audio_streamer import HTTPSpottyAudioStreamer
 from like_actions import LIKED_STATE_LOCK, notify_not_connected, set_current_track_liked
 from play_queue import clear as play_queue_clear
 from play_queue import should_fire_autoplay as play_queue_should_fire_autoplay
-from playlist_next import get_next_playlist_item, get_playlist_track_ids, parse_track_url
+from playlist_next import (
+    get_current_playback_time_seconds,
+    get_next_playlist_item,
+    get_playlist_track_ids,
+    parse_track_url,
+)
 from prebuffer import PrebufferManager
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
@@ -67,6 +72,8 @@ PREBUFFER_RELEASE_DELAY_MIN = 2.0
 PREBUFFER_RELEASE_DELAY_MAX = 15.0
 PREBUFFER_RELEASE_DELAY_STEP_UP = 2.0
 PREBUFFER_RELEASE_DELAY_STEP_DOWN = 0.5
+PREBUFFER_START_REMAINING_SECONDS = 45.0
+PREBUFFER_REMAINING_POLL_SECONDS = 1.0
 TOKEN_RENEW_BACKOFF_INITIAL_SECS = 5.0
 TOKEN_RENEW_BACKOFF_MAX_SECS = 300.0
 # The plugin cache is compacted (VACUUM) only from the service: checked about
@@ -90,6 +97,13 @@ def _start_daemon_thread(target, args=(), task_name: str = "background task") ->
     except RuntimeError as exc:
         log_msg(f"Could not start {task_name}: {exc}", LOGWARNING)
         return False
+
+
+def _prebuffer_start_ready(remaining_seconds, source_released: bool) -> bool:
+    return source_released and (
+        remaining_seconds is None
+        or remaining_seconds <= PREBUFFER_START_REMAINING_SECONDS
+    )
 
 
 class _SpotifyOSDServiceMonitor(xbmc.Monitor):
@@ -512,6 +526,7 @@ class MainService:
         # token renewals (5s doubling to 300s, reset on success).
         self.__renew_failures = 0
         self.__next_renew_attempt_at = 0.0
+        self.__proxy_failure_notified = False
 
         normalization_setting = (
             (SPOTIFY_ADDON.getSetting("spotify_normalization") or "auto").strip().lower()
@@ -566,6 +581,32 @@ class MainService:
         xbmcgui.Window(ADDON_WINDOW_ID).setProperty(PREBUFFER_RELEASE_DELAY_PROP, f"{delay:.1f}")
         log_msg(f"Prebuffer release delay now {delay:.1f}s.", LOGDEBUG)
 
+    def __ensure_proxy(self) -> bool:
+        if bottle_manager.is_healthy():
+            self.__proxy_failure_notified = False
+            return True
+
+        if bottle_manager.start_thread(PROXY_PORT):
+            self.__proxy_failure_notified = False
+            log_msg(f"Started bottle with port {PROXY_PORT}.")
+            return True
+
+        error = bottle_manager.get_startup_error()
+        detail = str(error) if error else "startup timed out"
+        log_msg(f"Spotify audio proxy failed to bind on port {PROXY_PORT}: {detail}", LOGWARNING)
+        if not getattr(self, "_MainService__proxy_failure_notified", False):
+            try:
+                xbmcgui.Dialog().notification(
+                    SPOTIFY_ADDON.getAddonInfo("name"),
+                    f"Spotify audio proxy could not bind on port {PROXY_PORT}; retrying.",
+                    time=8000,
+                    sound=False,
+                )
+            except Exception as exc:
+                log_exception(exc, "Spotify audio proxy notification failed")
+            self.__proxy_failure_notified = True
+        return False
+
     def _watch_prebuffer_result(self, downloader, track_id: str, delay_used: float) -> None:
         if downloader is None:
             return
@@ -593,6 +634,43 @@ class MainService:
                 )
         except Exception as exc:
             log_exception(exc, "watching prebuffer result failed")
+
+    def __wait_for_prebuffer_window(
+        self,
+        track_id: str,
+        duration_sec: float,
+        token: int,
+        downloader,
+    ) -> bool:
+        monitor = xbmc.Monitor()
+        while True:
+            with self._prebuffer_token_lock:
+                if self._prebuffer_token != token:
+                    return False
+
+            playback_time = get_current_playback_time_seconds()
+            if playback_time is None or duration_sec <= 0:
+                remaining = None
+            else:
+                remaining = max(0.0, duration_sec - playback_time)
+
+            source_released = downloader is None
+            if downloader is not None:
+                with downloader.cond:
+                    source_released = bool(
+                        downloader.is_finished or downloader.error or downloader.aborted
+                    )
+
+            if _prebuffer_start_ready(remaining, source_released):
+                log_msg(
+                    f"Prebuffer window opened for {track_id} with "
+                    f"{remaining if remaining is not None else 'unknown'}s remaining.",
+                    LOGDEBUG,
+                )
+                return True
+
+            if monitor.waitForAbort(PREBUFFER_REMAINING_POLL_SECONDS):
+                return False
 
     def _teardown_for_external_playback(self) -> None:
         """Tear down all Spotify audio resources when a non-Spotify player starts.
@@ -721,7 +799,8 @@ class MainService:
 
     def __on_spotify_playback_started(self, track_id: str) -> None:
         try:
-            self.__on_track_started(track_id, _read_confirmed_spotify_track_duration(track_id))
+            track_duration = _read_confirmed_spotify_track_duration(track_id)
+            self.__on_track_started(track_id, track_duration)
 
             _current_item, next_item = get_next_playlist_item()
             if not next_item:
@@ -768,13 +847,16 @@ class MainService:
                 # find_active_downloader also finds a post-seek playing
                 # downloader (start_byte > 0) and one whose head was trimmed.
                 dl = SpottyCacheManager.find_active_downloader(track_id)
-                if dl is not None and not dl.is_finished:
-                    with dl.cond:
-                        while not dl.is_finished and not dl.error and not dl.aborted:
-                            dl.cond.wait(timeout=30.0)
+                if not self.__wait_for_prebuffer_window(
+                    track_id,
+                    track_duration,
+                    my_token,
+                    dl,
+                ):
+                    return
 
                 log_msg(
-                    f"Main track {track_id} finished downloading. Safe to start prebuffer for next track.",
+                    f"Main track {track_id} released the Spotty session. Safe to start next-track prebuffer.",
                     LOGDEBUG,
                 )
 
@@ -934,8 +1016,7 @@ class MainService:
     def run(self) -> None:
         log_msg("Starting main service loop.")
 
-        bottle_manager.start_thread(PROXY_PORT)
-        log_msg(f"Started bottle with port {PROXY_PORT}.")
+        self.__ensure_proxy()
 
         self.__renew_token()
         # Keeps plugin processes' small cache writes from checkpointing the WAL.
@@ -945,6 +1026,8 @@ class MainService:
         loop_wait_in_secs = 6
         while True:
             loop_counter += 1
+            if not bottle_manager.is_healthy():
+                self.__ensure_proxy()
             if (loop_counter % 10) == 0:
                 log_msg(f"Main loop continuing. Loop counter: {loop_counter}.")
 

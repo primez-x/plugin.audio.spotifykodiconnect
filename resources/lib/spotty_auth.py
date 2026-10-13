@@ -18,6 +18,10 @@ ZEROCONF_PORT = 10001
 TOKEN_FETCH_MAX_RETRIES = 3
 TOKEN_FETCH_RETRY_DELAY_SECS = 1
 TOKEN_FETCH_TIMEOUT_SECS = 15
+ZEROCONF_AUTH_TIMEOUT_SECS = 180
+ZEROCONF_AUTH_POLL_SECS = 0.5
+ZEROCONF_TERMINATE_TIMEOUT_SECS = 2
+ZEROCONF_KILL_TIMEOUT_SECS = 5
 
 CLIENT_ID = "2eb96f9b37494be1824999d58028a305"
 SPOTTY_SCOPE = [
@@ -115,6 +119,78 @@ class SpottyAuth:
         except Exception as exc:
             log_exception(exc, "Zeroconf authentication error")
             return None
+
+    def wait_for_zeroconf_credentials(
+        self,
+        process,
+        timeout: float = ZEROCONF_AUTH_TIMEOUT_SECS,
+        progress_callback=None,
+        monitor=None,
+    ) -> bool:
+        """Poll for newly paired credentials until cancellation or timeout."""
+        monitor = monitor or xbmc.Monitor()
+        started_at = time.monotonic()
+        deadline = started_at + max(0.0, float(timeout))
+        credentials_file = self.__spotty.get_spotty_credentials_file()
+
+        while True:
+            try:
+                if os.path.isfile(credentials_file) and os.path.getsize(credentials_file) > 0:
+                    return True
+                if process.poll() is not None:
+                    log_msg("Spotty zeroconf process exited before credentials arrived.", LOGWARNING)
+                    return False
+            except OSError as exc:
+                log_exception(exc, "Checking Spotify pairing credentials")
+                return False
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log_msg("Spotify pairing timed out while waiting for credentials.", LOGWARNING)
+                return False
+
+            if progress_callback is not None:
+                percent = min(99, max(0, int(100 * (time.monotonic() - started_at) / timeout)))
+                if progress_callback(percent):
+                    log_msg("Spotify pairing cancelled by the user.", LOGDEBUG)
+                    return False
+
+            if monitor.waitForAbort(min(ZEROCONF_AUTH_POLL_SECS, remaining)):
+                log_msg("Kodi shutdown cancelled Spotify pairing.", LOGDEBUG)
+                return False
+
+    @staticmethod
+    def stop_zeroconf_authenticate(process) -> None:
+        """Stop and reap the pairing process, then close process pipes."""
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except Exception as exc:
+            log_exception(exc, "Failed to terminate Spotify pairing process")
+
+        try:
+            process.wait(timeout=ZEROCONF_TERMINATE_TIMEOUT_SECS)
+        except Exception as exc:
+            log_exception(exc, "Waiting for Spotify pairing process to stop")
+            try:
+                if process.poll() is None:
+                    process.kill()
+            except Exception as exc:
+                log_exception(exc, "Failed to kill Spotify pairing process")
+            try:
+                process.wait(timeout=ZEROCONF_KILL_TIMEOUT_SECS)
+            except Exception as exc:
+                log_exception(exc, "Failed to reap Spotify pairing process")
+        finally:
+            for name in ("stdout", "stderr"):
+                stream = getattr(process, name, None)
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
 
     def zeroconf_authenticated_ok(self) -> bool:
         if os.path.exists(self.__spotty.get_spotty_credentials_file()):

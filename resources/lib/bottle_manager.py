@@ -31,6 +31,19 @@ class MyWSGIRefServer(bottle.WSGIRefServer):
     def __init__(self, host: str = "", port: int = 0):
         super().__init__(host, port)
         self.__server = None
+        self.__startup_ready = threading.Event()
+        self.__startup_error = None
+
+    def wait_for_startup(self, timeout: float) -> bool:
+        if not self.__startup_ready.wait(timeout):
+            return False
+        return self.__server is not None and self.__startup_error is None
+
+    def get_startup_error(self):
+        return self.__startup_error
+
+    def is_bound(self) -> bool:
+        return self.__server is not None and self.__server.socket.fileno() >= 0
 
     def run(self, app) -> None:
         class FixedHandler(WSGIRequestHandler):
@@ -64,25 +77,43 @@ class MyWSGIRefServer(bottle.WSGIRefServer):
         # CHANGE (1) TO THE ORIGINAL BOTTLE CLASS METHOD!
         server_cls.timeout = STREAMING_TIMEOUT_IN_SECS
 
-        srv = make_server(self.host, self.port, app, server_cls, handler_cls)
+        try:
+            srv = make_server(self.host, self.port, app, server_cls, handler_cls)
+        except Exception as exc:
+            self.__startup_error = exc
+            self.__startup_ready.set()
+            raise
         # CHANGE (2) TO THE ORIGINAL BOTTLE CLASS METHOD!
         self.__server = srv
+        self.__startup_ready.set()
 
         log_msg(f"Starting wsgiref web server, timeout = {self.__server.timeout}.")
 
-        srv.serve_forever()
+        try:
+            srv.serve_forever()
+        finally:
+            srv.server_close()
 
     # HERE'S THE ADDED SERVER SHUTDOWN METHOD.
     def shutdown(self) -> None:
         log_msg("Shutdown wsgiref server requested...")
-        self.__server.shutdown()
-        # Release the port so a restarted service can bind it again.
-        self.__server.server_close()
+        server = self.__server
+        if server is None:
+            return
+        try:
+            server.shutdown()
+        finally:
+            server.server_close()
+
+    def close(self) -> None:
+        server = self.__server
+        if server is not None:
+            server.server_close()
 
 
 __server: MyWSGIRefServer = MyWSGIRefServer()
 __bottle_manager: Bottle = Bottle()
-__manager_thread: threading.Thread = threading.Thread()
+__manager_thread = None
 
 
 def route_all(app: object) -> None:
@@ -93,22 +124,52 @@ def route_all(app: object) -> None:
 
 
 def __begin_app() -> None:
-    bottle.run(app=__bottle_manager, server=__server)
+    try:
+        bottle.run(app=__bottle_manager, server=__server)
+    except Exception as exc:
+        log_exception(exc, "Bottle server stopped unexpectedly")
 
 
-def start_thread(web_port: int) -> None:
+def start_thread(web_port: int) -> bool:
     global __manager_thread
     global __server
+    if is_healthy():
+        return True
+    if __manager_thread is not None and __manager_thread.is_alive():
+        return __server.wait_for_startup(3.0) and is_healthy()
+
     __server = MyWSGIRefServer(host=PROXY_HOST, port=web_port)
-    __manager_thread = threading.Thread(target=__begin_app)
+    __manager_thread = threading.Thread(target=__begin_app, daemon=True)
     __manager_thread.start()
+    if __server.wait_for_startup(3.0) and is_healthy():
+        return True
+    __manager_thread.join(timeout=1.0)
+    return False
+
+
+def is_healthy() -> bool:
+    return (
+        __server is not None
+        and __manager_thread is not None
+        and __manager_thread.is_alive()
+        and __server.is_bound()
+    )
+
+
+def get_startup_error():
+    return __server.get_startup_error() if __server is not None else None
 
 
 def stop_thread() -> None:
     log_msg("Closing bottle app and thread.", LOGDEBUG)
     try:
         __bottle_manager.close()
-        __server.shutdown()
-        __manager_thread.join()
+        if __server is not None:
+            if __manager_thread is not None and __manager_thread.is_alive():
+                __server.shutdown()
+            else:
+                __server.close()
+        if __manager_thread is not None:
+            __manager_thread.join(timeout=5.0)
     except Exception as exc:
         log_exception(exc, f"Bottle app closed with exception.")

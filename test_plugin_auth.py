@@ -62,6 +62,7 @@ class PluginAuthGatingTests(unittest.TestCase):
         self.assertIn(f"str-{self.pc.SPOTIFY_CONNECTING_STR_ID}", RecordingDialog.notifications[0])
         self.assertEqual([{"handle": 1, "succeeded": False}], self.end_calls)
 
+
     def test_root_menu_while_service_connecting_notifies_without_asking(self):
         content = self.build(creds=True)
         self.assertFalse(content.check_auth_and_refresh_spotipy())
@@ -137,6 +138,80 @@ class PluginAuthGatingTests(unittest.TestCase):
         content.init_spotipy = lambda token: inits.append(token)
         self.assertTrue(content.check_auth_and_refresh_spotipy())
         self.assertEqual(["tok"], inits)
+
+
+class PairingProgressTests(unittest.TestCase):
+    def setUp(self):
+        self.pc = fp.import_plugin_content()
+        self.dialog_messages = []
+        self.progress_updates = []
+        self.pairing_flags = []
+        self.process = object()
+
+        class Dialog:
+            def ok(_self, heading, message):
+                self.dialog_messages.append((heading, message))
+
+        class Progress:
+            def create(_self, heading, message):
+                _self.created = (heading, message)
+
+            def update(_self, percent):
+                self.progress_updates.append(percent)
+
+            def iscanceled(_self):
+                return False
+
+            def close(_self):
+                _self.closed = True
+
+        self.progress = Progress()
+
+        class Auth:
+            def __init__(_self, _spotty):
+                pass
+
+            def start_zeroconf_authenticate(_self):
+                return self.process
+
+            def wait_for_zeroconf_credentials(_self, process, progress_callback=None):
+                self.assertIs(self.process, process)
+                progress_callback(50)
+                return True
+
+            def stop_zeroconf_authenticate(_self, process):
+                self.assertIs(self.process, process)
+                self.stopped = True
+
+            def zeroconf_authenticated_ok(_self):
+                return True
+
+            def renew_token(_self):
+                self.renewed = True
+
+        self.pc.SpottyAuth = Auth
+        self.pc.xbmcgui.Dialog = Dialog
+        self.pc.xbmcgui.DialogProgress = lambda: self.progress
+        self.pc.utils.mark_zeroconf_pairing = lambda active: self.pairing_flags.append(active)
+        content = object.__new__(self.pc.PluginContent)
+        content._PluginContent__addon = fp.FakeAddon()
+        content._PluginContent__spotty = object()
+        content.refresh_spotipy = lambda: None
+        content.get_authenticated_success_msg = lambda: "paired"
+        self.content = content
+
+    def test_pairing_waits_for_credentials_and_closes_progress(self):
+        self.content.authenticate_plugin("Pair using Spotify on your phone")
+
+        self.assertEqual([50], self.progress_updates)
+        self.assertEqual([True, False], self.pairing_flags)
+        self.assertEqual(
+            ("SpotifyKodiConnect", "Pair using Spotify on your phone"), self.progress.created
+        )
+        self.assertTrue(self.progress.closed)
+        self.assertTrue(self.stopped)
+        self.assertTrue(self.renewed)
+        self.assertEqual("paired", self.dialog_messages[-1][1])
 
 
 class CachedTokenReadTests(unittest.TestCase):
