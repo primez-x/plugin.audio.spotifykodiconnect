@@ -676,6 +676,17 @@ class ToggleLikeTests(unittest.TestCase):
         self.assertEqual("track-b", win.getProperty("Spotify.CurrentTrackId"))
         self.assertEqual("", win.getProperty("Spotify.CurrentTrackLiked"))
 
+    def test_delayed_hook_refresh_of_skipped_track_keeps_new_track_id(self):
+        main_service = import_main_service({})
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        main_service.get_next_playlist_item = lambda: (None, None)
+        main_service._liked_state_track_id = "track-b"
+        win.setProperty("Spotify.CurrentTrackId", "track-b")
+
+        main_service._refresh_playback_hooks("track-a", delay_ms=1000)
+
+        self.assertEqual("track-b", win.getProperty("Spotify.CurrentTrackId"))
+
     def test_toggle_without_valid_token_notifies_immediately(self):
         main_service = import_main_service({})
         main_service.get_valid_cached_auth_token = lambda: ""

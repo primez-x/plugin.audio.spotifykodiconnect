@@ -268,6 +268,8 @@ def _refresh_playback_hooks(current_track_id: str, delay_ms: int = 0) -> None:
     def _run():
         if delay_ms:
             xbmc.sleep(delay_ms)
+        if _liked_state_track_id != current_track_id:
+            return  # a newer track started or playback stopped during the delay
         win = xbmcgui.Window(ADDON_WINDOW_ID)
         try:
             current_item, next_item = get_next_playlist_item()
@@ -277,7 +279,8 @@ def _refresh_playback_hooks(current_track_id: str, delay_ms: int = 0) -> None:
             else:
                 _clear_track_hook(win, "CurrentTrack")
                 with LIKED_STATE_LOCK:
-                    _set_or_clear(win, "Spotify.CurrentTrackId", current_track_id)
+                    if _liked_state_track_id == current_track_id:
+                        _set_or_clear(win, "Spotify.CurrentTrackId", current_track_id)
 
             next_id, next_duration = parse_track_url((next_item or {}).get("file") or "")
             if next_id and next_id != current_track_id:
