@@ -20,7 +20,7 @@ import xbmcaddon
 import xbmcgui
 import xbmcplugin
 import xbmcvfs
-from like_actions import set_current_track_liked
+from like_actions import send_liked_to_service
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import *
@@ -1362,11 +1362,11 @@ class PluginContent:
             liked = bool(result and result[0])
             if liked:
                 self.__spotipy.current_user_saved_tracks_delete([track_id])
-                set_current_track_liked(track_id, False)
+                send_liked_to_service(track_id, False)
                 self.__set_relation_cache("savedtrack", track_id, False)
             else:
                 self.__spotipy.current_user_saved_tracks_add([track_id])
-                set_current_track_liked(track_id, True)
+                send_liked_to_service(track_id, True)
                 self.__set_relation_cache("savedtrack", track_id, True)
         except Exception as exc:
             log_exception(exc, "toggle_liked failed")

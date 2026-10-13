@@ -141,7 +141,7 @@ def _install_stubs():
 
     like_actions = types.ModuleType("like_actions")
     like_actions.notify_not_connected = lambda: None
-    like_actions.set_current_track_liked = lambda track_id, liked, request: True
+    like_actions.set_current_track_liked = lambda track_id, liked: True
     sys.modules["like_actions"] = like_actions
 
     bottle = types.ModuleType("bottle")

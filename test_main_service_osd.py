@@ -636,6 +636,46 @@ class ToggleLikeTests(unittest.TestCase):
 
         self.assertEqual("true", win.getProperty("Spotify.CurrentTrackLiked"))
 
+    def test_set_liked_notification_only_updates_the_playing_track(self):
+        main_service = import_main_service({})
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        win.setProperty("Spotify.CurrentTrackId", "track-b")
+        monitor = object.__new__(main_service._SpotifyOSDServiceMonitor)
+        sender = "plugin.audio.spotifykodiconnect"
+
+        monitor.onNotification(sender, "Other.SetLiked", '{"track_id": "track-a", "liked": true}')
+        self.assertEqual("", win.getProperty("Spotify.CurrentTrackLiked"))
+
+        monitor.onNotification(sender, "Other.SetLiked", '{"track_id": "track-b", "liked": true}')
+        self.assertEqual("true", win.getProperty("Spotify.CurrentTrackLiked"))
+
+        monitor.onNotification(sender, "Other.SetLiked", "not json")
+        self.assertEqual("true", win.getProperty("Spotify.CurrentTrackLiked"))
+
+    def test_liked_lookup_finishing_after_track_change_leaves_next_track_alone(self):
+        main_service = import_main_service({})
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+
+        class Client:
+            def __init__(self, auth=None):
+                pass
+
+            def track(self, track_id):
+                return {}
+
+            def current_user_saved_tracks_contains(self, ids):
+                win.setProperty("Spotify.CurrentTrackId", "track-b")
+                return [True]
+
+        main_service.spotipy.Spotify = Client
+        main_service.get_cached_auth_token = lambda: "token"
+        main_service.get_next_playlist_item = lambda: (None, None)
+        service = object.__new__(main_service.MainService)
+        service._MainService__on_track_started("track-a", 180)
+
+        self.assertEqual("track-b", win.getProperty("Spotify.CurrentTrackId"))
+        self.assertEqual("", win.getProperty("Spotify.CurrentTrackLiked"))
+
     def test_toggle_without_valid_token_notifies_immediately(self):
         main_service = import_main_service({})
         main_service.get_valid_cached_auth_token = lambda: ""

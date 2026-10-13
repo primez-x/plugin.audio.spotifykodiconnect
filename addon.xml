@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<addon id="plugin.audio.spotifykodiconnect" version="1.2.4" name="SpotifyKodiConnect" provider-name="primez-x">
+<addon id="plugin.audio.spotifykodiconnect" version="1.2.5" name="SpotifyKodiConnect" provider-name="primez-x">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
         <import addon="xbmc.addon" version="18.9.701" />
@@ -19,7 +19,10 @@
         <description lang="en_GB">Unofficial Spotify music plugin for Kodi. Improves on the original Spotify addon with consistent album/artist art in all views (including playlists), correct metadata tags, and background loading so navigation and playback feel smooth. Requires Spotify Premium.</description>
         <disclaimer lang="en_GB">This product uses the SPOTIFY WEB API but is not endorsed, certified or otherwise approved in any way by Spotify. Spotify is the registered trademark of Spotify AB.</disclaimer>
         <source>https://github.com/primez-x/plugin.audio.spotifykodiconnect</source>
-        <news>v1.2.4
+        <news>v1.2.5
+- The heart on the player no longer shows the previous track's liked state when a track change and a like, unlike or liked-state lookup happen at the same moment, including likes made from the add-on's own menu.
+
+v1.2.4
 - Liking or unliking a track no longer changes the heart of the next track when playback moves on before Spotify answers or the request fails.
 - Pressing Like while Spotify is still connecting now shows a "connecting" notification right away instead of silently waiting about 5 seconds.
 

@@ -3,6 +3,7 @@ plugin.audio.spotifykodiconnect
 SpotifyKodiConnect - service: spotty + HTTP audio streaming to Kodi.
 """
 
+import json
 import math
 import os
 import threading
@@ -17,7 +18,7 @@ import xbmc
 import xbmcaddon
 import xbmcgui
 from http_spotty_audio_streamer import HTTPSpottyAudioStreamer
-from like_actions import notify_not_connected, set_current_track_liked
+from like_actions import LIKED_STATE_LOCK, notify_not_connected, set_current_track_liked
 from play_queue import clear as play_queue_clear
 from play_queue import should_fire_autoplay as play_queue_should_fire_autoplay
 from playlist_next import get_next_playlist_item, get_playlist_track_ids, parse_track_url
@@ -99,12 +100,20 @@ class _SpotifyOSDServiceMonitor(xbmc.Monitor):
                          Performs the Spotify liked-state toggle entirely inside
                          the service process, avoiding RunPlugin reentry problems
                          with the audio plugin while a track is streaming.
+      Other.SetLiked   – sent by the plugin's toggle_liked with the new liked
+                         state, so only the service writes the heart icon.
     """
 
     def onNotification(self, sender: str, method: str, data: str) -> None:
         if sender == "plugin.audio.spotifykodiconnect" and method == "Other.ToggleLike":
             log_msg("ToggleLike notification received, spawning handler.", LOGDEBUG)
             _start_daemon_thread(self._handle_toggle_like, task_name="toggle-like handler")
+        elif sender == "plugin.audio.spotifykodiconnect" and method == "Other.SetLiked":
+            try:
+                payload = json.loads(data)
+                set_current_track_liked(str(payload["track_id"]), bool(payload["liked"]))
+            except (ValueError, KeyError, TypeError) as exc:
+                log_exception(exc, "SetLiked notification")
 
     @staticmethod
     def _handle_toggle_like() -> None:
@@ -267,7 +276,8 @@ def _refresh_playback_hooks(current_track_id: str, delay_ms: int = 0) -> None:
                 _publish_track_hook(win, "CurrentTrack", current_item, current_id, current_duration)
             else:
                 _clear_track_hook(win, "CurrentTrack")
-                _set_or_clear(win, "Spotify.CurrentTrackId", current_track_id)
+                with LIKED_STATE_LOCK:
+                    _set_or_clear(win, "Spotify.CurrentTrackId", current_track_id)
 
             next_id, next_duration = parse_track_url((next_item or {}).get("file") or "")
             if next_id and next_id != current_track_id:
@@ -422,8 +432,9 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
         _liked_state_track_id = ""
         _clear_artist_fanart_rotation()
         win = xbmcgui.Window(ADDON_WINDOW_ID)
-        win.clearProperty("Spotify.CurrentTrackId")
-        win.clearProperty("Spotify.CurrentTrackLiked")
+        with LIKED_STATE_LOCK:
+            win.clearProperty("Spotify.CurrentTrackId")
+            win.clearProperty("Spotify.CurrentTrackLiked")
         _clear_playback_hooks()
         # Drop any active play-queue session so a stale "loading" state from
         # a previous play doesn't suppress autoplay for the next one.
@@ -448,7 +459,8 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
                 is_spotify, track_id, has_player_file = _read_active_spotify_player_state(win)
                 if is_spotify:
                     if track_id:
-                        win.setProperty("Spotify.CurrentTrackId", track_id)
+                        with LIKED_STATE_LOCK:
+                            win.setProperty("Spotify.CurrentTrackId", track_id)
                         try:
                             self._on_spotify_started(track_id)
                         except Exception as exc:
@@ -619,14 +631,15 @@ class MainService:
         """Set OSD properties for Kodi-confirmed Spotify playback."""
         global _artist_fanart_urls, _artist_fanart_index, _liked_state_track_id
         win = xbmcgui.Window(ADDON_WINDOW_ID)
-        win.setProperty("Spotify.CurrentTrackId", track_id or "")
-        # Only reset and re-query the liked state when the track actually changes.
-        # Kodi issues fresh Range: bytes=0- requests for the same track during buffering,
-        # which would otherwise wipe a user-toggled liked state mid-play.
-        track_changed = track_id != _liked_state_track_id
-        if track_changed:
-            _liked_state_track_id = track_id
-            win.clearProperty("Spotify.CurrentTrackLiked")
+        with LIKED_STATE_LOCK:
+            win.setProperty("Spotify.CurrentTrackId", track_id or "")
+            # Only reset and re-query the liked state when the track actually changes.
+            # Kodi issues fresh Range: bytes=0- requests for the same track during buffering,
+            # which would otherwise wipe a user-toggled liked state mid-play.
+            track_changed = track_id != _liked_state_track_id
+            if track_changed:
+                _liked_state_track_id = track_id
+                win.clearProperty("Spotify.CurrentTrackLiked")
 
         _refresh_playback_hooks(track_id, delay_ms=1000)
 
@@ -692,10 +705,8 @@ class MainService:
                 sp = spotipy.Spotify(auth=token)
                 result = sp.current_user_saved_tracks_contains([track_id])
                 liked = "true" if (result and result[0]) else ""
-                if liked:
-                    win.setProperty("Spotify.CurrentTrackLiked", liked)
-                else:
-                    win.clearProperty("Spotify.CurrentTrackLiked")
+                # Skipped when playback moved on while the lookup was in flight.
+                set_current_track_liked(track_id, bool(liked))
                 log_msg(f"Spotify.CurrentTrackLiked = {liked!r} for {track_id}.", LOGDEBUG)
             except Exception as e:
                 log_msg(f"Error setting liked state for {track_id}: {e}", LOGWARNING)
