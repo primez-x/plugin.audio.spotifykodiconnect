@@ -295,7 +295,9 @@ def _lean_track(track: Dict[str, Any]) -> Dict[str, Any]:
         lean["rating"] = int(track["rating"])
     for key in _LEAN_TRACK_OPTIONAL_KEYS:
         value = track.get(key)
-        if value is not None and value != "" and value != []:
+        if key in ("saved", "artist_followed") or (
+            value is not None and value != "" and value != []
+        ):
             lean[key] = value
     linked_from = track.get("linked_from")
     if isinstance(linked_from, dict) and linked_from.get("id"):
@@ -415,11 +417,38 @@ class PluginContent:
             timer.mark("listing")
 
         except Exception as exc:
-            log_exception(exc, "PluginContent init error")
-            xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+            self.__handle_listing_error(exc)
         finally:
             if timing_enabled:
                 log_msg(timer.line(listing_timing.label(self.__params)), LOGINFO)
+
+    def __handle_listing_error(self, exc: Exception) -> None:
+        status = getattr(exc, "http_status", None)
+        if status is None and not isinstance(exc, OSError):
+            log_exception(exc, "Spotify listing failed")
+        else:
+            log_msg(
+                f"Spotify listing failed ({type(exc).__name__}, status={status}).",
+                xbmc.LOGWARNING,
+            )
+        try:
+            if not self.__is_non_interactive_request():
+                if status == 401:
+                    if self.__confirm_reauthenticate(SPOTIFY_LOGIN_EXPIRED_STR_ID):
+                        self.authenticate_plugin_after_login_failure()
+                else:
+                    fallback = (
+                        SPOTIFY_UNREACHABLE_STR_ID
+                        if status is not None or isinstance(exc, OSError)
+                        else SPOTIFY_LISTING_FAILED_STR_ID
+                    )
+                    string_id = {
+                        429: SPOTIFY_RATE_LIMITED_STR_ID,
+                        403: SPOTIFY_PERMISSION_STR_ID,
+                    }.get(status, fallback)
+                    self.__notify(self.__addon.getLocalizedString(string_id))
+        finally:
+            self.__end_directory(succeeded=False)
 
     def __timing_log_enabled(self) -> bool:
         try:
@@ -506,12 +535,12 @@ class PluginContent:
             log_exception(exc, "interactive request detection")
         return True
 
-    def __confirm_reauthenticate(self) -> bool:
+    def __confirm_reauthenticate(self, prompt_id: int = SPOTIFY_REAUTH_PROMPT_STR_ID) -> bool:
         try:
             return bool(
                 xbmcgui.Dialog().yesno(
                     self.__addon.getAddonInfo("name"),
-                    self.__addon.getLocalizedString(SPOTIFY_REAUTH_PROMPT_STR_ID),
+                    self.__addon.getLocalizedString(prompt_id),
                 )
             )
         except Exception as exc:
@@ -686,6 +715,10 @@ class PluginContent:
         offset = self.__params.get("offset", None)
         if offset:
             self.__offset = int(offset[0])
+        try:
+            self.__limit = max(1, min(50, int(self.__params.get("limit", [50])[0])))
+        except (TypeError, ValueError):
+            self.__limit = 50
         filt = self.__params.get("applyfilter", None)
         if filt:
             self.__filter = filt[0]
@@ -1233,53 +1266,63 @@ class PluginContent:
         )
         return {keys[key]: value for key, value in cached.items() if key in keys}
 
-    def __get_relation_set_for_page(
+    def __warn_lookup_failure(self, namespace: str, exc: Exception) -> None:
+        if self.__dict__.get("_lookup_failure_warned"):
+            return
+        self._lookup_failure_warned = True
+        log_msg(
+            f"Spotify optional lookup failed ({namespace}, {type(exc).__name__}); "
+            "some library actions or artwork are unavailable.",
+            xbmc.LOGWARNING,
+        )
+
+    def __get_relation_states_for_page(
         self,
         namespace: str,
         item_ids: List[str],
         lookup: Callable[[List[str]], List[bool]],
-    ) -> Set[str]:
-        result: Set[str] = set()
+    ) -> Dict[str, Optional[bool]]:
+        result: Dict[str, Optional[bool]] = {}
         missing: List[str] = []
         unique_ids = list(OrderedDict.fromkeys(item_id for item_id in item_ids if item_id))
         cached_states = self.__get_relation_cache_many(namespace, unique_ids)
         for item_id in unique_ids:
             cached = cached_states.get(item_id)
             if cached == "1":
-                result.add(item_id)
+                result[item_id] = True
             elif cached == "0":
-                continue
+                result[item_id] = False
             else:
                 missing.append(item_id)
+                result[item_id] = None
 
         fetched: Dict[str, bool] = {}
         for chunk in get_chunks(missing, 50):
             try:
                 states = lookup(chunk) or []
             except Exception as exc:
-                log_exception(exc, f"{namespace} relation lookup")
+                self.__warn_lookup_failure(namespace, exc)
                 states = []
             for item_id, is_related in zip(chunk, states):
                 related = bool(is_related)
-                if related:
-                    result.add(item_id)
+                result[item_id] = related
                 fetched[item_id] = related
         self.__set_relation_cache_many(namespace, fetched)
 
         return result
 
-    def __get_saved_track_ids_for_page(self, track_ids: List[str]) -> Set[str]:
-        return self.__get_relation_set_for_page(
+    def __get_saved_track_states_for_page(self, track_ids: List[str]) -> Dict[str, Optional[bool]]:
+        return self.__get_relation_states_for_page(
             "savedtrack", track_ids, self.__spotipy.current_user_saved_tracks_contains
         )
 
-    def __get_saved_album_ids_for_page(self, album_ids: List[str]) -> Set[str]:
-        return self.__get_relation_set_for_page(
+    def __get_saved_album_states_for_page(self, album_ids: List[str]) -> Dict[str, Optional[bool]]:
+        return self.__get_relation_states_for_page(
             "savedalbum", album_ids, self.__spotipy.current_user_saved_albums_contains
         )
 
-    def __get_followed_artist_ids_for_page(self, artist_ids: List[str]) -> Set[str]:
-        return self.__get_relation_set_for_page(
+    def __get_followed_artist_states_for_page(self, artist_ids: List[str]) -> Dict[str, Optional[bool]]:
+        return self.__get_relation_states_for_page(
             "followedartist", artist_ids, self.__spotipy.current_user_following_artists
         )
 
@@ -1318,12 +1361,13 @@ class PluginContent:
                 continue
             try:
                 state = self.__spotipy.playlist_is_following(playlist_id, [self.__userid])
-                is_followed = bool(state and state[0])
+                is_followed = bool(state[0]) if state else None
             except Exception as exc:
-                log_exception(exc, "playlist follow relation lookup")
-                is_followed = False
+                self.__warn_lookup_failure("followedplaylist", exc)
+                is_followed = None
             states[playlist_id] = is_followed
-            fetched[playlist_id] = is_followed
+            if is_followed is not None:
+                fetched[playlist_id] = is_followed
         self.__set_relation_cache_many("followedplaylist", fetched)
         return states
 
@@ -1434,9 +1478,9 @@ class PluginContent:
                 continue
             context_items = self.__get_playlist_track_context_menu_items(
                 track,
-                bool(track.get("saved")),
+                track.get("saved"),
                 playlist_details,
-                bool(track.get("artist_followed")),
+                track.get("artist_followed"),
             )
             item = self.__get_track_item(track, append_artist_to_label, context_items)
             if item is not None:
@@ -1822,7 +1866,13 @@ class PluginContent:
             li = xbmcgui.ListItem(item[0], path=item[1])
             li.setProperty("do_not_analyze", "true")
             li.setProperty("IsPlayable", "false")
-            li.setArt({"icon": os.path.join(self.__addon_icon_path, item[2])})
+            li.setArt(
+                _art_for_item(
+                    item[2]
+                    if item[2].startswith(("https://", "http://"))
+                    else os.path.join(self.__addon_icon_path, item[2])
+                )
+            )
             li.addContextMenuItems([], True)
             xbmcplugin.addDirectoryItem(
                 handle=self.__addon_handle, url=item[1], listitem=li, isFolder=True
@@ -2898,25 +2948,22 @@ class PluginContent:
         if include_context_items:
             track_ids_for_context = [t.get("id") for t in new_tracks if t.get("id")]
             if known_saved_track_ids is None:
-                saved_track_ids = self.__get_saved_track_ids_for_page(track_ids_for_context)
+                saved_track_states = self.__get_saved_track_states_for_page(track_ids_for_context)
             else:
-                saved_track_ids = {
-                    track_id
+                saved_track_states = {
+                    track_id: track_id in known_saved_track_ids
                     for track_id in track_ids_for_context
-                    if track_id in known_saved_track_ids
                 }
-                self.__set_relation_cache_many(
-                    "savedtrack", {track_id: True for track_id in saved_track_ids}
-                )
-            followed_artists = self.__get_followed_artist_ids_for_page(
+                self.__set_relation_cache_many("savedtrack", saved_track_states)
+            followed_artists = self.__get_followed_artist_states_for_page(
                 [t.get("artistid") for t in new_tracks if t.get("artistid")]
             )
             # Relation states only; context menus are built at render time.
             relation_ts = time.time()
             for track in new_tracks:
-                track["saved"] = track["id"] in saved_track_ids
+                track["saved"] = saved_track_states.get(track["id"])
                 if track.get("artistid"):
-                    track["artist_followed"] = track["artistid"] in followed_artists
+                    track["artist_followed"] = followed_artists.get(track["artistid"])
                 track[RELATION_SNAPSHOT_KEY] = relation_ts
 
         if include_artist_fanart:
@@ -3016,15 +3063,15 @@ class PluginContent:
                     # Spotify: images sorted by width descending; [0]=largest
                     result[artist["id"]] = (images[0].get("url") or "") if images else ""
         except Exception as e:
-            log_exception(e, "artist fanart fetch")
+            self.__warn_lookup_failure("artist fanart", e)
         return result
 
     def __get_playlist_track_context_menu_items(
         self,
         track: Dict[str, Any],
-        is_saved: bool,
+        is_saved: Optional[bool],
         playlist_details: Optional[Dict[str, Any]],
-        artist_followed: bool,
+        artist_followed: Optional[bool],
     ) -> List[Tuple[str, str]]:
         """Track context menu, built at render time from the row's relation states."""
         # Use original track id for actions when the track was relinked.
@@ -3040,14 +3087,14 @@ class PluginContent:
 
         context_items = []
 
-        if is_saved:
+        if is_saved is True:
             context_items.append(
                 (
                     loc(REMOVE_FROM_LIKED_SONGS_STR_ID),
                     f"RunPlugin({plugin}?action=remove_track&trackid={real_track_id})",
                 )
             )
-        else:
+        elif is_saved is False:
             context_items.append(
                 (
                     loc(ADD_TO_LIKED_SONGS_STR_ID),
@@ -3100,14 +3147,14 @@ class PluginContent:
                 ),
             ]
 
-            if artist_followed:
+            if artist_followed is True:
                 context_items.append(
                     (
                         loc(UNFOLLOW_ARTIST_STR_ID),
                         f"RunPlugin({plugin}?action=unfollow_artist&artistid={artist_id})",
                     )
                 )
-            else:
+            elif artist_followed is False:
                 context_items.append(
                     (
                         loc(FOLLOW_ARTIST_STR_ID),
@@ -3157,14 +3204,12 @@ class PluginContent:
 
         page_album_ids = [album.get("id") for album in albums if album.get("id")]
         if known_saved_album_ids is None:
-            saved_albums = self.__get_saved_album_ids_for_page(page_album_ids)
+            saved_albums = self.__get_saved_album_states_for_page(page_album_ids)
         else:
             saved_albums = {
-                album_id for album_id in page_album_ids if album_id in known_saved_album_ids
+                album_id: album_id in known_saved_album_ids for album_id in page_album_ids
             }
-            self.__set_relation_cache_many(
-                "savedalbum", {album_id: True for album_id in saved_albums}
-            )
+            self.__set_relation_cache_many("savedalbum", saved_albums)
         relation_ts = time.time()
 
         # process listing
@@ -3188,12 +3233,12 @@ class PluginContent:
             track["rating"] = str(self.__get_track_rating(int(track.get("popularity", 0))))
             track["artistid"] = (track.get("artists") or [{}])[0].get("id", "")
 
-            track["saved"] = track["id"] in saved_albums
+            track["saved"] = saved_albums.get(track["id"])
             track[RELATION_SNAPSHOT_KEY] = relation_ts
 
         return albums
 
-    def __get_album_track_context_menu_items(self, track, is_saved: bool) -> List[Tuple[str, str]]:
+    def __get_album_track_context_menu_items(self, track, is_saved: Optional[bool]) -> List[Tuple[str, str]]:
         loc = self.__localized
         plugin = f"plugin://{ADDON_ID}/"
         album_id = track["id"]
@@ -3222,14 +3267,14 @@ class PluginContent:
             ),
         ]
 
-        if is_saved:
+        if is_saved is True:
             context_items.append(
                 (
                     loc(REMOVE_TRACKS_FROM_MY_MUSIC_STR_ID),
                     f"RunPlugin({plugin}?action=remove_album&albumid={album_id})",
                 )
             )
-        else:
+        elif is_saved is False:
             context_items.append(
                 (
                     loc(SAVE_TRACKS_TO_MY_MUSIC_STR_ID),
@@ -3264,7 +3309,7 @@ class PluginContent:
             li.setProperty("do_not_analyze", "true")
             li.setProperty("IsPlayable", "false")
             li.addContextMenuItems(
-                self.__get_album_track_context_menu_items(track, bool(track.get("saved"))), True
+                self.__get_album_track_context_menu_items(track, track.get("saved")), True
             )
             xbmcplugin.addDirectoryItem(
                 handle=self.__addon_handle, url=track["url"], listitem=li, isFolder=True
@@ -3274,9 +3319,9 @@ class PluginContent:
         self, artists: List[Dict[str, Any]], is_followed: bool = False
     ) -> List[Dict[str, Any]]:
         artists = [a for a in artists if a]
-        followed_artists: Set[str] = set()
+        followed_artists: Dict[str, Optional[bool]] = {}
         if not is_followed:
-            followed_artists = self.__get_followed_artist_ids_for_page(
+            followed_artists = self.__get_followed_artist_states_for_page(
                 [
                     (a.get("artist") or a).get("id")
                     for a in artists
@@ -3304,12 +3349,12 @@ class PluginContent:
             artist["rating"] = str(self.__get_track_rating(artist["popularity"]))
             artist["followerslabel"] = f"{artist['followers']['total']} followers"
 
-            artist["followed"] = bool(is_followed or artist["id"] in followed_artists)
+            artist["followed"] = True if is_followed else followed_artists.get(artist["id"])
             artist[RELATION_SNAPSHOT_KEY] = relation_ts
 
         return artists
 
-    def __get_artist_context_menu_items(self, artist, is_followed: bool) -> List[Tuple[str, str]]:
+    def __get_artist_context_menu_items(self, artist, is_followed: Optional[bool]) -> List[Tuple[str, str]]:
         loc = self.__localized
         plugin = f"plugin://{ADDON_ID}/"
         artist_id = artist["id"]
@@ -3342,14 +3387,14 @@ class PluginContent:
             ),
         ]
 
-        if is_followed:
+        if is_followed is True:
             context_items.append(
                 (
                     loc(UNFOLLOW_ARTIST_STR_ID),
                     f"RunPlugin({plugin}?action=unfollow_artist&artistid={artist_id})",
                 )
             )
-        else:
+        elif is_followed is False:
             context_items.append(
                 (
                     loc(FOLLOW_ARTIST_STR_ID),
@@ -3384,7 +3429,7 @@ class PluginContent:
             li.setProperty("IsPlayable", "false")
             li.setLabel2(item.get("followerslabel") or "")
             li.addContextMenuItems(
-                self.__get_artist_context_menu_items(item, bool(item.get("followed"))), True
+                self.__get_artist_context_menu_items(item, item.get("followed")), True
             )
             xbmcplugin.addDirectoryItem(
                 handle=self.__addon_handle,
@@ -3530,7 +3575,7 @@ class PluginContent:
                     f"RunPlugin({plugin}?action=unfollow_playlist&{ids})",
                 )
             )
-        elif owner_id != self.__userid:
+        elif owner_id != self.__userid and is_followed is False:
             contextitems.append(
                 (loc(FOLLOW_PLAYLIST_STR_ID), f"RunPlugin({plugin}?action=follow_playlist&{ids})")
             )
@@ -4052,7 +4097,8 @@ class PluginContent:
 
     def __search_cache_key(self, query: str) -> str:
         digest = hashlib.sha1(self._normalize_search_query(query).encode("utf-8")).hexdigest()
-        return f"spotify.search.{self.__user_country or '-'}.{self.__offset}.{digest[:20]}"
+        key = f"spotify.search.{self.__user_country or '-'}.{self.__offset}.{digest[:20]}"
+        return key if self.__limit == 50 else f"{key}.limit{self.__limit}"
 
     def __get_search_results(self, query: str) -> Dict[str, Any]:
         """One /search call for all four types, shared by every search route.
@@ -4141,6 +4187,26 @@ class PluginContent:
         items = (result.get(section) or {}).get("items") or []
         return [item for item in items if item]
 
+    def __add_search_next_page(self, query: str, section: str, field: str) -> None:
+        page = self.__get_search_results(query).get(section) or {}
+        returned = len(page.get("items") or [])
+        offset = self.__offset + returned
+        if not returned or offset >= (page.get("total") or 0):
+            return
+        url = self.__build_url(
+            {
+                "action": f"search_{section}",
+                field: query,
+                "offset": offset,
+                "limit": self.__limit,
+            }
+        )
+        li = xbmcgui.ListItem(self.__localized(NEXT_PAGE_STR_ID), path=url)
+        li.setProperty("IsPlayable", "false")
+        xbmcplugin.addDirectoryItem(
+            handle=self.__addon_handle, url=url, listitem=li, isFolder=True
+        )
+
     def search_artists(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "artists")
         xbmcplugin.setProperty(
@@ -4153,6 +4219,7 @@ class PluginContent:
         self.__add_artist_listitems(artists)
 
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
+        self.__add_search_next_page(self.__artist_id, "artists", "artistid")
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
     def search_tracks(self) -> None:
@@ -4169,6 +4236,7 @@ class PluginContent:
         self.__add_track_listitems(tracks, True)
 
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
+        self.__add_search_next_page(self.__track_id, "tracks", "trackid")
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
     def search_albums(self) -> None:
@@ -4187,6 +4255,7 @@ class PluginContent:
         self.__add_album_listitems(albums, True)
 
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
+        self.__add_search_next_page(self.__album_id, "albums", "albumid")
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
     def search_playlists(self) -> None:
@@ -4201,6 +4270,7 @@ class PluginContent:
         )
         playlists = self.__prepare_playlist_listitems(items)
         self.__add_playlist_listitems(playlists)
+        self.__add_search_next_page(self.__playlist_id, "playlists", "playlistid")
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
     def search(self) -> None:
@@ -4231,25 +4301,25 @@ class PluginContent:
         items.append(
             (
                 f"{xbmc.getLocalizedString(KODI_ARTISTS_STR_ID)} ({total('artists')})",
-                self.__build_url({"action": self.search_artists.__name__, "artistid": value}),
+                self.__build_url({"action": self.search_artists.__name__, "artistid": value, "limit": self.__limit}),
             )
         )
         items.append(
             (
                 f"{xbmc.getLocalizedString(KODI_PLAYLISTS_STR_ID)} ({total('playlists')})",
-                self.__build_url({"action": self.search_playlists.__name__, "playlistid": value}),
+                self.__build_url({"action": self.search_playlists.__name__, "playlistid": value, "limit": self.__limit}),
             )
         )
         items.append(
             (
                 f"{xbmc.getLocalizedString(KODI_ALBUMS_STR_ID)} ({total('albums')})",
-                self.__build_url({"action": self.search_albums.__name__, "albumid": value}),
+                self.__build_url({"action": self.search_albums.__name__, "albumid": value, "limit": self.__limit}),
             )
         )
         items.append(
             (
                 f"{xbmc.getLocalizedString(KODI_SONGS_STR_ID)} ({total('tracks')})",
-                self.__build_url({"action": self.search_tracks.__name__, "trackid": value}),
+                self.__build_url({"action": self.search_tracks.__name__, "trackid": value, "limit": self.__limit}),
             )
         )
         for item in items:

@@ -377,3 +377,39 @@ msgstr ""
 msgctxt "#11154"
 msgid "Liked songs"
 msgstr ""
+
+msgctxt "#11155"
+msgid "Spotify rate limit reached. Try again shortly."
+msgstr ""
+
+msgctxt "#11156"
+msgid "Spotify denied access. Check your account permissions or Premium subscription."
+msgstr ""
+
+msgctxt "#11157"
+msgid "Cannot reach Spotify. Check your connection and try again."
+msgstr ""
+
+msgctxt "#11158"
+msgid "Next page"
+msgstr ""
+
+msgctxt "#11159"
+msgid "Spotify playback failed. Check your connection or Spotify login and Premium subscription."
+msgstr ""
+
+msgctxt "#11160"
+msgid "Spotify playback failed. Authenticate again."
+msgstr ""
+
+msgctxt "#11161"
+msgid "Spotify playback failed. Check your Premium subscription."
+msgstr ""
+
+msgctxt "#11162"
+msgid "Spotify could not open this folder. Try again."
+msgstr ""
+
+msgctxt "#11163"
+msgid "Spotify login expired. Authenticate again now?"
+msgstr ""

@@ -871,6 +871,66 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             mgr._instances.clear()
             mgr._recent_tracks.clear()
 
+    def test_verified_terminal_classifier_seam_stops_first_attempt(self):
+        from unittest.mock import patch
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+        header, length = self.module.create_wav_header_for_duration(1)
+        for cause in ("auth", "premium"):
+            spotty = FakeSpotty([b"", bytes(length)])
+            with patch.object(spotty_cache, "_classify_spotty_failure", return_value=cause):
+                downloader = spotty_cache.SpottyDownloader(
+                    spotty, "t1", 1, 0, "320", "off", 35, header, length)
+                downloader.start()
+                downloader.thread.join(timeout=2)
+            self.assertFalse(downloader.thread.is_alive())
+            self.assertEqual(1, len(spotty.calls))
+            self.assertTrue(downloader.error)
+            self.assertEqual(cause, downloader.failure_cause)
+
+    def test_terminal_cause_survives_failed_startup_cleanup(self):
+        from unittest.mock import patch
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+        header, length = self.module.create_wav_header_for_duration(1)
+        downloader = spotty_cache.SpottyDownloader(
+            FakeSpotty([]), "t1", 1, 0, "320", "off", 35, header, length)
+        downloader.error = True
+        downloader.failure_cause = "auth"
+        downloader.cleanup()
+        with patch.object(spotty_cache.SpottyCacheManager, "_instances", {("t1", 0): downloader}):
+            self.assertEqual("auth", spotty_cache.SpottyCacheManager.get_failure_cause("t1"))
+            self.assertIsNone(spotty_cache.SpottyCacheManager.get_failure_cause("other"))
+
+    def test_failure_lookup_ignores_older_seek_after_downloader_replacement(self):
+        from unittest.mock import patch
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+        header, length = self.module.create_wav_header_for_duration(1)
+        old = spotty_cache.SpottyDownloader(FakeSpotty([]), "t1", 1, 44, "320", "off", 35, header, length)
+        old.error = True
+        old.failure_cause = "auth"
+        new = spotty_cache.SpottyDownloader(FakeSpotty([]), "t1", 1, 0, "320", "off", 35, header, length)
+        # Replacement at byte zero retains the dictionary's earlier key position.
+        with patch.object(spotty_cache.SpottyCacheManager, "_instances", {("t1", 0): new, ("t1", 44): old}):
+            self.assertIsNone(spotty_cache.SpottyCacheManager.get_failure_cause("t1"))
+
+    def test_unknown_diagnostic_keeps_bounded_recovery(self):
+        from unittest.mock import patch
+        sys.modules.pop("spotty_cache", None)
+        import spotty_cache
+        self.assertIsNone(spotty_cache._classify_spotty_failure("unverified diagnostic"))
+        header, length = self.module.create_wav_header_for_duration(1)
+        spotty = FakeSpotty([b"", bytes(length - len(header))])
+        with patch.object(spotty_cache.SpottyDownloader, "_RETRY_DELAYS", (0,)):
+            downloader = spotty_cache.SpottyDownloader(
+                spotty, "t1", 1, 0, "320", "off", 35, header, length)
+            downloader.start()
+            downloader.thread.join(timeout=2)
+        self.assertFalse(downloader.thread.is_alive())
+        self.assertEqual(2, len(spotty.calls))
+        self.assertFalse(downloader.error)
+
     def test_downloader_marks_large_clean_short_finish_as_error(self):
         sys.modules.pop("spotty_cache", None)
         import spotty_cache

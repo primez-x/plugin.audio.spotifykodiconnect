@@ -126,5 +126,75 @@ class LongRetryAfterTests(unittest.TestCase):
             sys.path.remove(lib)
 
 
+@unittest.skipUnless(HAVE_DEPS, "requests/urllib3 not installed")
+class TransportTests(unittest.TestCase):
+    def test_real_http_status_and_single_shot_writes(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from spotipy import Spotify, SpotifyException
+        counts = {}
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def respond(self):
+                counts[self.command] = counts.get(self.command, 0) + 1
+                self.send_response(int(self.path.strip("/")))
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":{"message":"unavailable","reason":"server failure"}}')
+            do_GET = do_POST = do_PUT = do_DELETE = respond
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = Spotify(retries=1, status_retries=1, backoff_factor=0)
+        try:
+            self.assertEqual((3.05, 10), client.requests_timeout)
+            for method in ("GET", "POST", "PUT", "DELETE"):
+                for status in (500, 503, 429):
+                    with self.subTest(method=method, status=status):
+                        counts.clear()
+                        with self.assertRaises(SpotifyException) as caught:
+                            client._internal_call(method, f"http://127.0.0.1:{server.server_port}/{status}", None, {})
+                        self.assertEqual(status, caught.exception.http_status)
+                        self.assertEqual(2 if method == "GET" else 1, counts[method])
+        finally:
+            client._session.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_retry_without_http_response_preserves_reason(self):
+        import requests
+        from spotipy import Spotify, SpotifyException
+        from unittest.mock import Mock
+        reason = urllib3.exceptions.ConnectTimeoutError("connection timed out")
+        failure = urllib3.exceptions.MaxRetryError(None, "/v1/me", reason)
+        session = Mock()
+        session.request.side_effect = requests.exceptions.RetryError(failure)
+        client = Spotify(requests_session=False)
+        client._session = session
+        with self.assertRaises(SpotifyException) as caught:
+            client._internal_call("GET", "me", None, {})
+        self.assertEqual(0, caught.exception.http_status)
+        self.assertIs(reason, caught.exception.reason)
+
+    def test_long_429_preserves_status_and_retry_after(self):
+        import requests
+        from spotipy import Spotify, SpotifyException
+        from unittest.mock import Mock
+        retry = spotipy_util.Retry(total=1, allowed_methods={"GET"})
+        try:
+            retry.increment("GET", "/v1/me", response=_Resp(429, "3600"))
+        except urllib3.exceptions.MaxRetryError as failure:
+            session = Mock()
+            session.request.side_effect = requests.exceptions.RetryError(failure)
+        client = Spotify(requests_session=False)
+        client._session = session
+        with self.assertRaises(SpotifyException) as caught:
+            client._internal_call("GET", "me", None, {})
+        self.assertEqual(429, caught.exception.http_status)
+        self.assertEqual("3600", caught.exception.headers["Retry-After"])
+
+
 if __name__ == "__main__":
     unittest.main()

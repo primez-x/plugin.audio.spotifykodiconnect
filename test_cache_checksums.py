@@ -304,7 +304,8 @@ class CacheChecksumTests(ContentTestCase):
         for url in urls:
             params = urllib.parse.parse_qs(url.split("?", 1)[1])
             key = expected.pop(params["action"][0])
-            self.assertEqual({"action", key}, set(params))
+            self.assertEqual({"action", key, "limit"}, set(params))
+            self.assertEqual(["50"], params["limit"])
             self.assertEqual(["Simon & Garfunkel #1+2=3"], params[key])
         self.assertEqual({}, expected)
 
@@ -454,6 +455,102 @@ class PerformanceTests(ContentTestCase):
             module.addDirectoryItem, module.addDirectoryItems = saved
         return rendered
 
+    def test_search_pagination_preserves_query_and_consumes_null_rows(self):
+        import urllib.parse
+        for route, field in (("search_tracks", "trackid"), ("search_artists", "artistid"),
+                             ("search_albums", "albumid"), ("search_playlists", "playlistid")):
+            with self.subTest(route=route):
+                rows = self._run_search_route(SearchSpotify([]), route, "a & b")
+                self.assertEqual(4, len(rows))
+                params = urllib.parse.parse_qs(urllib.parse.urlsplit(rows[-1].path).query)
+                self.assertEqual(["a & b"], params[field])
+                self.assertEqual(["4"], params["offset"])
+                self.assertEqual(["50"], params["limit"])
+
+    def test_search_last_or_empty_page_has_no_continuation(self):
+        spotify = SearchSpotify([])
+        content = self.build(spotify)
+        for section in ({"total": 4, "items": [None] * 4}, {"total": 99, "items": []}):
+            content._PluginContent__get_search_results = lambda q: {"tracks": section}
+            self.assertEqual([], self._run_with_content(content, "search_tracks"))
+
+    def _run_with_content(self, content, route):
+        rows = []
+        original = self.pc.xbmcplugin.addDirectoryItem
+        self.pc.xbmcplugin.addDirectoryItem = lambda **kw: rows.append(kw["listitem"])
+        try:
+            getattr(content, route)()
+        finally:
+            self.pc.xbmcplugin.addDirectoryItem = original
+        return rows
+
+    def test_limit_bounds_and_separate_search_cache(self):
+        import sys
+        from unittest.mock import patch
+        for raw, expected in (("10", 10), ("0", 1), ("999", 50), ("bad", 50)):
+            content = self.build(SearchSpotify([]))
+            with patch.object(sys, "argv", ["plugin://spotify", "1", "?limit=" + raw]):
+                content.parse_params()
+            self.assertEqual(expected, content._PluginContent__limit)
+        content = self.build(SearchSpotify([]))
+        key = content._PluginContent__search_cache_key("abc")
+        content._PluginContent__limit = 10
+        self.assertNotEqual(key, content._PluginContent__search_cache_key("abc"))
+
+    def test_explore_remote_and_local_art(self):
+        content = self.build(ContentSpotify([]))
+        content._PluginContent__get_explore_categories = lambda: [("remote", "url", "https://image/icon")]
+        rows = self._run_with_content(content, "browse_main_explore")
+        self.assertEqual("https://image/icon", rows[-1].art["icon"])
+        self.assertEqual("icons/icon_music_playlists.png", rows[0].art["icon"])
+
+    def test_relation_siblings_preserve_cached_false_and_true_during_outage(self):
+        spotify = ContentSpotify([])
+        def failed(ids):
+            raise OSError("outage")
+        spotify.current_user_saved_albums_contains = failed
+        spotify.current_user_following_artists = failed
+        spotify.playlist_is_following = lambda *args: failed(args)
+        content = self.build(spotify)
+        warnings = []
+        self.pc.log_msg = lambda *args: warnings.append(args)
+        albums = content._PluginContent__prepare_album_listitems(albums=[fp.spotify_album(1)])
+        artists = content._PluginContent__prepare_artist_listitems([fp.spotify_artist(1)])
+        playlist = fp.spotify_playlist(1)
+        states = content._PluginContent__get_followed_playlist_states_for_page([playlist], "lookup")
+        playlist["followed"] = states[playlist["id"]]
+        playlist["url"] = "url"
+        for kind, rows, field, actions in (("album", albums, "saved", ("save_album", "remove_album")),
+                                          ("artist", artists, "followed", ("follow_artist", "unfollow_artist")),
+                                          ("playlist", [playlist], "followed", ("follow_playlist", "unfollow_playlist"))):
+            self.assertIsNone(rows[0][field])
+            menus = fp.rendered_context_items(self.pc, content, kind, rows)
+            self.assertFalse(any(f"action={action}&" in cmd for menu in menus for label, cmd in menu for action in actions))
+        self.assertEqual(1, len(warnings))
+        content._PluginContent__set_relation_cache_many("savedtrack", {"track-1": True, "track-2": False})
+        spotify.current_user_saved_tracks_contains = failed
+        tracks = content._PluginContent__prepare_track_listitems(
+            tracks=[fp.spotify_track(i) for i in (1, 2, 3)], include_artist_fanart=False)
+        self.assertEqual([True, False, None], [row["saved"] for row in tracks])
+
+    def test_relation_outage_preserves_unknown_and_warns_once(self):
+        spotify = ContentSpotify([])
+        def failed(ids):
+            raise OSError("outage")
+        spotify.current_user_saved_tracks_contains = failed
+        spotify.current_user_following_artists = failed
+        content = self.build(spotify)
+        warnings = []
+        self.pc.log_msg = lambda *args: warnings.append(args)
+        tracks = content._PluginContent__prepare_track_listitems(
+            tracks=[fp.spotify_track(i) for i in range(51)], include_artist_fanart=False)
+        self.assertTrue(all(row["saved"] is None for row in tracks))
+        self.assertTrue(all(row["artist_followed"] is None for row in tracks))
+        menus = fp.rendered_context_items(self.pc, content, "track", tracks)
+        self.assertFalse(any("action=save_track" in cmd or "action=follow_artist" in cmd
+                             for menu in menus for label, cmd in menu))
+        self.assertEqual(1, len(warnings))
+
     def test_four_search_widgets_share_one_search_call(self):
         spotify = SearchSpotify(fp.RecordingPlayer.events)
         counts = {}
@@ -471,7 +568,7 @@ class PerformanceTests(ContentTestCase):
         self.assertEqual({"artist", "album", "track", "playlist"}, set(types.split(",")))
         self.assertEqual((50, 0, "US"), (limit, offset, market))
         self.assertEqual(
-            {"search_artists": 3, "search_albums": 3, "search_tracks": 3, "search_playlists": 3},
+            {"search_artists": 4, "search_albums": 4, "search_tracks": 4, "search_playlists": 4},
             counts,
         )
         self.assertEqual([], spotify.album_detail_requests, "no /albums re-fetch")
@@ -515,7 +612,7 @@ class PerformanceTests(ContentTestCase):
         fp.FakeMonitor.on_wait = other_process_finishes
         rendered = self._run_search_route(second, "search_tracks", "abba")
 
-        self.assertEqual(3, len(rendered))
+        self.assertEqual(4, len(rendered))
         self.assertEqual(1, len(first.search_requests))
         self.assertEqual([], second.search_requests, "served from the first process' result")
 
@@ -625,7 +722,7 @@ class PerformanceTests(ContentTestCase):
             any("?action=follow_artist&artistid=artist-1)" in c for _l, c in artist_menu)
         )
         playlist_menu = self.render("playlist", playlists)[0]
-        self.assertTrue(any("?action=follow_playlist&" in c for _l, c in playlist_menu))
+        self.assertFalse(any("?action=follow_playlist&" in c for _l, c in playlist_menu))
 
     # -- chunked paged collections ------------------------------------------
 

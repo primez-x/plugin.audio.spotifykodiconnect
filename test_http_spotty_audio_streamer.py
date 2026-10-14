@@ -45,6 +45,12 @@ class FakeWindow:
 
 
 class FakeAddon:
+    def getLocalizedString(self, number):
+        return f"str-{number}"
+
+    def getAddonInfo(self, key):
+        return "Spotify"
+
     def getSetting(self, key):
         if key == "spotify_bitrate":
             return "320"
@@ -149,6 +155,7 @@ def install_stubs():
 
     xbmcgui = types.ModuleType("xbmcgui")
     xbmcgui.Window = FakeWindow
+    xbmcgui.Dialog = lambda: types.SimpleNamespace(notification=lambda *a, **kw: None)
     sys.modules["xbmcgui"] = xbmcgui
 
     spotipy = types.ModuleType("spotipy")
@@ -283,6 +290,66 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
             "bottle",
         ):
             sys.modules.pop(module_name, None)
+
+    def test_playback_failure_notice_is_once_per_queue_session(self):
+        module = import_http_streamer()
+        notices = []
+        module.xbmcgui.Dialog = lambda: types.SimpleNamespace(notification=lambda *a, **kw: notices.append((a, kw)))
+        module.xbmcaddon.Addon = lambda **kw: types.SimpleNamespace(
+            getLocalizedString=lambda number: f"str-{number}", getAddonInfo=lambda key: "Spotify")
+        failures = types.ModuleType("spotty_cache")
+        failures.SpottyCacheManager = types.SimpleNamespace(get_failure_cause=lambda track: "auth")
+        sys.modules["spotty_cache"] = failures
+        FakeWindow.properties.clear()
+        FakeWindow.properties["Spotify.PlayQueue.SessionId"] = "session-1"
+        streamer = module.HTTPSpottyAudioStreamer(object())
+        streamer._notify_playback_failure("track-1")
+        streamer._notify_playback_failure("track-2")
+        self.assertEqual(1, len(notices))
+        self.assertIn("str-11160", notices[0][0])
+        FakeWindow.properties["Spotify.PlayQueue.SessionId"] = "session-2"
+        failures.SpottyCacheManager.get_failure_cause = lambda track: "premium"
+        streamer._notify_playback_failure("track-3")
+        self.assertEqual(2, len(notices))
+        self.assertIn("str-11161", notices[1][0])
+
+    def test_midstream_failure_notifies_and_replaced_stream_stays_quiet(self):
+        module = import_http_streamer()
+        notices = []
+        module.xbmcgui.Dialog = lambda: types.SimpleNamespace(notification=lambda *a, **kw: notices.append(a))
+        FakeWindow.properties.clear()
+        FakeWindow.properties["Spotify.PlayQueue.SessionId"] = "midstream-session"
+        failures = types.ModuleType("spotty_cache")
+        failures.SpottyCacheManager = types.SimpleNamespace(get_failure_cause=lambda track: "connection")
+        sys.modules["spotty_cache"] = failures
+        streamer = module.HTTPSpottyAudioStreamer(object())
+        response = streamer.spotty_stream_audio_track("track", "180.wav")
+        list(response)
+        self.assertEqual(1, len(notices))
+        notices.clear()
+        FakeWindow.properties["Spotify.PlayQueue.SessionId"] = "replacement-session"
+        response = streamer.spotty_stream_audio_track("next", "180.wav")
+        streamer.release_stream(lambda: None)
+        list(response)
+        self.assertEqual([], notices)
+
+    def test_preflight_failure_notifies_but_busy_refusal_stays_quiet(self):
+        module = import_http_streamer()
+        notices = []
+        module.xbmcgui.Dialog = lambda: types.SimpleNamespace(notification=lambda *a, **kw: notices.append(a))
+        module.xbmcaddon.Addon = lambda **kw: types.SimpleNamespace(
+            getLocalizedString=lambda number: f"str-{number}", getAddonInfo=lambda key: "Spotify")
+        FakeWindow.properties.clear()
+        streamer = module.HTTPSpottyAudioStreamer(object())
+        streamer._initialization_busy_response("track", "busy")
+        self.assertEqual([], notices)
+        streamer._HTTPSpottyAudioStreamer__spotty_streamer.prepare_result = False
+        streamer.spotty_stream_audio_track("track", "180.wav")
+        self.assertEqual(503, FakeBottleState.response.status)
+        self.assertEqual(1, len(notices))
+        self.assertIn("str-11159", notices[0])
+        streamer.spotty_stream_audio_track("next-track", "180.wav")
+        self.assertEqual(1, len(notices))
 
     def test_new_track_get_does_not_publish_confirmed_current_track(self):
         module = import_http_streamer()

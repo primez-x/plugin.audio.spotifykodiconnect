@@ -54,6 +54,68 @@ class PluginAuthGatingTests(unittest.TestCase):
         self.pc.xbmc.getCondVisibility = lambda cond: is_media
         return content
 
+    def test_unexpected_listing_error_has_generic_folder_message(self):
+        content = self.build()
+        content._PluginContent__handle_listing_error(ValueError("unexpected"))
+        self.assertIn(f"str-{self.pc.SPOTIFY_LISTING_FAILED_STR_ID}", RecordingDialog.notifications[-1])
+        self.assertFalse(self.end_calls[-1]["succeeded"])
+
+    def test_dispatch_failure_ends_unsuccessfully_and_redacts_notification(self):
+        from unittest.mock import patch
+        self.pc.xbmc.getInfoLabel = lambda label: "plugin://plugin.audio.spotifykodiconnect/"
+        def parse(content):
+            content._PluginContent__action = "browse_main_library"
+        def handler(content, action):
+            def failed():
+                raise TimeoutError("private diagnostic")
+            return failed
+        with patch.object(self.pc.PluginContent, "parse_params", parse), \
+             patch.object(self.pc.PluginContent, "check_auth_and_refresh_spotipy", return_value=True), \
+             patch.object(self.pc.PluginContent, "_get_action_handler", handler):
+            self.pc.PluginContent()
+        self.assertFalse(self.end_calls[-1]["succeeded"])
+        self.assertEqual(1, len(RecordingDialog.notifications))
+        self.assertNotIn("private diagnostic", str(RecordingDialog.notifications))
+
+    def test_new_error_strings_exist_once_in_base_catalog(self):
+        import ast
+        import pathlib
+        import re
+        root = pathlib.Path(fp.REPO_ROOT)
+        tree = ast.parse((root / "resources/lib/string_ids.py").read_text())
+        numbers = [node.value.value for node in tree.body if isinstance(node, ast.Assign)
+                   and isinstance(node.value, ast.Constant) and isinstance(node.value.value, int)
+                   and 11155 <= node.value.value <= 11163]
+        self.assertEqual(list(range(11155, 11164)), numbers)
+        catalog = (root / "resources/language/resource.language.en_gb/strings.po").read_text()
+        for number in numbers:
+            self.assertEqual(1, catalog.count(f'msgctxt "#{number}"'))
+            self.assertRegex(catalog, rf'msgctxt "#{number}"\nmsgid "[^"\n]+"')
+
+    def test_listing_error_statuses_and_widget_silence(self):
+        for status, string_name in ((429, "SPOTIFY_RATE_LIMITED_STR_ID"),
+                                    (403, "SPOTIFY_PERMISSION_STR_ID"),
+                                    (0, "SPOTIFY_UNREACHABLE_STR_ID")):
+            content = self.build()
+            error = OSError("network")
+            error.http_status = status
+            content._PluginContent__handle_listing_error(error)
+            self.assertIn(f"str-{getattr(self.pc, string_name)}", RecordingDialog.notifications[-1])
+            self.assertFalse(self.end_calls[-1]["succeeded"])
+        RecordingDialog.notifications.clear()
+        content = self.build(is_media=False)
+        content._PluginContent__handle_listing_error(OSError("network"))
+        self.assertEqual([], RecordingDialog.notifications)
+
+    def test_listing_401_uses_existing_pairing_confirmation(self):
+        content = self.build()
+        error = OSError("expired")
+        error.http_status = 401
+        RecordingDialog.yesno_answer = True
+        content._PluginContent__handle_listing_error(error)
+        self.assertEqual([1], self.auth_calls)
+        self.assertFalse(self.end_calls[-1]["succeeded"])
+
     def test_credentials_exist_notifies_connecting_without_pairing(self):
         content = self.build(action="browse_main_library", creds=True)
         self.assertFalse(content.check_auth_and_refresh_spotipy())

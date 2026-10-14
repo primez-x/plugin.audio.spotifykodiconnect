@@ -202,13 +202,16 @@ class Retry(urllib3.Retry):
                     hook(time.time() + long_retry_after)
                 except Exception:
                     pass
-            raise urllib3.exceptions.MaxRetryError(
+            failure = urllib3.exceptions.MaxRetryError(
                 _pool,
                 url,
                 urllib3.exceptions.ResponseError(
                     f"too many 429 error responses (Retry-After {long_retry_after:.0f}s)"
                 ),
             )
+            failure.http_status = response.status
+            failure.headers = response.headers
+            raise failure
         if response:
             retry_header = response.headers.get("Retry-After")
             if self.is_retry(method, response.status, bool(retry_header)):

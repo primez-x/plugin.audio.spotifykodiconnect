@@ -1456,7 +1456,8 @@ class PlaylistFastPathTests(unittest.TestCase):
 
         self.assertEqual([], spotify.playlist_follow_requests)
         menus = rendered_context_items(self.plugin_content, content, "playlist", playlists)
-        self.assertTrue(any("?action=follow_playlist&" in command for _label, command in menus[0]))
+        self.assertIsNone(playlists[0]["followed"])
+        self.assertFalse(any("?action=follow_playlist&" in command for _label, command in menus[0]))
 
     def test_prepare_user_playlists_infers_external_items_are_followed_without_lookup(self):
         events = RecordingPlayer.events
@@ -1918,20 +1919,24 @@ class PlaylistFastPathTests(unittest.TestCase):
             spotify.playlist_detail_requests,
         )
 
-    def test_artist_fanart_fetch_logs_exception_with_exception_first(self):
+    def test_artist_fanart_fetch_warns_once_without_traceback(self):
         events = RecordingPlayer.events
         spotify = FailingFanartSpotify(events, total=1)
         content = self.build_content(spotify)
         logged = []
-
-        self.plugin_content.log_exception = lambda exc, details: logged.append((exc, details))
+        tracebacks = []
+        self.plugin_content.log_msg = lambda message, level: logged.append((message, level))
+        self.plugin_content.log_exception = lambda *args: tracebacks.append(args)
 
         result = content._PluginContent__get_artist_fanart_map(["artist-1"])
+        content._PluginContent__get_artist_fanart_map(["artist-2"])
 
         self.assertEqual({}, result)
+        self.assertEqual([], tracebacks)
         self.assertEqual(1, len(logged))
-        self.assertIsInstance(logged[0][0], RuntimeError)
-        self.assertEqual("artist fanart fetch", logged[0][1])
+        self.assertIn("artist fanart", logged[0][0])
+        self.assertIn("RuntimeError", logged[0][0])
+        self.assertEqual(self.plugin_content.xbmc.LOGWARNING, logged[0][1])
 
     def test_artist_fanart_cache_hit_avoids_duplicate_artist_lookup(self):
         events = RecordingPlayer.events

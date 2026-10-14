@@ -131,7 +131,7 @@ class Spotify:
         oauth_manager=None,
         auth_manager=None,
         proxies=None,
-        requests_timeout=5,
+        requests_timeout=(3.05, 10),
         status_forcelist=None,
         retries=max_retries,
         status_retries=max_retries,
@@ -222,9 +222,10 @@ class Spotify:
         self._session = requests.Session()
         retry = Retry(
             total=self.retries,
-            connect=None,
+            connect=0,
             read=False,
-            allowed_methods=frozenset(['GET', 'POST', 'PUT', 'DELETE']),
+            allowed_methods=frozenset(['GET']),
+            raise_on_status=False,
             status=self.status_retries,
             backoff_factor=self.backoff_factor,
             status_forcelist=self.status_forcelist)
@@ -302,17 +303,15 @@ class Spotify:
                 headers=response.headers,
             )
         except requests.exceptions.RetryError as retry_error:
-            request = retry_error.request
+            failure = retry_error.args[0] if retry_error.args else None
+            reason = getattr(failure, "reason", None)
             logger.error('Max Retries reached')
-            try:
-                reason = retry_error.args[0].reason
-            except (IndexError, AttributeError):
-                reason = None
             raise SpotifyException(
-                429,
+                getattr(failure, "http_status", 0),
                 -1,
-                f"{request.path_url}:\n Max Retries",
-                reason=reason
+                "Max Retries",
+                reason=reason,
+                headers=getattr(failure, "headers", None),
             )
         except ValueError:
             results = None

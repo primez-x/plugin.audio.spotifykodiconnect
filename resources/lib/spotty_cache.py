@@ -4,6 +4,7 @@ import time
 from array import array
 from collections import deque
 from operator import sub
+from typing import Optional
 
 from spotty import Spotty
 from utils import log_exception, log_msg
@@ -54,6 +55,15 @@ _SENSITIVE_DIAGNOSTIC_RE = re.compile(
 )
 _AUTH_SCHEME_RE = re.compile(r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+")
 _URL_USERINFO_RE = re.compile(r"(://)[^/@\s]+@")
+
+
+def _classify_spotty_failure(diagnostic_tail: str) -> Optional[str]:
+    """Return auth/premium only for verified terminal diagnostic samples.
+
+    No local sample establishes a terminal pattern. Unknown diagnostics retain
+    bounded retries until a verified sample supplies a conservative rule.
+    """
+    return None
 
 
 def _redact_spotty_diagnostic(value: str) -> str:
@@ -245,6 +255,8 @@ class SpottyDownloader:
         self.last_progress_monotonic = None
         self.is_finished = False
         self.error = False
+        self.failure_cause = None
+        self.created_monotonic = time.monotonic()
         self.aborted = False
         self.process = None
         self.thread = None
@@ -684,6 +696,11 @@ class SpottyDownloader:
                 or large_short_finish
                 or rc != 0
             )
+            terminal_cause = (
+                _classify_spotty_failure(diagnostics) if retryable_finish or rc != 0 else None
+            )
+            if terminal_cause not in ("auth", "premium"):
+                terminal_cause = None
             if diagnostics and (retryable_finish or rc != 0):
                 log_msg(
                     f"Spotty diagnostic tail for {self.track_id}, attempt {attempt + 1}: "
@@ -697,7 +714,11 @@ class SpottyDownloader:
                     LOGDEBUG,
                 )
                 failures = 0
-            if retryable_finish and failures < self._MAX_SESSION_RETRIES:
+            if (
+                retryable_finish
+                and terminal_cause is None
+                and failures < self._MAX_SESSION_RETRIES
+            ):
                 delay = self._RETRY_DELAYS[min(failures, len(self._RETRY_DELAYS) - 1)]
                 failures += 1
                 if timeout_reason:
@@ -731,7 +752,14 @@ class SpottyDownloader:
             with self.cond:
                 if not self.aborted:
                     remaining = max(0, (self.track_length - self.start_byte) - self.written_bytes)
-                    if (timeout_reason or attempt_exception is not None) and remaining > 0:
+                    if terminal_cause is not None:
+                        self.failure_cause = terminal_cause
+                        self.error = True
+                        log_msg(
+                            f"Spotty terminal {terminal_cause} failure; stopping retries.",
+                            LOGWARNING,
+                        )
+                    elif (timeout_reason or attempt_exception is not None) and remaining > 0:
                         reason = timeout_reason or type(attempt_exception).__name__
                         log_msg(
                             f"Spotty {reason} after {self._MAX_SESSION_RETRIES} retries for "
@@ -773,6 +801,8 @@ class SpottyDownloader:
 
                 if self.process is process:
                     self.process = None
+                if self.error and self.failure_cause is None:
+                    self.failure_cause = "unknown"
                 self.is_finished = True
                 self.cond.notify_all()
                 peak_mib = self._peak_buffer_bytes / (1024 * 1024)
@@ -1061,6 +1091,21 @@ class SpottyCacheManager:
                             if best is None or inst.start_byte > best.start_byte:
                                 best = inst
             return best
+
+    @classmethod
+    def get_failure_cause(cls, track_id: str) -> Optional[str]:
+        """Read the latest track downloader failure without changing ownership."""
+        with cls._lock:
+            downloader = max(
+                (value for key, value in cls._instances.items() if key[0] == track_id),
+                key=lambda value: value.created_monotonic,
+                default=None,
+            )
+            if downloader is not None:
+                with downloader.cond:
+                    if downloader.error:
+                        return downloader.failure_cause or "unknown"
+        return None
 
     @classmethod
     def cleanup_all(cls):

@@ -14,6 +14,11 @@ import xbmc
 import xbmcaddon
 import xbmcgui
 from like_actions import notify_not_connected, set_current_track_liked
+from string_ids import (
+    SPOTIFY_PLAYBACK_FAILED_STR_ID,
+    SPOTIFY_PLAYBACK_AUTH_STR_ID,
+    SPOTIFY_PLAYBACK_PREMIUM_STR_ID,
+)
 from spotty import Spotty
 from spotty_audio_streamer import (
     STARTUP_REAL_PCM_WAIT_SECONDS,
@@ -105,6 +110,8 @@ class HTTPSpottyAudioStreamer:
         self.__spotty_streamer.bitrate = bitrate
         self.__is_streaming = False
         self.__stream_lock = threading.Lock()
+        self._failure_notice_lock = threading.Lock()
+        self._last_failure_notice = (None, 0.0)
         self.__current_track_id: Optional[str] = None
         self.__current_request_id: str = ""  # Track current request for init coordination.
         self.__current_stream_spec: Optional[SpottyStreamSpec] = None
@@ -753,6 +760,39 @@ class HTTPSpottyAudioStreamer:
             f"{previous_track_id} is not safely complete."
         )
 
+    def _notify_playback_failure(self, track_id: str, force: bool = False) -> None:
+        cause = None
+        try:
+            from spotty_cache import SpottyCacheManager
+
+            cause = SpottyCacheManager.get_failure_cause(track_id)
+        except (ImportError, AttributeError):
+            pass
+        if cause is None and not force:
+            return
+        try:
+            session = xbmcgui.Window(ADDON_WINDOW_ID).getProperty("Spotify.PlayQueue.SessionId")
+            now = time.monotonic()
+            with self._failure_notice_lock:
+                previous_session, previous_time = self._last_failure_notice
+                if previous_session == session and (session or now - previous_time < 60):
+                    return
+                self._last_failure_notice = (session, now)
+            addon = xbmcaddon.Addon(id=ADDON_ID)
+            string_id = {
+                "auth": SPOTIFY_PLAYBACK_AUTH_STR_ID,
+                "premium": SPOTIFY_PLAYBACK_PREMIUM_STR_ID,
+            }.get(cause, SPOTIFY_PLAYBACK_FAILED_STR_ID)
+            xbmcgui.Dialog().notification(
+                addon.getAddonInfo("name"),
+                addon.getLocalizedString(string_id),
+                icon=addon.getAddonInfo("icon"),
+                time=5000,
+                sound=False,
+            )
+        except Exception as exc:
+            log_msg(f"Spotify playback notification failed ({type(exc).__name__}).", LOGWARNING)
+
     def _failed_new_track_response(
         self,
         track_id: str,
@@ -763,6 +803,7 @@ class HTTPSpottyAudioStreamer:
         previous_stream_spec: Optional[SpottyStreamSpec],
         previous_stream_preserved: bool,
     ):
+        notify_failure = self._owns_initialization(track_id, request_id)
         self._abort_initialization(
             track_id,
             request_id,
@@ -772,6 +813,8 @@ class HTTPSpottyAudioStreamer:
             previous_stream_spec,
             previous_stream_preserved,
         )
+        if notify_failure:
+            self._notify_playback_failure(track_id, force=True)
         return self._unavailable_response(
             f"Refusing stream for {track_id}: Spotty failed before real PCM "
             f"(previous={previous_track_id}, previous_streaming={previous_was_streaming})."
@@ -1140,6 +1183,10 @@ class HTTPSpottyAudioStreamer:
                     yield prebuffer_prefix
                 if stream_body is not None:
                     yield from stream_body
+                with self.__stream_lock:
+                    owns_stream = self.__current_request_id == request_id
+                if owns_stream:
+                    self._notify_playback_failure(track_id or "")
             except GeneratorExit:
                 # Back can mean "close OSD" (playback continues) or "cancel". Do NOT clear
                 # state here—we only clear when the track truly ends (__notify_track_finished).
