@@ -709,6 +709,92 @@ class PlaylistFastPathTests(unittest.TestCase):
         url = RecordingPlaylist.instances[0].items[0][0]
         self.assertRegex(url, r"/track/track-\d+/180\.000\.wav$")
 
+    def test_old_track_advance_during_first_page_preserves_full_replacement(self):
+        import test_main_service_osd as osd
+
+        for boundary in ("fetch", "prepare", "track"):
+            with self.subTest(boundary=boundary):
+                self.setUp()
+                queue = self._shared_queue()
+                content_a = self.build_content(FakeSpotify(RecordingPlayer.events, total=75))
+                content_a.play_playlist()
+                old_items = list(queue.items)
+                DeferredThread.started_targets.clear()
+                labels = {}
+                string_ids = sys.modules["string_ids"]
+                main_service = osd.import_main_service(labels)
+                sys.modules["string_ids"] = string_ids
+                main_service._start_daemon_thread = lambda target, **kwargs: target()
+                main_service.xbmcgui.Window = FakeWindow
+                import play_queue
+
+                def expose(entry):
+                    url, listitem = entry
+                    labels["Player.FileNameAndPath"] = url
+                    labels["MusicPlayer.Property(spotifytrackid)"] = listitem.properties["spotifytrackid"]
+                    labels["MusicPlayer.Property(_spotify_queue_owner)"] = listitem.properties.get("_spotify_queue_owner", "")
+
+                expose(old_items[0])
+                monitor = main_service._SpotifyOSDPlayerMonitor()
+                monitor.onPlayBackStarted()
+                content_b = self.build_content(FakeSpotify(RecordingPlayer.events, total=100))
+                name = {
+                    "fetch": "_PluginContent__get_playlist_items_page",
+                    "prepare": "_PluginContent__prepare_playlist_items_page",
+                    "track": "_PluginContent__get_track_item",
+                }[boundary]
+                original = getattr(content_b, name)
+                advanced = []
+
+                def advance(*args, **kwargs):
+                    if not advanced:
+                        advanced.append(True)
+                        expose(old_items[1])
+                        monitor.onPlayBackStarted()
+                    return original(*args, **kwargs)
+
+                setattr(content_b, name, advance)
+                transport = []
+
+                class Player:
+                    def play(self, playlist):
+                        transport.append((monitor.onPlayBackStopped, playlist.items[0]))
+
+                self.plugin_content.xbmc.Player = Player
+                self.plugin_content.threading.Thread = DeferredThread
+                content_b.play_playlist()
+                owner_b = play_queue.session_id()
+                self.assertEqual(50, len(queue.items))
+                stopped, first_b = transport[0]
+                stopped()
+                self.assertEqual(owner_b, play_queue.session_id())
+                self.assertFalse(play_queue.should_fire_autoplay())
+                expose(first_b)
+                monitor.onPlayBackStarted()
+                DeferredThread.started_targets[0]()
+                self.assertEqual(100, len(queue.items))
+                self.assertEqual("100", self._play_queue_window().getProperty(play_queue.PROP_ORIGINAL_LOADED))
+                self.assertTrue(play_queue.is_original_complete())
+                self.assertEqual(100, len({id(listitem) for _url, listitem in queue.items}))
+                for _url, listitem in queue.items:
+                    track_id = listitem.properties["spotifytrackid"]
+                    self.assertEqual(f"{owner_b}:{track_id}", listitem.properties.get("_spotify_queue_owner"))
+                monitor.onPlayBackStopped()
+                self.assertEqual("", play_queue.session_id())
+                self.assertTrue(play_queue.should_fire_autoplay())
+
+    def test_track_renderer_stamps_default_no_session_and_distinct_owned_items(self):
+        content = self.build_content(FakeSpotify([]))
+        render = content._PluginContent__get_track_item
+        track = spotify_track(7)
+        default = render(track)[1]
+        first = render(track, queue_owner="owner-a")[1]
+        second = render(track, queue_owner="owner-b")[1]
+        self.assertEqual(":track-7", default.properties.get("_spotify_queue_owner"))
+        self.assertEqual("owner-a:track-7", first.properties.get("_spotify_queue_owner"))
+        self.assertEqual("owner-b:track-7", second.properties.get("_spotify_queue_owner"))
+        self.assertIsNot(first, second)
+
     def test_play_playlist_skips_browse_only_metadata_calls(self):
         events = RecordingPlayer.events
         spotify = FakeSpotify(events, total=1)
@@ -941,8 +1027,8 @@ class PlaylistFastPathTests(unittest.TestCase):
         events = RecordingPlayer.events
         content = self.build_content(FakeSpotify(events, total=75))
         original = content._PluginContent__get_track_item
-        content._PluginContent__get_track_item = lambda track, *args: (
-            None if int(track["id"].split("-")[-1]) < 50 else original(track, *args)
+        content._PluginContent__get_track_item = lambda track, *args, **kwargs: (
+            None if int(track["id"].split("-")[-1]) < 50 else original(track, *args, **kwargs)
         )
         content.play_playlist()
         self.assertEqual(["fetch:0", "fetch:50", "play"], events)

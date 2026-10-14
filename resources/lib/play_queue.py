@@ -18,6 +18,8 @@ import xbmcgui
 from utils import ADDON_DATA_PATH, ADDON_WINDOW_ID, log_msg
 from xbmc import LOGDEBUG
 
+ITEM_OWNER_PROPERTY = "_spotify_queue_owner"
+
 PROP_SESSION_ID = "Spotify.PlayQueue.SessionId"
 PROP_ORIGINAL_TOTAL = "Spotify.PlayQueue.OriginalTotal"
 PROP_ORIGINAL_LOADED = "Spotify.PlayQueue.OriginalLoaded"
@@ -31,6 +33,11 @@ _PLAY_QUEUE_PROPS = (
     PROP_ORIGINAL_COMPLETE,
     PROP_AUTOPLAY_FETCHED,
 )
+
+
+def stamp_item_owner(listitem, track_id: str, owner: str = "") -> None:
+    """Bind a fresh playback item to a queue owner and the item's track."""
+    listitem.setProperty(ITEM_OWNER_PROPERTY, f"{owner}:{track_id}")
 
 
 def _window():

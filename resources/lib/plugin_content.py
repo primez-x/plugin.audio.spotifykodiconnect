@@ -30,6 +30,7 @@ from play_queue import (
     session_guard as play_queue_session_guard,
     session_id as play_queue_session_id,
     start_session as play_queue_start_session,
+    stamp_item_owner as play_queue_stamp_item_owner,
 )
 from utils import (
     ADDON_ID,
@@ -1490,6 +1491,7 @@ class PluginContent:
         track: Dict[str, Any],
         append_artist_to_label: bool = False,
         context_items: Optional[List[Tuple[str, str]]] = None,
+        queue_owner: str = "",
     ) -> Optional[Tuple[str, xbmcgui.ListItem]]:
         # Unwrap Spotify playlist item format: { "track": { "id", "duration_ms", ... } }
         # Only unwrap when "track" is a dict (nested track object); avoid setting track to None or non-dict
@@ -1560,6 +1562,7 @@ class PluginContent:
 
         li.setArt(_art_for_track(track, "DefaultMusicSongs.png", track.get("artist_fanart") or ""))
         li.setProperty("spotifytrackid", track["id"])
+        play_queue_stamp_item_owner(li, track["id"], queue_owner)
         li.setContentLookup(False)
         li.addContextMenuItems(context_items or [], True)
         li.setProperty("do_not_analyze", "true")
@@ -2328,7 +2331,7 @@ class PluginContent:
                 for track in tracks:
                     if monitor.abortRequested() or play_queue_session_id() != owner:
                         return
-                    item = self.__get_track_item(track, True)
+                    item = self.__get_track_item(track, True, queue_owner=owner)
                     if item is not None:
                         first_items.append(item)
                 if first_items:
@@ -2386,7 +2389,7 @@ class PluginContent:
                         if monitor.abortRequested():
                             return
                         try:
-                            item = self.__get_track_item(track, True)
+                            item = self.__get_track_item(track, True, queue_owner=owner)
                         except Exception:
                             continue
                         with play_queue_session_guard(owner) as win:

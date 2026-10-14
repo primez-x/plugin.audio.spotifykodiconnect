@@ -20,7 +20,8 @@ import xbmcgui
 from http_spotty_audio_streamer import HTTPSpottyAudioStreamer
 from like_actions import LIKED_STATE_LOCK, notify_not_connected, set_current_track_liked
 from play_queue import clear as play_queue_clear
-from play_queue import session_id as play_queue_session_id
+from play_queue import ITEM_OWNER_PROPERTY
+from play_queue import stamp_item_owner as play_queue_stamp_item_owner
 from play_queue import should_fire_autoplay as play_queue_should_fire_autoplay
 from playlist_next import (
     get_current_playback_time_seconds,
@@ -261,6 +262,24 @@ def _read_active_spotify_player_state(win) -> tuple[bool, str, bool]:
     return False, "", has_player_file
 
 
+def _read_player_queue_owner(track_id: str) -> str:
+    """Accept the item marker only while the player identifies the same track."""
+    label = f"MusicPlayer.Property({ITEM_OWNER_PROPERTY})"
+    binding = xbmc.getInfoLabel(label) or ""
+    owner, separator, bound_track_id = binding.partition(":")
+    if not owner or not separator or bound_track_id != track_id:
+        return ""
+    for file_label in PLAYER_FILE_LABELS:
+        file_path = (xbmc.getInfoLabel(file_label) or "").strip()
+        if file_path and parse_track_url(file_path)[0] != track_id:
+            return ""
+    if (xbmc.getInfoLabel(SPOTIFY_TRACK_PROPERTY_LABELS[0]) or "").strip() != track_id:
+        return ""
+    if (xbmc.getInfoLabel(label) or "") != binding:
+        return ""
+    return owner
+
+
 def _read_confirmed_spotify_track_duration(track_id: str) -> float:
     try:
         current_item, _next_item = get_next_playlist_item()
@@ -362,6 +381,7 @@ def _restore_now_playing_tag(track_id: str, track: dict) -> bool:
         image = images[0]["url"]
         li.setArt({"thumb": image, "poster": image, "fanart": image, "icon": image})
     li.setProperty("spotifytrackid", track_id)
+    play_queue_stamp_item_owner(li, track_id)
     xbmc.Player().updateInfoTag(li)
     log_msg(f"Restored the now-playing tag for {track_id} (played without its ListItem).", LOGDEBUG)
     return True
@@ -444,7 +464,6 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
         xbmc.Player.__init__(self)
         self._on_spotify_started = on_spotify_started or (lambda _track_id: None)
         self._on_external_playback = on_external_playback or (lambda: None)
-        self._play_queue_owner = ""
         self._metadata_check = None
 
     def _clear(self, owner=None, check=None) -> None:
@@ -452,7 +471,7 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
         if check is not None and self._metadata_check is not check:
             return
         if owner is None:
-            owner = self._play_queue_owner
+            owner = self._metadata_check["owner"] if self._metadata_check is not None else ""
         if check is None:
             self._metadata_check = None
         # A replacement session can precede the old player's stop callback.
@@ -460,7 +479,6 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
         if self._metadata_check is not check or (check is not None and not cleared):
             return
         self._metadata_check = None
-        self._play_queue_owner = ""
         _liked_state_track_id = ""
         _clear_artist_fanart_rotation()
         win = xbmcgui.Window(ADDON_WINDOW_ID)
@@ -479,9 +497,10 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
         self._clear()
 
     def onPlayBackStarted(self) -> None:
-        owner = play_queue_session_id()
-        check = object()
-        self._play_queue_owner = owner
+        win = xbmcgui.Window(ADDON_WINDOW_ID)
+        _is_spotify, origin_track_id, _has_player_file = _read_active_spotify_player_state(win)
+        owner = _read_player_queue_owner(origin_track_id)
+        check = {"owner": owner}
         self._metadata_check = check
         # If a non-Spotify item starts playing, clear the Spotify OSD state.
         # PAPlayer can fire before MusicPlayer properties settle, so wait until
@@ -489,10 +508,16 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
         def _check():
             win = xbmcgui.Window(ADDON_WINDOW_ID)
             for _attempt in range(SPOTIFY_PLAYER_METADATA_ATTEMPTS):
-                if self._metadata_check is not check or play_queue_session_id() != owner:
+                if self._metadata_check is not check:
                     return
                 is_spotify, track_id, has_player_file = _read_active_spotify_player_state(win)
-                if self._metadata_check is not check or play_queue_session_id() != owner:
+                current_owner = _read_player_queue_owner(track_id)
+                if self._metadata_check is not check:
+                    return
+                if (owner or origin_track_id) and (
+                    current_owner != owner or track_id != origin_track_id
+                ):
+                    check["owner"] = ""
                     return
                 if is_spotify:
                     if track_id:
@@ -990,6 +1015,7 @@ class MainService:
                     li = xbmcgui.ListItem(label=name)
                     li.setProperty("IsPlayable", "true")
                     li.setProperty("spotifytrackid", tid)
+                    play_queue_stamp_item_owner(li, tid)
                     li.setInfo(
                         "music",
                         {
