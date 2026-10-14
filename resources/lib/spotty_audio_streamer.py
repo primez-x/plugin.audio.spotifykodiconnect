@@ -368,6 +368,7 @@ class SpottyAudioStreamer:
         track_length = stream_spec.track_length
         wav_header = stream_spec.wav_header
         stream_generation = self.__terminate_generation
+        started_at = time.monotonic()
         downloader = self._get_or_start_downloader(stream_spec, range_begin)
         if downloader is None:
             return False
@@ -381,10 +382,19 @@ class SpottyAudioStreamer:
             track_id,
         )
         if not ready or self._startup_failed_before_real_pcm(downloader, range_begin, wav_header):
-            self._log_transfer(
-                "error",
-                stream_track_id=track_id,
-                msg="Background downloader did not reach real PCM startup target",
+            with downloader.cond:
+                state = (
+                    f"real_pcm={int(getattr(downloader, 'real_pcm_bytes', 0) or 0)}, "
+                    f"finished={bool(downloader.is_finished)}, "
+                    f"error={bool(downloader.error)}, aborted={bool(downloader.aborted)}"
+                )
+            # superseded=True: a newer request or a release ended this startup,
+            # not Spotty.
+            log_msg(
+                f"Spotify startup for {track_id} at byte {range_begin} failed before real PCM "
+                f"after {time.monotonic() - started_at:.1f}s ({state}, "
+                f"superseded={self._is_terminated(stream_generation)}).",
+                LOGWARNING,
             )
             self._cleanup_failed_startup_downloader(downloader)
             return False

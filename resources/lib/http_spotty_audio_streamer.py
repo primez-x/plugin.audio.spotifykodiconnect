@@ -22,6 +22,7 @@ from spotty_audio_streamer import (
     create_wav_header_for_duration,
 )
 from utils import ADDON_ID, ADDON_WINDOW_ID, LOGDEBUG, get_valid_cached_auth_token, log_msg
+from xbmc import LOGWARNING
 
 _settings_cache = {
     "bitrate": "320",
@@ -162,32 +163,42 @@ class HTTPSpottyAudioStreamer:
         else:
             log_msg("No running audio streamer. Nothing to stop.", LOGDEBUG)
 
-    def teardown_for_external_playback(self) -> None:
-        """Tear down ALL streaming state when a non-Spotify player takes over.
+    def release_stream(self, release_resources: Callable[[], None]) -> bool:
+        """Drop the active stream and run release_resources with new requests held.
 
-        Clears internal streaming flags so the next Spotify request starts fresh,
-        and terminates any active stream generator.  Combined with
-        SpottyCacheManager.cleanup_all() and kill_all_spotties() from the service,
-        this releases every audio resource before VideoPlayer reconfigures the
-        AML audio codec (e.g. stereo PCM → multi-channel AC3 pass-through),
-        preventing Amlogic audio driver deadlocks.
+        The release owns the initialization reservation while release_resources
+        runs, so a request that arrives meanwhile waits and then starts fresh
+        instead of reusing the released stream or the stream's downloader.
+
+        A stream startup in progress belongs to a newer selection: Kodi waits for
+        a closing player's stream requests before reporting the stop.  The
+        release then leaves the stream state and all resources alone.
+
+        Return whether the release dropped a stream track.
         """
-        log_msg("External playback detected — tearing down Spotify audio stream.", LOGDEBUG)
+        release_id = f"release-{uuid.uuid4()}"
         with self.__stream_lock:
-            was_streaming = self.__is_streaming
+            if self.__init_in_progress:
+                return False
+            released_track = self.__current_track_id is not None
             self.__is_streaming = False
             self.__current_track_id = None
             self.__current_request_id = ""
             self.__current_stream_spec = None
-            self.__init_in_progress = False
+            self.__init_in_progress = True
             self.__initializing_track_id = None
-            self.__initializing_request_id = ""
-            try:
-                self.__init_event.set()
-            except Exception:
-                pass
-        if was_streaming:
+            self.__initializing_request_id = release_id
+            self.__init_event.clear()
+        try:
             self.__terminate_streaming()
+            release_resources()
+        finally:
+            with self.__stream_lock:
+                if self.__initializing_request_id == release_id:
+                    self.__init_in_progress = False
+                    self.__initializing_request_id = ""
+                    self.__init_event.set()
+        return released_track
 
     def __terminate_streaming(self) -> None:
         if self.__spotty_streamer.terminate_stream():
@@ -680,16 +691,28 @@ class HTTPSpottyAudioStreamer:
             self.__init_event.set()
 
     @staticmethod
-    def _initialization_busy_response(track_id: str):
+    def _unavailable_response(message: str):
+        """Refuse a stream request with 503; Kodi skips the track on a refusal.
+
+        Logged without debug logging: a refusal chain is a user-visible skip.
+        """
         bottle.response.status = 503
         bottle.response.content_type = "text/plain"
         bottle.response.content_length = 0
         bottle.response.headers["Retry-After"] = "1"
-        log_msg(
-            f"Refusing stream for {track_id}: another Spotify stream is still initializing.",
-            LOGDEBUG,
-        )
+        log_msg(message, LOGWARNING)
         return ""
+
+    def _initialization_busy_response(self, track_id: str, reason: str):
+        with self.__stream_lock:
+            owner = (
+                self.__initializing_track_id or "a stream release"
+                if self.__init_in_progress
+                else "none"
+            )
+        return self._unavailable_response(
+            f"Refusing stream for {track_id}: {reason} (startup owner: {owner})."
+        )
 
     def _player_near_natural_handoff(self, previous_track_id: str) -> bool:
         try:
@@ -725,16 +748,10 @@ class HTTPSpottyAudioStreamer:
             previous_stream_spec,
             initializing_request_id,
         )
-        bottle.response.status = 503
-        bottle.response.content_type = "text/plain"
-        bottle.response.content_length = 0
-        bottle.response.headers["Retry-After"] = "1"
-        log_msg(
+        return self._unavailable_response(
             f"Refusing preload for {next_track_id}: active Spotify stream "
-            f"{previous_track_id} is not safely complete.",
-            LOGDEBUG,
+            f"{previous_track_id} is not safely complete."
         )
-        return ""
 
     def _failed_new_track_response(
         self,
@@ -755,15 +772,10 @@ class HTTPSpottyAudioStreamer:
             previous_stream_spec,
             previous_stream_preserved,
         )
-        bottle.response.status = 503
-        bottle.response.content_type = "text/plain"
-        bottle.response.content_length = 0
-        bottle.response.headers["Retry-After"] = "1"
-        log_msg(
-            f"Refusing stream for {track_id}: Spotty failed before real PCM.",
-            LOGDEBUG,
+        return self._unavailable_response(
+            f"Refusing stream for {track_id}: Spotty failed before real PCM "
+            f"(previous={previous_track_id}, previous_streaming={previous_was_streaming})."
         )
-        return ""
 
     SPOTTY_AUDIO_TRACK_ROUTE = "/track/<track_id>/<duration>"
 
@@ -793,7 +805,10 @@ class HTTPSpottyAudioStreamer:
             self._request_range_begin(request_range),
         )
         if coordination is None:
-            return self._initialization_busy_response(track_id)
+            return self._initialization_busy_response(
+                track_id,
+                f"another startup did not finish within {INITIALIZATION_WAIT_SECONDS:.0f}s",
+            )
         (
             is_new_track,
             request_id,
@@ -882,7 +897,9 @@ class HTTPSpottyAudioStreamer:
                     norm,
                 )
                 if request_stream_spec is None:
-                    return self._initialization_busy_response(track_id)
+                    return self._initialization_busy_response(
+                        track_id, "this startup was replaced"
+                    )
                 log_msg(
                     f"Preparing spotify track '{track_id}',"
                     f" track length {request_stream_spec.track_length}."
@@ -1071,7 +1088,9 @@ class HTTPSpottyAudioStreamer:
             request_id or "",
             stream_spec,
         ):
-            return self._initialization_busy_response(track_id or "")
+            return self._initialization_busy_response(
+                track_id or "", "this startup was replaced"
+            )
 
         r_begin = range_begin
         r_end = range_end

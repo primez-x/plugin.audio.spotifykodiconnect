@@ -21,7 +21,7 @@ from http_spotty_audio_streamer import HTTPSpottyAudioStreamer
 from like_actions import LIKED_STATE_LOCK, notify_not_connected, set_current_track_liked
 from play_queue import clear as play_queue_clear
 from play_queue import ITEM_OWNER_PROPERTY
-from play_queue import stamp_item_owner as play_queue_stamp_item_owner
+from play_queue import bind_stream_item as play_queue_bind_stream_item
 from play_queue import should_fire_autoplay as play_queue_should_fire_autoplay
 from playlist_next import (
     get_current_playback_time_seconds,
@@ -43,7 +43,7 @@ from utils import (
     log_exception,
     log_msg,
 )
-from xbmc import LOGDEBUG, LOGWARNING
+from xbmc import LOGDEBUG, LOGINFO, LOGWARNING
 
 SPOTIFY_ADDON = xbmcaddon.Addon(id=ADDON_ID)
 utils.install_spotipy_rate_limit_hook(spotipy)
@@ -380,8 +380,7 @@ def _restore_now_playing_tag(track_id: str, track: dict) -> bool:
     if images and images[0].get("url"):
         image = images[0]["url"]
         li.setArt({"thumb": image, "poster": image, "fanart": image, "icon": image})
-    li.setProperty("spotifytrackid", track_id)
-    play_queue_stamp_item_owner(li, track_id)
+    play_queue_bind_stream_item(li, track_id)
     xbmc.Player().updateInfoTag(li)
     log_msg(f"Restored the now-playing tag for {track_id} (played without its ListItem).", LOGDEBUG)
     return True
@@ -460,10 +459,11 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
     fire whenever Kodi's internal buffer fills (mid-song), not only at true end-of-track.
     """
 
-    def __init__(self, on_spotify_started=None, on_external_playback=None):
+    def __init__(self, on_spotify_started=None, on_external_playback=None, on_stopped=None):
         xbmc.Player.__init__(self)
         self._on_spotify_started = on_spotify_started or (lambda _track_id: None)
         self._on_external_playback = on_external_playback or (lambda: None)
+        self._on_stopped = on_stopped or (lambda: None)
         self._metadata_check = None
 
     def _clear(self, owner=None, check=None) -> None:
@@ -489,6 +489,7 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
 
     def onPlayBackStopped(self) -> None:
         self._clear()
+        self._on_stopped()
 
     def onPlayBackEnded(self) -> None:
         self._clear()
@@ -600,6 +601,7 @@ class MainService:
         self.__osd_player_monitor = _SpotifyOSDPlayerMonitor(
             on_spotify_started=self.__on_spotify_playback_started,
             on_external_playback=self._teardown_for_external_playback,
+            on_stopped=self._release_after_stop,
         )
 
         # Cancellation token for _deferred_prebuffer threads.  Incremented after
@@ -717,6 +719,39 @@ class MainService:
             if monitor.waitForAbort(PREBUFFER_REMAINING_POLL_SECONDS):
                 return False
 
+    def __release_audio(self) -> bool:
+        """Release the stream, the stream downloaders, Spotty processes and prebuffering.
+
+        The streamer holds new stream requests until the release completes, so a
+        request can never start on, or reuse, the released resources.  Return
+        whether a Spotify stream track was released.
+        """
+        from spotty_cache import SpottyCacheManager
+
+        def release_resources():
+            # Cancel any deferred prebuffer threads and the prebuffer state.
+            with self._prebuffer_token_lock:
+                self._prebuffer_token += 1
+            self.__prebuffer_manager.cancel_prebuffer()
+            # Abort all background downloaders and kill their spotty subprocesses.
+            SpottyCacheManager.cleanup_all()
+
+        return self.__http_spotty_streamer.release_stream(release_resources)
+
+    def _release_after_stop(self) -> None:
+        """Release Spotify audio when the user stops playback.
+
+        Without this, the stopped track's stream state and Spotty process stayed
+        alive until the next selection, which then inherited them.  A stop
+        callback can arrive after a replacement selection has started; Kodi then
+        reports playback, or the replacement's stream startup is in progress, and
+        the replacement keeps the replacement stream.
+        """
+        if _is_kodi_playing():
+            return
+        if self.__release_audio():
+            log_msg("Playback stopped: released Spotify audio resources.", LOGINFO)
+
     def _teardown_for_external_playback(self) -> None:
         """Tear down all Spotify audio resources when a non-Spotify player starts.
 
@@ -726,27 +761,12 @@ class MainService:
         cache downloads, cancelling prebuffer, and terminating the active HTTP
         stream — before VideoPlayer reconfigures the AML audio codec.
         """
-        from spotty_cache import SpottyCacheManager
-
-        # Guard: only tear down if Spotify audio resources are actually active.
-        win = xbmcgui.Window(ADDON_WINDOW_ID)
-        if not win.getProperty("Spotify.CurrentTrackId"):
+        # The Stop callback of the closed Spotify player can clear the OSD
+        # properties first, so the stream state decides whether Spotify held audio.
+        if not self.__release_audio():
             return
 
         log_msg("External playback detected — tearing down Spotify audio resources.")
-
-        # Cancel any deferred prebuffer threads.
-        with self._prebuffer_token_lock:
-            self._prebuffer_token += 1
-
-        # Cancel prebuffer state.
-        self.__prebuffer_manager.cancel_prebuffer()
-
-        # Abort all background downloaders and kill their spotty subprocesses.
-        SpottyCacheManager.cleanup_all()
-
-        # Terminate the active HTTP stream generator and clear streaming state.
-        self.__http_spotty_streamer.teardown_for_external_playback()
 
         # Kill any remaining spotty processes not tracked by the cache manager.
         self.__spotty_helper.kill_all_spotties()
@@ -1014,8 +1034,7 @@ class MainService:
                     url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{tid}/{url_duration}.wav"
                     li = xbmcgui.ListItem(label=name)
                     li.setProperty("IsPlayable", "true")
-                    li.setProperty("spotifytrackid", tid)
-                    play_queue_stamp_item_owner(li, tid)
+                    play_queue_bind_stream_item(li, tid)
                     li.setInfo(
                         "music",
                         {

@@ -35,9 +35,18 @@ _PLAY_QUEUE_PROPS = (
 )
 
 
-def stamp_item_owner(listitem, track_id: str, owner: str = "") -> None:
-    """Bind a fresh playback item to a queue owner and the item's track."""
+def bind_stream_item(listitem, track_id: str, owner: str = "") -> None:
+    """Bind a fresh playback item to the item's track, a queue owner and the stream type.
+
+    Kodi probes an http item without a mime type with a blocking request on the
+    thread that hands the item over. The local proxy that answers the probe
+    runs in Kodi's Python runtime, so a probe from a Python thread stalls until
+    curl times out (20 s per probe).
+    """
+    listitem.setProperty("spotifytrackid", track_id)
     listitem.setProperty(ITEM_OWNER_PROPERTY, f"{owner}:{track_id}")
+    listitem.setMimeType("audio/x-wav")
+    listitem.setContentLookup(False)
 
 
 def _window():

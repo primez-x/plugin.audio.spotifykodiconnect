@@ -454,6 +454,25 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         self.assertFalse(streamer.prepare_part_audio_stream(0))
         self.assertTrue(downloader.aborted)
 
+    def test_startup_failure_warning_names_the_downloader_state(self):
+        """A 503 skip chain at default log level must show why startup failed."""
+        logs = []
+        self.module.log_msg = lambda msg, level=0, *args, **kwargs: logs.append((level, str(msg)))
+        streamer = self.module.SpottyAudioStreamer(object())
+        streamer.set_track("track-1", 180)
+        wav_header, _ = self.module.create_wav_header_for_duration(180)
+        downloader = FakeDownloader(wav_header)
+        downloader.error = True
+        downloader.is_finished = True
+        FakeSpottyCacheManager.downloader = downloader
+
+        self.assertFalse(streamer.prepare_part_audio_stream(0))
+
+        warnings = [msg for level, msg in logs if level == self.module.LOGWARNING]
+        self.assertEqual(1, len(warnings), logs)
+        for detail in ("track-1", "error=True", "aborted=False", "superseded=False"):
+            self.assertIn(detail, warnings[0])
+
     def test_prepare_from_start_rejects_finished_downloader_before_real_pcm(self):
         streamer = self.module.SpottyAudioStreamer(object())
         streamer.set_track("track-1", 180)

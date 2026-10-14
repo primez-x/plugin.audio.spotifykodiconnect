@@ -138,6 +138,7 @@ def install_stubs():
 
     xbmc = types.ModuleType("xbmc")
     xbmc.LOGDEBUG = 0
+    xbmc.LOGWARNING = 2
     xbmc.getInfoLabel = lambda label: ""
     xbmc.getCondVisibility = lambda condition: False
     sys.modules["xbmc"] = xbmc
@@ -886,6 +887,131 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
             )
         finally:
             recovered.close()
+
+    def test_release_after_stop_makes_same_song_replay_start_fresh(self):
+        """Stop -> replay of the same song must not inherit the stopped stream."""
+        module = import_http_streamer()
+        stale = ActiveDownloader()
+        install_downloader_cache(stale, track_id="replay-track")
+        streamer = module.HTTPSpottyAudioStreamer(object())
+        fake_streamer = streamer._HTTPSpottyAudioStreamer__spotty_streamer
+        streamer.spotty_stream_audio_track("replay-track", "180.wav").close()
+        replays = []
+        replay_threads = []
+
+        def request_replay():
+            replays.append(streamer.spotty_stream_audio_track("replay-track", "180.wav"))
+
+        def release_resources():
+            # A replay that arrives during the release waits for the release.
+            thread = threading.Thread(target=request_replay, daemon=True)
+            thread.start()
+            replay_threads.append(thread)
+            time.sleep(0.2)
+            self.assertEqual([], replays)
+            stale.cleanup()
+
+        streamer.release_stream(release_resources)
+        replay_threads[0].join(timeout=2.0)
+
+        self.assertEqual(1, len(replays))
+        try:
+            self.assertEqual(b"x" * 16, next(replays[0]))
+            # The replay ran a new startup instead of reusing the stopped stream.
+            self.assertEqual(
+                [("replay-track", 180.0), ("replay-track", 180.0)],
+                fake_streamer.set_track_calls,
+            )
+            self.assertEqual([0, 0], fake_streamer.prepare_calls)
+            self.assertEqual(1, stale.cleanup_calls)
+        finally:
+            replays[0].close()
+
+    def test_overlapping_release_preserves_the_first_cleanup_reservation(self):
+        module = import_http_streamer()
+        streamer = module.HTTPSpottyAudioStreamer(object())
+        entered = threading.Event()
+        finish = threading.Event()
+        second_cleanup = []
+
+        def first_cleanup():
+            entered.set()
+            finish.wait(timeout=2)
+
+        thread = threading.Thread(target=lambda: streamer.release_stream(first_cleanup))
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=1))
+            streamer.release_stream(lambda: second_cleanup.append(True))
+            self.assertEqual([], second_cleanup)
+            self.assertTrue(streamer._HTTPSpottyAudioStreamer__init_in_progress)
+            self.assertFalse(streamer._HTTPSpottyAudioStreamer__init_event.is_set())
+        finally:
+            finish.set()
+            thread.join(timeout=2)
+
+    def _assert_late_stop_release_keeps_new_startup(self, new_track_id):
+        """A Stop release that arrives after a new selection started must yield.
+
+        Kodi delivers the Python Stop callback only after PAPlayer::CloseFile has
+        waited for the stopped player's open jobs, so a startup still pending at
+        that point belongs to the next player.  Kodi sets the next player's
+        isPlaying flag after the open job (and the GET) can start, so the stop
+        check alone cannot tell the two apart.
+        """
+        module = import_http_streamer()
+        spotty_cache = types.ModuleType("spotty_cache")
+        spotty_cache.SpottyCacheManager = MissingSpottyCacheManager
+        sys.modules["spotty_cache"] = spotty_cache
+        streamer = module.HTTPSpottyAudioStreamer(object())
+        fake_streamer = streamer._HTTPSpottyAudioStreamer__spotty_streamer
+        # The stopped song: Kodi closed the connection on Stop.
+        streamer.spotty_stream_audio_track("stopped-track", "180.wav").close()
+        fake_streamer.prepare_entered.clear()
+        fake_streamer.prepare_release = threading.Event()
+        results = []
+        thread = threading.Thread(
+            target=lambda: results.append(
+                streamer.spotty_stream_audio_track(new_track_id, "200.wav")
+            ),
+            daemon=True,
+        )
+        thread.start()
+        self.assertTrue(fake_streamer.prepare_entered.wait(timeout=1.0))
+        released = []
+
+        streamer.release_stream(lambda: released.append(True))
+        fake_streamer.prepare_release.set()
+        thread.join(timeout=1.0)
+
+        self.assertEqual([], released)
+        self.assertEqual(1, len(results))
+        try:
+            self.assertEqual(b"x" * 16, next(results[0]))
+            self.assertTrue(streamer.is_current_track_streaming(new_track_id))
+        finally:
+            results[0].close()
+
+    def test_late_stop_release_keeps_a_new_track_startup(self):
+        self._assert_late_stop_release_keeps_new_startup("next-track")
+
+    def test_late_stop_release_keeps_a_same_song_replay_startup(self):
+        self._assert_late_stop_release_keeps_new_startup("stopped-track")
+
+    def test_stream_refusal_is_logged_without_debug_logging(self):
+        """A skip chain at default log level must show why each track was refused."""
+        module = import_http_streamer()
+        logs = []
+        module.log_msg = lambda msg, level=0, *args, **kwargs: logs.append((level, msg))
+        streamer = module.HTTPSpottyAudioStreamer(object())
+        streamer._HTTPSpottyAudioStreamer__spotty_streamer.prepare_result = False
+
+        streamer.spotty_stream_audio_track("failed-track", "180.wav")
+
+        warnings = [msg for level, msg in logs if level == module.LOGWARNING]
+        self.assertEqual(1, len(warnings), logs)
+        self.assertIn("failed-track", warnings[0])
+        self.assertIn("real PCM", warnings[0])
 
 
 class HTTPRangeTests(unittest.TestCase):

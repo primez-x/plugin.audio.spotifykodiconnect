@@ -25,12 +25,12 @@ from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import *
 from play_queue import (
+    bind_stream_item as play_queue_bind_stream_item,
     mark_original_complete as play_queue_mark_original_complete,
     report_loaded as play_queue_report_loaded,
     session_guard as play_queue_session_guard,
     session_id as play_queue_session_id,
     start_session as play_queue_start_session,
-    stamp_item_owner as play_queue_stamp_item_owner,
 )
 from utils import (
     ADDON_ID,
@@ -1561,12 +1561,9 @@ class PluginContent:
             li.setProperty("Artist_Description", artist_desc)
 
         li.setArt(_art_for_track(track, "DefaultMusicSongs.png", track.get("artist_fanart") or ""))
-        li.setProperty("spotifytrackid", track["id"])
-        play_queue_stamp_item_owner(li, track["id"], queue_owner)
-        li.setContentLookup(False)
+        play_queue_bind_stream_item(li, track["id"], queue_owner)
         li.addContextMenuItems(context_items or [], True)
         li.setProperty("do_not_analyze", "true")
-        li.setMimeType("audio/x-wav")
 
         return url, li
 

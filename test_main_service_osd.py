@@ -118,6 +118,7 @@ def install_stubs(info_labels, settings=None):
 
     xbmc = types.ModuleType("xbmc")
     xbmc.LOGDEBUG = 0
+    xbmc.LOGINFO = 1
     xbmc.LOGWARNING = 2
     xbmc.Monitor = FakeMonitor
     xbmc.Player = FakePlayer
@@ -806,6 +807,7 @@ class BareNowPlayingTagTests(unittest.TestCase):
     def _start(self, info_labels, api_track=None):
         main_service = import_main_service(info_labels)
         updates, api_calls = [], []
+        probes = self.probes = []
 
         class Tag:
             def __init__(self):
@@ -820,6 +822,7 @@ class BareNowPlayingTagTests(unittest.TestCase):
             def __init__(self, label="", path="", offscreen=False):
                 self.label, self.path = label, path
                 self.tag, self.art, self.props = Tag(), {}, {}
+                self.mime_type, self.content_lookup = "", True
 
             def getMusicInfoTag(self):
                 return self.tag
@@ -830,8 +833,21 @@ class BareNowPlayingTagTests(unittest.TestCase):
             def setProperty(self, key, value):
                 self.props[key] = value
 
+            def setMimeType(self, mime_type):
+                self.mime_type = mime_type
+
+            def setContentLookup(self, enabled):
+                self.content_lookup = enabled
+
         class Player:
             def updateInfoTag(self, item):
+                # Kodi's CFileItem::UpdateInfo ends with
+                # UpdateMimeType(m_doContentLookup): an http item without a
+                # mime type is probed with a blocking HTTP request on the
+                # calling thread. The proxy answering that probe runs in this
+                # Python runtime, so the probe stalls until curl times out.
+                if item.content_lookup and not item.mime_type and item.path.startswith("http"):
+                    probes.append(item.path)
                 updates.append(item)
 
         class Client:
@@ -887,6 +903,14 @@ class BareNowPlayingTagTests(unittest.TestCase):
         self.assertEqual("track-1", item.props["spotifytrackid"])
         self.assertEqual(":track-1", item.props.get("_spotify_queue_owner"))
         self.assertEqual(1, api_calls.count("track"))
+
+    def test_restored_tag_never_makes_kodi_probe_the_local_stream(self):
+        """Device run 2026-10-14: the probe froze every Spotify thread for 40 s."""
+        updates, _api_calls = self._start({"Player.FilenameAndPath": self.URL}, self.TRACK)
+        self.assertEqual(1, len(updates))
+        self.assertEqual([], self.probes)
+        self.assertEqual("audio/x-wav", updates[0].mime_type)
+        self.assertFalse(updates[0].content_lookup)
 
     def test_plugin_listitem_playback_is_left_alone(self):
         updates, api_calls = self._start(
@@ -1319,6 +1343,12 @@ class SpotifyAutoplayGatingTests(unittest.TestCase):
             def setArt(self, art):
                 self.art = art
 
+            def setMimeType(self, mime_type):
+                self.mime_type = mime_type
+
+            def setContentLookup(self, enabled):
+                self.content_lookup = enabled
+
         main_service.get_cached_auth_token = lambda: "token"
         main_service.spotipy.Spotify = lambda auth=None: _Spotify()
         main_service.get_playlist_track_ids = lambda: {"rec-2"}
@@ -1343,6 +1373,9 @@ class SpotifyAutoplayGatingTests(unittest.TestCase):
         self.assertEqual("Artist 1", first.info["artist"])
         self.assertEqual("Album", first.info["album"])
         self.assertEqual("img-1", first.art["thumb"])
+        # Kodi must open queued items without probing the local stream first.
+        self.assertEqual("audio/x-wav", first.mime_type)
+        self.assertFalse(first.content_lookup)
 
     def test_osd_clear_wipes_play_queue_session_state(self):
         """A current manual stop clears the queue and allows ordinary autoplay."""
@@ -1364,6 +1397,123 @@ class SpotifyAutoplayGatingTests(unittest.TestCase):
         self.assertEqual("", win.getProperty("Spotify.PlayQueue.SessionId"))
         self.assertEqual("", win.getProperty("Spotify.PlayQueue.OriginalComplete"))
         self.assertEqual("", win.getProperty("Spotify.PlayQueue.AutoplayFetched"))
+
+
+class PlaybackStopReleaseTests(unittest.TestCase):
+    """Device run 2026-10-14: after Stop, the stopped track's Spotty process and
+    stream state stayed alive until the next selection, so a replay of the same
+    song inherited them."""
+
+    def tearDown(self):
+        threading.Thread = _REAL_THREAD
+        FakeWindow.windows.clear()
+        for module_name in ("main_service", "playlist_next", "play_queue", "spotty_cache"):
+            sys.modules.pop(module_name, None)
+
+    def _service(self, playing=False, stream_held=True):
+        main_service = import_main_service({})
+        events = []
+
+        class Player:
+            def isPlaying(self):
+                return playing
+
+        class Streamer:
+            def release_stream(self, release_resources):
+                events.append("release_stream")
+                release_resources()
+                return stream_held
+
+        class Prebuffer:
+            def cancel_prebuffer(self):
+                events.append("cancel_prebuffer")
+
+        class Helper:
+            def kill_all_spotties(self):
+                events.append("kill_all_spotties")
+
+        class Manager:
+            @staticmethod
+            def cleanup_all():
+                events.append("cleanup_all")
+
+        spotty_cache = types.ModuleType("spotty_cache")
+        spotty_cache.SpottyCacheManager = Manager
+        sys.modules["spotty_cache"] = spotty_cache
+        main_service.xbmc.Player = Player
+        service = object.__new__(main_service.MainService)
+        service._MainService__http_spotty_streamer = Streamer()
+        service._MainService__prebuffer_manager = Prebuffer()
+        service._MainService__spotty_helper = Helper()
+        service._prebuffer_token = 7
+        service._prebuffer_token_lock = threading.Lock()
+        return main_service, service, events
+
+    def test_stop_releases_stream_downloaders_and_pending_prebuffer(self):
+        _main_service, service, events = self._service()
+
+        service._release_after_stop()
+
+        # Spotify login and token processes are not stream processes: keep them.
+        self.assertEqual(["release_stream", "cancel_prebuffer", "cleanup_all"], events)
+        # A deferred prebuffer for the stopped track must not start afterwards.
+        self.assertEqual(8, service._prebuffer_token)
+
+    def test_late_stop_callback_leaves_replacement_playback_alone(self):
+        _main_service, service, events = self._service(playing=True)
+
+        service._release_after_stop()
+
+        self.assertEqual([], events)
+        self.assertEqual(7, service._prebuffer_token)
+
+    def test_external_playback_teardown_also_kills_untracked_spotty_processes(self):
+        _main_service, service, events = self._service()
+
+        service._teardown_for_external_playback()
+
+        self.assertEqual(
+            ["release_stream", "cancel_prebuffer", "cleanup_all", "kill_all_spotties"],
+            events,
+        )
+
+    def test_switch_to_a_movie_tears_down_spotify_after_the_stop_callback(self):
+        """Spotify -> Plex: Kodi closes PAPlayer first, so the Stop callback clears
+        Spotify.CurrentTrackId before the movie's start check runs, and VideoPlayer
+        already plays when the Stop callback arrives."""
+        main_service, service, events = self._service(playing=True)
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+        win.setProperty("Spotify.CurrentTrackId", "track-a")
+        monitor = main_service._SpotifyOSDPlayerMonitor(
+            on_external_playback=service._teardown_for_external_playback,
+            on_stopped=service._release_after_stop,
+        )
+
+        monitor.onPlayBackStopped()
+        service._teardown_for_external_playback()
+
+        self.assertEqual(
+            ["release_stream", "cancel_prebuffer", "cleanup_all", "kill_all_spotties"],
+            events,
+        )
+
+    def test_movie_start_without_spotify_stream_keeps_spotty_processes(self):
+        _main_service, service, events = self._service(stream_held=False)
+
+        service._teardown_for_external_playback()
+
+        self.assertNotIn("kill_all_spotties", events)
+
+    def test_only_a_user_stop_releases_spotify_audio(self):
+        main_service = import_main_service({})
+        stopped = []
+        monitor = main_service._SpotifyOSDPlayerMonitor(on_stopped=lambda: stopped.append(True))
+
+        monitor.onPlayBackEnded()
+        monitor.onPlayBackError()
+        self.assertEqual([], stopped)
+        monitor.onPlayBackStopped()
+        self.assertEqual([True], stopped)
 
 
 if __name__ == "__main__":
