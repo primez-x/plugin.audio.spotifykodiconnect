@@ -1643,7 +1643,7 @@ class PluginContent:
                 MUSIC_ALBUMS_ICON,
             ),
             (
-                xbmc.getLocalizedString(KODI_SONGS_STR_ID),
+                self.__addon.getLocalizedString(LIKED_SONGS_STR_ID),
                 f"plugin://{ADDON_ID}/?action={self.browse_saved_tracks.__name__}",
                 MUSIC_SONGS_ICON,
             ),
@@ -1684,6 +1684,11 @@ class PluginContent:
 
     def browse_top_artists(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "artists")
+        xbmcplugin.setProperty(
+            self.__addon_handle,
+            "FolderName",
+            self.__addon.getLocalizedString(MOST_PLAYED_ARTISTS_STR_ID),
+        )
         cache_str = f"spotify.topartists.{self.__userid}"
         checksum = self.__content_checksum("topartists")
         artists = self.cache.get(cache_str, checksum=checksum)
@@ -1711,6 +1716,11 @@ class PluginContent:
 
     def browse_top_tracks(self) -> None:
         xbmcplugin.setContent(self.__addon_handle, "songs")
+        xbmcplugin.setProperty(
+            self.__addon_handle,
+            "FolderName",
+            self.__addon.getLocalizedString(MOST_PLAYED_TRACKS_STR_ID),
+        )
         cache_str = f"spotify.toptracks.{self.__userid}"
         checksum = self.__content_checksum("toptracks")
         tracks = self.cache.get(cache_str, checksum=checksum)
@@ -3931,7 +3941,7 @@ class PluginContent:
         xbmcplugin.setProperty(
             self.__addon_handle,
             "FolderName",
-            xbmc.getLocalizedString(KODI_SONGS_STR_ID),
+            self.__addon.getLocalizedString(LIKED_SONGS_STR_ID),
         )
         tracks = self.__get_saved_tracks()
         self.__add_track_listitems(tracks, True)

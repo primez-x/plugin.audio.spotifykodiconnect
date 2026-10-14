@@ -695,6 +695,57 @@ class PlaylistFastPathTests(unittest.TestCase):
         self.plugin_content.xbmc.getInfoLabel = lambda label, target_url=target_url: target_url
         return target_url
 
+    def record_plugin_properties(self):
+        calls = []
+        module = self.plugin_content.xbmcplugin
+        original = module.setProperty
+        module.setProperty = lambda *args, **kwargs: calls.append((args, kwargs))
+        self.addCleanup(setattr, module, "setProperty", original)
+        return calls
+
+    def test_browse_top_artists_sets_localized_folder_name(self):
+        content = self.build_content(FakeSpotify(RecordingPlayer.events))
+        content.cache.get = lambda *args, **kwargs: [{}]
+        content._PluginContent__add_artist_listitems = lambda artists: None
+        properties = self.record_plugin_properties()
+
+        content.browse_top_artists()
+
+        self.assertIn(((1, "FolderName", "str-11023"), {}), properties)
+
+    def test_browse_top_tracks_sets_localized_folder_name(self):
+        content = self.build_content(FakeSpotify(RecordingPlayer.events))
+        content.cache.get = lambda *args, **kwargs: [{}]
+        content._PluginContent__add_track_listitems = lambda tracks, *_args: None
+        properties = self.record_plugin_properties()
+
+        content.browse_top_tracks()
+
+        self.assertIn(((1, "FolderName", "str-11024"), {}), properties)
+
+    def test_browse_saved_tracks_sets_liked_songs_folder_name(self):
+        content = self.build_content(FakeSpotify(RecordingPlayer.events))
+        content._PluginContent__get_saved_tracks = lambda: []
+        content._PluginContent__add_track_listitems = lambda tracks, *_args: None
+        properties = self.record_plugin_properties()
+
+        content.browse_saved_tracks()
+
+        self.assertIn(((1, "FolderName", "str-11154"), {}), properties)
+
+    def test_my_music_saved_tracks_entry_uses_liked_songs_label(self):
+        content = self.build_content(FakeSpotify(RecordingPlayer.events))
+        items = []
+        module = self.plugin_content.xbmcplugin
+        original = module.addDirectoryItem
+        module.addDirectoryItem = lambda *args, **kwargs: items.append(kwargs["listitem"])
+        self.addCleanup(setattr, module, "addDirectoryItem", original)
+
+        content.browse_main_library()
+
+        entry = next(item for item in items if "action=browse_saved_tracks" in item.path)
+        self.assertEqual("str-11154", entry.label)
+
     def test_play_playlist_starts_after_first_page_before_fetching_remaining_pages(self):
         events = RecordingPlayer.events
         spotify = FakeSpotify(events, total=75)

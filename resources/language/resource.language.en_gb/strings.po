@@ -373,3 +373,7 @@ msgstr ""
 msgctxt "#11153"
 msgid "Write one line per Spotify listing (widgets and browsing) to the Kodi log with the time it took. Leave disabled unless you are measuring widget speed."
 msgstr ""
+
+msgctxt "#11154"
+msgid "Liked songs"
+msgstr ""
