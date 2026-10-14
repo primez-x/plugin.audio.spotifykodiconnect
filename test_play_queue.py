@@ -1,6 +1,9 @@
 import os
 import sys
 import types
+import tempfile
+import multiprocessing
+from unittest.mock import patch
 import unittest
 
 REPO_ROOT = os.path.dirname(__file__)
@@ -23,7 +26,7 @@ class FakeWindow:
         self.properties.pop(key, None)
 
 
-def install_stubs(window):
+def install_stubs(window, profile):
     xbmc = types.ModuleType("xbmc")
     xbmc.LOGDEBUG = 0
     sys.modules["xbmc"] = xbmc
@@ -34,6 +37,7 @@ def install_stubs(window):
 
     utils = types.ModuleType("utils")
     utils.ADDON_WINDOW_ID = 10000
+    utils.ADDON_DATA_PATH = profile
     utils.log_msg = lambda *args, **kwargs: None
     sys.modules["utils"] = utils
 
@@ -41,7 +45,9 @@ def install_stubs(window):
 class PlayQueueTests(unittest.TestCase):
     def setUp(self):
         self.window = FakeWindow()
-        install_stubs(self.window)
+        self.profile = tempfile.TemporaryDirectory(prefix="spotify-queue-")
+        self.addCleanup(self.profile.cleanup)
+        install_stubs(self.window, self.profile.name)
         if LIB_DIR not in sys.path:
             sys.path.insert(0, LIB_DIR)
         sys.modules.pop("play_queue", None)
@@ -72,13 +78,88 @@ class PlayQueueTests(unittest.TestCase):
     def test_mark_original_complete_flips_loading_flag(self):
         self.play_queue.start_session(75)
         self.assertFalse(self.play_queue.is_original_complete())
-        self.play_queue.mark_original_complete()
+        self.play_queue.mark_original_complete(self.play_queue.session_id())
         self.assertTrue(self.play_queue.is_original_complete())
 
     def test_report_loaded_updates_count_for_diagnostics(self):
         self.play_queue.start_session(75)
-        self.play_queue.report_loaded(50)
+        self.play_queue.report_loaded(50, self.play_queue.session_id())
         self.assertEqual("50", self.window.getProperty("Spotify.PlayQueue.OriginalLoaded"))
+
+    def test_session_tokens_are_unique_at_the_same_timestamp(self):
+        with patch("time.time", return_value=1234):
+            first = self.play_queue.start_session(75)
+            second = self.play_queue.start_session(75)
+        self.assertNotEqual(first, second)
+
+    def test_stale_progress_and_completion_leave_new_session_unchanged(self):
+        first = self.play_queue.start_session(75)
+        second = self.play_queue.start_session(100)
+        self.play_queue.report_loaded(75, first)
+        self.play_queue.mark_original_complete(first)
+        self.assertEqual(second, self.play_queue.session_id())
+        self.assertEqual("0", self.window.getProperty(self.play_queue.PROP_ORIGINAL_LOADED))
+        self.assertFalse(self.play_queue.is_original_complete())
+
+    def test_guard_serializes_cross_process_replacement_and_clear(self):
+        context = multiprocessing.get_context("fork")
+        with context.Manager() as manager:
+            self.window.properties = manager.dict()
+            for action in ("replace", "clear"):
+                with self.subTest(action=action):
+                    old = self.play_queue.start_session(75)
+                    entered = context.Event()
+                    released = context.Event()
+                    attempted = context.Event()
+                    finished = context.Event()
+                    mutations = manager.list()
+                    def append():
+                        with self.play_queue.session_guard(old) as owned:
+                            if not owned:
+                                raise RuntimeError("active owner rejected")
+                            entered.set()
+                            if not released.wait(5):
+                                raise RuntimeError("guard release timeout")
+                            mutations.append("old")
+                    def transition():
+                        attempted.set()
+                        if action == "replace":
+                            self.play_queue.start_session(100)
+                        else:
+                            self.play_queue.clear()
+                        mutations[:] = [action]
+                        finished.set()
+                    loader = context.Process(target=append)
+                    replacement = context.Process(target=transition)
+                    loader.start()
+                    try:
+                        self.assertTrue(entered.wait(5), "loader did not acquire guard")
+                        replacement.start()
+                        self.assertTrue(attempted.wait(5))
+                        self.assertFalse(finished.wait(0.2), "transition crossed an active mutation")
+                    finally:
+                        released.set()
+                        loader.join(5)
+                        if replacement.pid is not None:
+                            replacement.join(5)
+                        for process in (loader, replacement):
+                            if process.pid is not None and process.is_alive():
+                                process.terminate()
+                                process.join()
+                    self.assertEqual(0, loader.exitcode)
+                    self.assertEqual(0, replacement.exitcode)
+                    self.assertEqual([action], list(mutations))
+                    with self.play_queue.session_guard(old) as owned:
+                        self.assertFalse(owned)
+
+    def test_guard_releases_after_exception(self):
+        old = self.play_queue.start_session(75)
+        with self.assertRaises(RuntimeError):
+            with self.play_queue.session_guard(old) as owned:
+                self.assertTrue(owned)
+                raise RuntimeError("append failed")
+        new = self.play_queue.start_session(100)
+        self.assertEqual(new, self.play_queue.session_id())
 
     # --- is_loading ------------------------------------------------------------
 
@@ -88,7 +169,7 @@ class PlayQueueTests(unittest.TestCase):
 
     def test_is_loading_false_after_mark_original_complete(self):
         self.play_queue.start_session(75)
-        self.play_queue.mark_original_complete()
+        self.play_queue.mark_original_complete(self.play_queue.session_id())
         self.assertFalse(self.play_queue.is_loading())
 
     def test_is_loading_false_when_no_session_active(self):
@@ -106,7 +187,7 @@ class PlayQueueTests(unittest.TestCase):
 
     def test_should_fire_autoplay_returns_true_when_original_complete(self):
         self.play_queue.start_session(75)
-        self.play_queue.mark_original_complete()
+        self.play_queue.mark_original_complete(self.play_queue.session_id())
         self.assertTrue(self.play_queue.should_fire_autoplay())
 
     def test_should_fire_autoplay_claims_slot_atomically_on_first_true(self):
@@ -114,7 +195,7 @@ class PlayQueueTests(unittest.TestCase):
         don't double-fire. Kodi dispatches serially, but the protocol
         defends against re-entry."""
         self.play_queue.start_session(75)
-        self.play_queue.mark_original_complete()
+        self.play_queue.mark_original_complete(self.play_queue.session_id())
         self.assertTrue(self.play_queue.should_fire_autoplay())
         # Second call must see the claimed slot.
         self.assertEqual("true", self.window.getProperty("Spotify.PlayQueue.AutoplayFetched"))
@@ -122,7 +203,7 @@ class PlayQueueTests(unittest.TestCase):
 
     def test_should_fire_autoplay_fires_only_once_per_session(self):
         self.play_queue.start_session(75)
-        self.play_queue.mark_original_complete()
+        self.play_queue.mark_original_complete(self.play_queue.session_id())
         results = [self.play_queue.should_fire_autoplay() for _ in range(5)]
         self.assertEqual([True, False, False, False, False], results)
 
@@ -141,8 +222,8 @@ class PlayQueueTests(unittest.TestCase):
 
     def test_clear_wipes_all_play_queue_props(self):
         self.play_queue.start_session(75)
-        self.play_queue.report_loaded(50)
-        self.play_queue.mark_original_complete()
+        self.play_queue.report_loaded(50, self.play_queue.session_id())
+        self.play_queue.mark_original_complete(self.play_queue.session_id())
         self.play_queue.clear()
         for key in (
             "Spotify.PlayQueue.SessionId",
@@ -157,6 +238,28 @@ class PlayQueueTests(unittest.TestCase):
         self.play_queue.clear()  # must not raise
         self.play_queue.clear()
 
+    def test_owner_clear_rejects_stale_and_empty_owners_atomically(self):
+        old = self.play_queue.start_session(75)
+        new = self.play_queue.start_session(100)
+        for owner in (old, ""):
+            with self.subTest(owner=owner):
+                self.play_queue.clear(owner)
+                self.assertEqual(new, self.play_queue.session_id())
+                self.assertFalse(self.play_queue.should_fire_autoplay())
+        self.play_queue.clear(new)
+        self.assertEqual("", self.play_queue.session_id())
+        self.window.setProperty(self.play_queue.PROP_ORIGINAL_COMPLETE, "false")
+        self.play_queue.clear("")
+        self.assertEqual("", self.window.getProperty(self.play_queue.PROP_ORIGINAL_COMPLETE))
+
+    def test_owner_clear_propagates_storage_failure_without_mutation(self):
+        owner = self.play_queue.start_session(100)
+        with patch.object(self.play_queue.sqlite3, "connect", side_effect=OSError("storage unavailable")):
+            with self.assertRaises(OSError):
+                self.play_queue.clear(owner)
+        self.assertEqual(owner, self.play_queue.session_id())
+        self.assertFalse(self.play_queue.should_fire_autoplay())
+
     # --- session lifecycle: stop mid-load then start new session --------------
 
     def test_new_session_overwrites_stale_state_from_prior_session(self):
@@ -164,7 +267,7 @@ class PlayQueueTests(unittest.TestCase):
         start_session must clear the stale 'loading' state — otherwise the
         new session would inherit the dead session's flags."""
         self.play_queue.start_session(75)
-        self.play_queue.report_loaded(50)
+        self.play_queue.report_loaded(50, self.play_queue.session_id())
         # Session dies without mark_original_complete.
         # User stops playback (service calls clear) and starts a new one:
         self.play_queue.clear()

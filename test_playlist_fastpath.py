@@ -1,10 +1,12 @@
 import os
 import sys
 import types
+import tempfile
 import unittest
 
 REPO_ROOT = os.path.dirname(__file__)
 LIB_DIR = os.path.join(REPO_ROOT, "resources", "lib")
+_TEST_PROFILE = tempfile.TemporaryDirectory(prefix="spotify-fastpath-")
 
 
 class FakeAddon:
@@ -264,7 +266,9 @@ def install_kodi_stubs():
     sys.modules["xbmcplugin"] = xbmcplugin
 
     xbmcvfs = types.ModuleType("xbmcvfs")
-    xbmcvfs.translatePath = lambda path: path
+    xbmcvfs.translatePath = lambda path: (
+        _TEST_PROFILE.name if path.startswith("special://profile/") else path
+    )
     sys.modules["xbmcvfs"] = xbmcvfs
 
     simplecache = types.ModuleType("simplecache")
@@ -295,6 +299,8 @@ def import_plugin_content():
         sys.path.insert(0, LIB_DIR)
     sys.argv = ["plugin://plugin.audio.spotifykodiconnect", "1", "?"]
     sys.modules.pop("plugin_content", None)
+    sys.modules.pop("play_queue", None)
+    sys.modules.pop("utils", None)
     # Other test modules install partial string_ids stubs; use the real one.
     if not hasattr(sys.modules.get("string_ids"), "SPOTIFY_CONNECTING_STR_ID"):
         sys.modules.pop("string_ids", None)
@@ -829,6 +835,219 @@ class PlaylistFastPathTests(unittest.TestCase):
             win.getProperty("Spotify.PlayQueue.OriginalComplete"),
             "finally block must mark complete even when paging exits early",
         )
+
+    def _shared_queue(self):
+        queue = RecordingPlaylist(0)
+        self.plugin_content.xbmc.PlayList = lambda playlist_id: queue
+        return queue
+
+    def test_stale_loader_cannot_change_replacement_queue(self):
+        import play_queue
+
+        queue = self._shared_queue()
+        self.build_content(FakeSpotify(RecordingPlayer.events, total=75)).play_playlist()
+        loader = DeferredThread.started_targets[0]
+        play_queue.clear()
+        self.build_content(FakeSpotify(RecordingPlayer.events, total=100)).play_playlist()
+        expected = list(queue.items)
+        token = play_queue.session_id()
+        loader()
+        self.assertEqual(expected, queue.items)
+        self.assertEqual(token, play_queue.session_id())
+        self.assertEqual("50", self._play_queue_window().getProperty(play_queue.PROP_ORIGINAL_LOADED))
+        self.assertFalse(play_queue.is_original_complete())
+        self.assertFalse(play_queue.should_fire_autoplay())
+
+    def test_stale_loader_abort_cannot_complete_replacement(self):
+        import play_queue
+
+        self._shared_queue()
+        self.build_content(FakeSpotify(RecordingPlayer.events, total=75)).play_playlist()
+        loader = DeferredThread.started_targets[0]
+        self.build_content(FakeSpotify(RecordingPlayer.events, total=100)).play_playlist()
+        self.plugin_content.xbmc.Monitor = lambda: types.SimpleNamespace(abortRequested=lambda: True)
+        loader()
+        self.assertFalse(play_queue.is_original_complete())
+
+    def test_loader_replacement_during_external_work_is_fenced(self):
+        import play_queue
+
+        for boundary in ("fetch", "prepare", "track"):
+            for fails in (False, True):
+                with self.subTest(boundary=boundary, fails=fails):
+                    RecordingPlayer.events.clear()
+                    DeferredThread.started_targets.clear()
+                    queue = self._shared_queue()
+                    content = self.build_content(FakeSpotify(RecordingPlayer.events, total=75))
+                    content.play_playlist()
+                    loader = DeferredThread.started_targets[0]
+                    token = []
+                    def replace():
+                        token.append(play_queue.start_session(100))
+                        queue.clear()
+                        queue.add("replacement", None)
+                        if fails:
+                            raise RuntimeError("external work failed")
+                    if boundary == "fetch":
+                        original = content._PluginContent__get_playlist_items_page
+                        def fetch(*args, **kwargs):
+                            replace()
+                            return original(*args, **kwargs)
+                        content._PluginContent__get_playlist_items_page = fetch
+                    elif boundary == "prepare":
+                        original = content._PluginContent__prepare_playlist_items_page
+                        def prepare(*args, **kwargs):
+                            replace()
+                            return original(*args, **kwargs)
+                        content._PluginContent__prepare_playlist_items_page = prepare
+                    else:
+                        original = content._PluginContent__get_track_item
+                        def track(*args, **kwargs):
+                            if not token:
+                                replace()
+                            return original(*args, **kwargs)
+                        content._PluginContent__get_track_item = track
+                    try:
+                        loader()
+                    except RuntimeError:
+                        if not fails:
+                            raise
+                    self.assertEqual([("replacement", None)], queue.items)
+                    self.assertEqual(token[0], play_queue.session_id())
+                    self.assertEqual("0", self._play_queue_window().getProperty(play_queue.PROP_ORIGINAL_LOADED))
+                    self.assertFalse(play_queue.is_original_complete())
+
+    def test_first_playable_page_starts_before_next_fetch_with_raw_offsets(self):
+        events = RecordingPlayer.events
+        spotify = FakeSpotify(events, total=130)
+        original = spotify.playlist_items
+        def page(playlist_id, **kwargs):
+            result = original(playlist_id, **kwargs)
+            offset = kwargs.get("offset", 0)
+            for row in result["items"][:50 if offset == 0 else 30]:
+                row["track"]["id"] = None
+            return result
+        spotify.playlist_items = page
+        self.build_content(spotify).play_playlist()
+        self.assertEqual(["fetch:0", "fetch:50", "play"], events)
+        self.assertEqual(20, len(RecordingPlaylist.instances[0].items))
+        self.assertEqual(1, len(DeferredThread.started_targets))
+        DeferredThread.started_targets[0]()
+        self.assertEqual(["fetch:0", "fetch:50", "play", "fetch:100"], events)
+        self.assertEqual("20", self._play_queue_window().getProperty("Spotify.PlayQueue.OriginalLoaded"))
+        self.assertEqual("true", self._play_queue_window().getProperty("Spotify.PlayQueue.OriginalComplete"))
+
+    def test_unusable_kodi_entries_do_not_hide_later_playable_page(self):
+        events = RecordingPlayer.events
+        content = self.build_content(FakeSpotify(events, total=75))
+        original = content._PluginContent__get_track_item
+        content._PluginContent__get_track_item = lambda track, *args: (
+            None if int(track["id"].split("-")[-1]) < 50 else original(track, *args)
+        )
+        content.play_playlist()
+        self.assertEqual(["fetch:0", "fetch:50", "play"], events)
+        self.assertEqual(25, len(RecordingPlaylist.instances[0].items))
+        self.assertEqual([], DeferredThread.started_targets)
+
+    def test_all_local_and_empty_playlists_terminate_without_play(self):
+        for total in (0, 75):
+            with self.subTest(total=total):
+                RecordingPlayer.events.clear()
+                RecordingPlaylist.instances.clear()
+                spotify = FakeSpotify(RecordingPlayer.events, total=total)
+                original = spotify.playlist_items
+                def page(playlist_id, **kwargs):
+                    result = original(playlist_id, **kwargs)
+                    for row in result["items"]:
+                        row["track"]["id"] = None
+                    return result
+                spotify.playlist_items = page
+                self.build_content(spotify).play_playlist()
+                self.assertEqual(["fetch:0"] if total == 0 else ["fetch:0", "fetch:50"], RecordingPlayer.events)
+                self.assertEqual([], RecordingPlaylist.instances)
+                self.assertEqual([], DeferredThread.started_targets)
+                self.assertEqual("true", self._play_queue_window().getProperty("Spotify.PlayQueue.OriginalComplete"))
+
+    def test_active_abort_leaves_original_incomplete(self):
+        import play_queue
+
+        self.build_content(FakeSpotify(RecordingPlayer.events, total=75)).play_playlist()
+        self.plugin_content.xbmc.Monitor = lambda: types.SimpleNamespace(abortRequested=lambda: True)
+        DeferredThread.started_targets[0]()
+        self.assertFalse(play_queue.is_original_complete())
+
+    def test_initial_fetch_replacement_failure_cannot_complete_new_session(self):
+        import play_queue
+
+        content = self.build_content(FakeSpotify(RecordingPlayer.events, total=75))
+        def fetch(*args, **kwargs):
+            play_queue.start_session(100)
+            raise RuntimeError("network")
+        content._PluginContent__get_playlist_items_page = fetch
+        with self.assertRaises(RuntimeError):
+            content.play_playlist()
+        self.assertFalse(play_queue.is_original_complete())
+
+    def test_initial_external_work_replacement_cannot_clear_or_play_new_queue(self):
+        import play_queue
+
+        for boundary in ("fetch", "prepare", "track"):
+            with self.subTest(boundary=boundary):
+                RecordingPlayer.events.clear()
+                DeferredThread.started_targets.clear()
+                queue = self._shared_queue()
+                content = self.build_content(FakeSpotify(RecordingPlayer.events, total=75))
+                token = []
+                def replace():
+                    if not token:
+                        token.append(play_queue.start_session(100))
+                        queue.add("replacement", None)
+                name = {
+                    "fetch": "_PluginContent__get_playlist_items_page",
+                    "prepare": "_PluginContent__prepare_playlist_items_page",
+                    "track": "_PluginContent__get_track_item",
+                }[boundary]
+                original = getattr(content, name)
+                def external(*args, **kwargs):
+                    replace()
+                    return original(*args, **kwargs)
+                setattr(content, name, external)
+                content.play_playlist()
+                self.assertEqual([("replacement", None)], queue.items)
+                self.assertNotIn("play", RecordingPlayer.events)
+                self.assertEqual(token[0], play_queue.session_id())
+                self.assertEqual("0", self._play_queue_window().getProperty(play_queue.PROP_ORIGINAL_LOADED))
+                self.assertFalse(play_queue.is_original_complete())
+
+    def test_abort_during_track_preparation_prevents_append_and_complete(self):
+        import play_queue
+
+        queue = self._shared_queue()
+        content = self.build_content(FakeSpotify(RecordingPlayer.events, total=75))
+        content.play_playlist()
+        aborted = [False]
+        self.plugin_content.xbmc.Monitor = lambda: types.SimpleNamespace(abortRequested=lambda: aborted[0])
+        original = content._PluginContent__get_track_item
+        def track(*args, **kwargs):
+            aborted[0] = True
+            return original(*args, **kwargs)
+        content._PluginContent__get_track_item = track
+        DeferredThread.started_targets[0]()
+        self.assertEqual(50, len(queue.items))
+        self.assertFalse(play_queue.is_original_complete())
+
+    def test_active_page_failure_completes_only_current_session(self):
+        import play_queue
+
+        content = self.build_content(FakeSpotify(RecordingPlayer.events, total=75))
+        content.play_playlist()
+        def fetch(*args, **kwargs):
+            raise RuntimeError("network")
+        content._PluginContent__get_playlist_items_page = fetch
+        with self.assertRaises(RuntimeError):
+            DeferredThread.started_targets[0]()
+        self.assertTrue(play_queue.is_original_complete())
+        self.assertEqual("50", self._play_queue_window().getProperty(play_queue.PROP_ORIGINAL_LOADED))
 
     def test_browse_playlist_uses_first_page_and_hidden_continuation(self):
         events = RecordingPlayer.events

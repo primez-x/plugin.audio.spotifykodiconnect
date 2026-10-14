@@ -27,6 +27,8 @@ from string_ids import *
 from play_queue import (
     mark_original_complete as play_queue_mark_original_complete,
     report_loaded as play_queue_report_loaded,
+    session_guard as play_queue_session_guard,
+    session_id as play_queue_session_id,
     start_session as play_queue_start_session,
 )
 from utils import (
@@ -2298,74 +2300,79 @@ class PluginContent:
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
     def play_playlist(self) -> None:
-        """Play entire playlist: start first page immediately, queue rest in background.
-
-        Opens a play-queue session (see ``play_queue``) so the service knows
-        when the original playlist is fully loaded and only then considers
-        firing autoplay. Without this coordination the service used to see
-        a transient "no next item" gap during background paging and fire
-        autoplay destructively mid-load.
-        """
+        """Start the first playable page and append later pages for the same owner."""
         playlist_details = self.__get_playlist_summary(self.__playlist_id)
         total = int(playlist_details.get("tracks", {}).get("total") or 0)
-        # Start session BEFORE we touch Kodi's playlist so the service sees
-        # original_complete=false the moment it receives the first
-        # onPlayBackStarted callback. If the playlist fits in one page we
-        # mark complete at session start (handled inside start_session when
-        # total <= 0, otherwise mark_original_complete below after paging).
-        play_queue_start_session(total)
+        owner = play_queue_start_session(total)
         page_limit = 50
+        monitor = xbmc.Monitor()
+        offset = 0
+        first_items = []
         try:
-            raw_items = self.__get_playlist_items_page(
-                playlist_details["id"], offset=0, limit=page_limit
-            )
-            items = self.__prepare_playlist_items_page(
-                playlist_details,
-                raw_items,
-                include_context_items=False,
-                include_artist_fanart=False,
-            )
+            # Raw offsets advance even when a page contains no playable tracks.
+            while offset == 0 or offset < total:
+                if monitor.abortRequested() or play_queue_session_id() != owner:
+                    return
+                raw_items = self.__get_playlist_items_page(
+                    playlist_details["id"], offset=offset, limit=page_limit
+                )
+                if not raw_items:
+                    break
+                offset += len(raw_items)
+                tracks = self.__prepare_playlist_items_page(
+                    playlist_details,
+                    raw_items,
+                    include_context_items=False,
+                    include_artist_fanart=False,
+                )
+                for track in tracks:
+                    if monitor.abortRequested() or play_queue_session_id() != owner:
+                        return
+                    item = self.__get_track_item(track, True)
+                    if item is not None:
+                        first_items.append(item)
+                if first_items:
+                    break
+            if monitor.abortRequested():
+                return
+            with play_queue_session_guard(owner) as win:
+                if win is None:
+                    return
+                if first_items:
+                    kodi_playlist = xbmc.PlayList(0)
+                    kodi_playlist.clear()
+                    for url, listitem in first_items:
+                        kodi_playlist.add(url, listitem)
+            if not first_items:
+                log_msg(f"Playlist '{playlist_details.get('name', '')}' has no playable tracks.")
+                play_queue_mark_original_complete(owner)
+                self.__end_directory(succeeded=False)
+                return
+            loaded_count = len(first_items)
+            play_queue_report_loaded(loaded_count, owner)
+            with play_queue_session_guard(owner) as win:
+                if win is None or monitor.abortRequested():
+                    return
+                log_msg(f"Start playing playlist '{playlist_details['name']}'.")
+                xbmc.Player().play(kodi_playlist)
+            if total <= offset:
+                play_queue_mark_original_complete(owner)
+                return
         except Exception:
-            # Never leave the service believing the original is still loading.
-            play_queue_mark_original_complete()
+            if not monitor.abortRequested():
+                play_queue_mark_original_complete(owner)
             raise
-        if not items:
-            log_msg(f"Playlist '{playlist_details.get('name', '')}' has no playable tracks.")
-            play_queue_mark_original_complete()
-            self.__end_directory(succeeded=False)
-            return
-        log_msg(f"Start playing playlist '{playlist_details['name']}'.")
-
-        kodi_playlist = xbmc.PlayList(0)
-        kodi_playlist.clear()
-
-        loaded_count = 0
-        for track in items:
-            item = self.__get_track_item(track, True)
-            if item is not None:
-                url, li = item
-                kodi_playlist.add(url, li)
-                loaded_count += 1
-        play_queue_report_loaded(loaded_count)
-
-        xbmc.Player().play(kodi_playlist)
-
-        next_offset = len(raw_items)
-        # Fit-in-one-page path: nothing more to page, original is complete.
-        if total <= next_offset:
-            play_queue_mark_original_complete()
-            return
 
         def add_remaining():
             monitor = xbmc.Monitor()
-            offset = next_offset
-            nonlocal_loaded = loaded_count
+            next_offset = offset
+            loaded = loaded_count
             try:
-                while total > offset:
-                    if monitor.abortRequested():
+                while total > next_offset:
+                    if monitor.abortRequested() or play_queue_session_id() != owner:
                         return
                     raw_page = self.__get_playlist_items_page(
-                        playlist_details["id"], offset=offset, limit=page_limit
+                        playlist_details["id"], offset=next_offset, limit=page_limit
                     )
                     if not raw_page:
                         return
@@ -2375,28 +2382,26 @@ class PluginContent:
                         include_context_items=False,
                         include_artist_fanart=False,
                     )
-                    page_added = 0
                     for track in tracks:
                         if monitor.abortRequested():
                             return
                         try:
                             item = self.__get_track_item(track, True)
-                            if item is not None:
-                                u, listitem = item
-                                kodi_playlist.add(u, listitem)
-                                page_added += 1
                         except Exception:
-                            pass
+                            continue
+                        with play_queue_session_guard(owner) as win:
+                            if win is None or monitor.abortRequested():
+                                return
+                            if item is not None:
+                                url, listitem = item
+                                kodi_playlist.add(url, listitem)
+                                loaded += 1
                         xbmc.sleep(2)
-                    offset += len(raw_page)
-                    nonlocal_loaded += page_added
-                    play_queue_report_loaded(nonlocal_loaded)
+                    next_offset += len(raw_page)
+                    play_queue_report_loaded(loaded, owner)
             finally:
-                # Always mark complete when the paging loop exits, whether it
-                # finished naturally, hit abort, or got an empty page. Without
-                # this, an early exit leaves the service stuck thinking the
-                # original is still loading and autoplay never fires.
-                play_queue_mark_original_complete()
+                if not monitor.abortRequested():
+                    play_queue_mark_original_complete(owner)
 
         _start_background_thread(add_remaining)
 

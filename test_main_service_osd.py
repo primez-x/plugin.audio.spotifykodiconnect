@@ -6,6 +6,7 @@ import threading
 # global threading module; restore it so later test modules get real threads.
 _REAL_THREAD = threading.Thread
 import types
+import tempfile
 import unittest
 
 REPO_ROOT = os.path.dirname(__file__)
@@ -13,6 +14,7 @@ LIB_DIR = os.path.join(REPO_ROOT, "resources", "lib")
 
 
 FAKE_SETTINGS = {}
+_TEST_PROFILE = tempfile.TemporaryDirectory(prefix="spotify-service-")
 
 
 class FakeAddon:
@@ -163,6 +165,7 @@ def install_stubs(info_labels, settings=None):
     utils = types.ModuleType("utils")
     utils.ADDON_ID = "plugin.audio.spotifykodiconnect"
     utils.ADDON_WINDOW_ID = 10000
+    utils.ADDON_DATA_PATH = _TEST_PROFILE.name
     utils.PROXY_HOST = "127.0.0.1"
     utils.PROXY_PORT = 52309
     utils.get_cached_auth_token = lambda: None
@@ -185,7 +188,7 @@ def import_main_service(info_labels, settings=None):
     install_stubs(info_labels, settings=settings)
     if LIB_DIR not in sys.path:
         sys.path.insert(0, LIB_DIR)
-    for module_name in ("main_service", "playlist_next", "like_actions"):
+    for module_name in ("main_service", "playlist_next", "like_actions", "play_queue"):
         sys.modules.pop(module_name, None)
     import main_service
 
@@ -201,6 +204,7 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
             "main_service",
             "playlist_next",
             "like_actions",
+            "play_queue",
             "xbmc",
             "xbmcaddon",
             "xbmcgui",
@@ -215,6 +219,137 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
             "string_ids",
         ):
             sys.modules.pop(module_name, None)
+
+    def test_replacement_session_survives_old_terminal_callbacks(self):
+        for prior_session in (False, True):
+            for callback in ("onPlayBackStopped", "onPlayBackEnded", "onPlayBackError"):
+                with self.subTest(prior_session=prior_session, callback=callback):
+                    labels = {"MusicPlayer.Property(spotifytrackid)": "track-a"}
+                    main_service = import_main_service(labels)
+                    import play_queue
+
+                    play_queue.clear()
+                    if prior_session:
+                        play_queue.start_session(75)
+                    monitor = main_service._SpotifyOSDPlayerMonitor()
+                    monitor.onPlayBackStarted()
+                    owner_b = play_queue.start_session(100)
+                    play_queue.report_loaded(50, owner_b)
+
+                    getattr(monitor, callback)()
+
+                    self.assertEqual(owner_b, play_queue.session_id())
+                    self.assertFalse(play_queue.should_fire_autoplay())
+                    win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+                    self.assertEqual("50", win.getProperty(play_queue.PROP_ORIGINAL_LOADED))
+                    labels["MusicPlayer.Property(spotifytrackid)"] = "track-b"
+                    monitor.onPlayBackStarted()
+                    monitor.onPlayBackStopped()
+                    self.assertEqual("", play_queue.session_id())
+                    self.assertEqual("", win.getProperty("Spotify.CurrentTrackId"))
+
+    def test_delayed_metadata_checks_cannot_act_on_newer_playback(self):
+        for newer_file in ("http://127.0.0.1:52309/track/track-b/180.wav", "smb://media/movie.mkv"):
+            with self.subTest(newer_file=newer_file):
+                labels = {}
+                main_service = import_main_service(labels)
+                import play_queue
+
+                play_queue.clear()
+                pending = []
+                main_service._start_daemon_thread = lambda target, **kwargs: pending.append(target)
+                started = []
+                external = []
+                monitor = main_service._SpotifyOSDPlayerMonitor(started.append, lambda: external.append(True))
+                play_queue.start_session(75)
+                monitor.onPlayBackStarted()
+                owner_b = play_queue.start_session(100)
+                labels["Player.FileNameAndPath"] = newer_file
+                monitor.onPlayBackStarted()
+
+                pending[0]()
+
+                self.assertEqual([], started)
+                self.assertEqual([], external)
+                self.assertEqual(owner_b, play_queue.session_id())
+                pending[1]()
+                if newer_file.startswith("http"):
+                    self.assertEqual(["track-b"], started)
+                    self.assertEqual(owner_b, play_queue.session_id())
+                else:
+                    self.assertEqual([True], external)
+                    self.assertEqual("", play_queue.session_id())
+
+    def test_metadata_timeout_cannot_clear_replacement_before_new_start(self):
+        main_service = import_main_service({})
+        import play_queue
+
+        play_queue.start_session(75)
+        monitor = main_service._SpotifyOSDPlayerMonitor()
+        replacement = []
+
+        def replace_during_wait(_millis):
+            if not replacement:
+                replacement.append(play_queue.start_session(100))
+
+        main_service.xbmc.sleep = replace_during_wait
+        monitor.onPlayBackStarted()
+
+        self.assertEqual(replacement[0], play_queue.session_id())
+        self.assertFalse(play_queue.should_fire_autoplay())
+
+    def test_stop_cancels_metadata_check_before_current_owner_is_identified(self):
+        main_service = import_main_service({})
+        import play_queue
+
+        owner = play_queue.start_session(100)
+        pending = []
+        main_service._start_daemon_thread = lambda target, **kwargs: pending.append(target)
+        monitor = main_service._SpotifyOSDPlayerMonitor()
+        monitor.onPlayBackStarted()
+        monitor.onPlayBackStopped()
+        self.assertEqual("", play_queue.session_id())
+        replacement = play_queue.start_session(100)
+        pending[0]()
+        self.assertNotEqual(owner, replacement)
+        self.assertEqual(replacement, play_queue.session_id())
+
+    def test_old_metadata_check_cannot_publish_with_same_queue_owner(self):
+        labels = {"MusicPlayer.Property(spotifytrackid)": "track-b"}
+        main_service = import_main_service(labels)
+        import play_queue
+
+        play_queue.start_session(100)
+        pending = []
+        started = []
+        main_service._start_daemon_thread = lambda target, **kwargs: pending.append(target)
+        monitor = main_service._SpotifyOSDPlayerMonitor(started.append)
+        monitor.onPlayBackStarted()
+        monitor.onPlayBackStarted()
+        pending[1]()
+        pending[0]()
+        self.assertEqual(["track-b"], started)
+
+    def test_external_teardown_cleanup_preserves_session_created_during_callback(self):
+        main_service = import_main_service({"Player.FileNameAndPath": "smb://media/movie.mkv"})
+        import play_queue
+
+        play_queue.start_session(75)
+        replacement = []
+        win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
+
+        def replace_during_teardown():
+            replacement.append(play_queue.start_session(100))
+            win.setProperty("Spotify.CurrentTrackId", "track-b")
+
+        monitor = main_service._SpotifyOSDPlayerMonitor(
+            on_external_playback=replace_during_teardown
+        )
+        monitor.onPlayBackStarted()
+
+        self.assertEqual(replacement[0], play_queue.session_id())
+        self.assertFalse(play_queue.should_fire_autoplay())
+        self.assertEqual("track-b", win.getProperty("Spotify.CurrentTrackId"))
 
     def test_playback_started_preserves_published_spotify_track_while_metadata_settles(self):
         main_service = import_main_service({})
@@ -1051,16 +1186,16 @@ class SpotifyAutoplayGatingTests(unittest.TestCase):
         self.assertEqual("img-1", first.art["thumb"])
 
     def test_osd_clear_wipes_play_queue_session_state(self):
-        """When playback stops, _SpotifyOSDPlayerMonitor._clear() must drop
-        the play-queue session so a stale 'loading' state doesn't suppress
-        autoplay for the next play."""
-        main_service = import_main_service({})
+        """A current manual stop clears the queue and allows ordinary autoplay."""
+        main_service = import_main_service({"MusicPlayer.Property(spotifytrackid)": "track-a"})
         win = main_service.xbmcgui.Window(main_service.ADDON_WINDOW_ID)
         win.setProperty("Spotify.PlayQueue.SessionId", "stale-session")
         win.setProperty("Spotify.PlayQueue.OriginalComplete", "false")
         win.setProperty("Spotify.PlayQueue.AutoplayFetched", "true")
 
-        main_service._SpotifyOSDPlayerMonitor()._clear()
+        monitor = main_service._SpotifyOSDPlayerMonitor()
+        monitor.onPlayBackStarted()
+        monitor.onPlayBackStopped()
 
         self.assertEqual("", win.getProperty("Spotify.PlayQueue.SessionId"))
         self.assertEqual("", win.getProperty("Spotify.PlayQueue.OriginalComplete"))

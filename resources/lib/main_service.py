@@ -20,6 +20,7 @@ import xbmcgui
 from http_spotty_audio_streamer import HTTPSpottyAudioStreamer
 from like_actions import LIKED_STATE_LOCK, notify_not_connected, set_current_track_liked
 from play_queue import clear as play_queue_clear
+from play_queue import session_id as play_queue_session_id
 from play_queue import should_fire_autoplay as play_queue_should_fire_autoplay
 from playlist_next import (
     get_current_playback_time_seconds,
@@ -443,9 +444,23 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
         xbmc.Player.__init__(self)
         self._on_spotify_started = on_spotify_started or (lambda _track_id: None)
         self._on_external_playback = on_external_playback or (lambda: None)
+        self._play_queue_owner = ""
+        self._metadata_check = None
 
-    def _clear(self) -> None:
+    def _clear(self, owner=None, check=None) -> None:
         global _liked_state_track_id
+        if check is not None and self._metadata_check is not check:
+            return
+        if owner is None:
+            owner = self._play_queue_owner
+        if check is None:
+            self._metadata_check = None
+        # A replacement session can precede the old player's stop callback.
+        cleared = play_queue_clear(owner)
+        if self._metadata_check is not check or (check is not None and not cleared):
+            return
+        self._metadata_check = None
+        self._play_queue_owner = ""
         _liked_state_track_id = ""
         _clear_artist_fanart_rotation()
         win = xbmcgui.Window(ADDON_WINDOW_ID)
@@ -453,9 +468,6 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
             win.clearProperty("Spotify.CurrentTrackId")
             win.clearProperty("Spotify.CurrentTrackLiked")
         _clear_playback_hooks()
-        # Drop any active play-queue session so a stale "loading" state from
-        # a previous play doesn't suppress autoplay for the next one.
-        play_queue_clear()
 
     def onPlayBackStopped(self) -> None:
         self._clear()
@@ -467,13 +479,21 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
         self._clear()
 
     def onPlayBackStarted(self) -> None:
+        owner = play_queue_session_id()
+        check = object()
+        self._play_queue_owner = owner
+        self._metadata_check = check
         # If a non-Spotify item starts playing, clear the Spotify OSD state.
         # PAPlayer can fire before MusicPlayer properties settle, so wait until
         # Kodi exposes either a Spotify marker or a concrete non-Spotify file.
         def _check():
             win = xbmcgui.Window(ADDON_WINDOW_ID)
             for _attempt in range(SPOTIFY_PLAYER_METADATA_ATTEMPTS):
+                if self._metadata_check is not check or play_queue_session_id() != owner:
+                    return
                 is_spotify, track_id, has_player_file = _read_active_spotify_player_state(win)
+                if self._metadata_check is not check or play_queue_session_id() != owner:
+                    return
                 if is_spotify:
                     if track_id:
                         with LIKED_STATE_LOCK:
@@ -493,7 +513,7 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
                         self._on_external_playback()
                     except Exception as exc:
                         log_exception(exc, "External playback teardown callback failed")
-                    self._clear()
+                    self._clear(owner, check)
                     return
                 xbmc.sleep(SPOTIFY_PLAYER_METADATA_POLL_MS)
 
@@ -503,7 +523,7 @@ class _SpotifyOSDPlayerMonitor(xbmc.Player):
                     LOGDEBUG,
                 )
             else:
-                self._clear()
+                self._clear(owner, check)
 
         _start_daemon_thread(_check, task_name="Spotify playback metadata check")
 
