@@ -86,7 +86,7 @@ def _play_and_load_list(query, listing, track_id, duration_ms, position, playlis
         playlist.clear()
         playlist.add(url, li)
     player = xbmc.Player()
-    player.play(playlist, windowed=True, startpos=0)
+    player.play(playlist, startpos=0)
 
     # Load the other songs after the audio starts, so the load does not delay the song.
     monitor = xbmc.Monitor()
@@ -134,7 +134,6 @@ def run(query):
     if xbmcgui.Window(_HOME_WINDOW_ID).getProperty(PROP_LISTING) == listing:
         index = _queue_index(playlist, track_id, position)
         if index >= 0:
-            # Windowed like Kodi's own list click: the song list stays on screen.
-            xbmc.Player().play(playlist, windowed=True, startpos=index)
+            xbmc.Player().play(playlist, startpos=index)
             return
     _play_and_load_list(query, listing, track_id, duration_ms, position, playlist)

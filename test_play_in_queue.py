@@ -80,7 +80,7 @@ class PlayInQueueTests(unittest.TestCase):
                 kodi.queue.append(FakeItem(url))
 
         class Player:
-            def play(self, item, windowed, startpos):
+            def play(self, item, startpos, windowed=False):
                 kodi.calls.append(("play", {"windowed": windowed, "startpos": startpos}))
 
             def isPlayingAudio(self):
@@ -158,14 +158,14 @@ class PlayInQueueTests(unittest.TestCase):
         kodi = FakeKodi([song("a"), song("b"), song("c")])
         kodi.properties["Spotify.PlayQueue.Listing"] = LIST
         self.click(kodi, 1, "b")
-        self.assertEqual([("play", {"windowed": True, "startpos": 1})], kodi.calls)
+        self.assertEqual([("play", {"windowed": False, "startpos": 1})], kodi.calls)
 
     def test_moved_song_plays_at_the_queue_index(self):
         # Shuffle and queue edits move a song away from the listing position.
         kodi = FakeKodi([song("c"), song("a"), song("b")])
         kodi.properties["Spotify.PlayQueue.Listing"] = LIST
         self.click(kodi, 1, "b")
-        self.assertEqual([("play", {"windowed": True, "startpos": 2})], kodi.calls)
+        self.assertEqual([("play", {"windowed": False, "startpos": 2})], kodi.calls)
 
     def test_click_in_another_list_plays_first_then_loads_the_list_around_the_song(self):
         listing = [song(t) for t in "abcde"]
@@ -177,7 +177,7 @@ class PlayInQueueTests(unittest.TestCase):
             [call[0] for call in kodi.calls],
         )
         self.assertEqual("Song C", kodi.calls[1][1], "the clicked song keeps the row tags")
-        self.assertEqual({"windowed": True, "startpos": 0}, kodi.calls[2][1])
+        self.assertEqual({"windowed": False, "startpos": 0}, kodi.calls[2][1])
         self.assertEqual(listing, [item.getPath() for item in kodi.queue])
         self.assertEqual(LIST, kodi.properties["Spotify.PlayQueue.Listing"])
 
@@ -198,8 +198,8 @@ class PlayInQueueTests(unittest.TestCase):
         module = self.install(kodi)
         player_play = module.xbmc.Player.play
 
-        def play_then_supersede(player, item, windowed, startpos):
-            player_play(player, item, windowed, startpos)
+        def play_then_supersede(player, item, startpos, windowed=False):
+            player_play(player, item, startpos, windowed)
             kodi.properties["Spotify.PlayQueue.SessionId"] = "newer"
 
         module.xbmc.Player.play = play_then_supersede
