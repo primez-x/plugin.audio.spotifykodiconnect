@@ -396,12 +396,16 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             (48, 0, 4, False),
             (48, 0, 7, False),
             (48, 0, 8, True),
+            (46, 46, 5, False),
+            (46, 46, 6, True),
             (176040, 176040, 4, True),
             (44, 48, 4, False),
             (0, 48, 4, False),
             (176443, 0, 176399, False),
             (176443, 0, 176400, True),
         )
+        self.addCleanup(setattr, self.module, "STARTUP_REAL_PCM_WAIT_SECONDS",
+                        self.module.STARTUP_REAL_PCM_WAIT_SECONDS)
         self.module.STARTUP_REAL_PCM_WAIT_SECONDS = 0.002
         for finished in (False, True):
             for begin, start, real_count, expected in cases:
@@ -474,6 +478,91 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         self.assertTrue(streamer.prepare_part_audio_stream(0))
         payload = b"".join(streamer.send_part_audio_stream(spec.track_length, 0))
         self.assertEqual(spec.wav_header + b"\x01\x02\x03\x04" + bytes(176396), payload)
+
+    def test_clean_finished_padding_requires_aligned_frame_and_available_bytes(self):
+        for start, real_count, available, expected in (
+            (0, 0, True, False), (0, 1, True, False),
+            (0, 2, True, False), (0, 3, True, False),
+            (0, 4, True, True), (46, 5, True, False),
+            (46, 6, True, True), (46, 6, False, False),
+        ):
+            with self.subTest(start=start, real_count=real_count, available=available):
+                streamer = self.module.SpottyAudioStreamer(object())
+                streamer.set_track("padded-track", 1)
+                spec = streamer.get_stream_spec()
+                prefix = spec.wav_header[start:] if start < 44 else b""
+                downloader = FakeDownloader(prefix, bytes(real_count), auto_fill=False)
+                downloader.start_byte = start
+                downloader.real_pcm_bytes = real_count
+                downloader.is_finished = True
+                if available:
+                    downloader._buffer.extend(bytes(spec.track_length - start - downloader.written_bytes))
+                    downloader.written_bytes = len(downloader._buffer)
+                FakeSpottyCacheManager.downloader = downloader
+                self.assertEqual(expected, streamer.prepare_part_audio_stream(100))
+                if real_count >= (6 if start == 46 else 4):
+                    self.assertFalse(downloader.aborted)
+
+    def test_finished_padding_cannot_validate_failed_stale_or_invalid_range(self):
+        for state in ("aborted", "error", "stale", "past-end", "starts-after-request"):
+            with self.subTest(state=state):
+                streamer = self.module.SpottyAudioStreamer(object())
+                streamer.set_track("padded-track", 1)
+                spec = streamer.get_stream_spec()
+                downloader = FakeDownloader(spec.wav_header, bytes(spec.track_length - 44), auto_fill=False)
+                downloader.real_pcm_bytes = 4
+                downloader.is_finished = True
+                begin = 100
+                if state == "stale":
+                    streamer.terminate_stream()
+                elif state == "past-end":
+                    begin = spec.track_length
+                elif state == "starts-after-request":
+                    downloader.start_byte = 104
+                else:
+                    setattr(downloader, state, True)
+                self.assertFalse(streamer._prime_startup_real_pcm(
+                    downloader, begin, spec.wav_header, spec.track_length, 0, spec.track_id))
+
+    def test_superseded_startup_preserves_downloader_reused_by_live_generation(self):
+        for body in (False, True):
+            with self.subTest(body=body):
+                streamer = self.module.SpottyAudioStreamer(object())
+                streamer.set_track("replay-track", 1)
+                spec = streamer.get_stream_spec()
+                downloader = FakeDownloader(spec.wav_header, b"abcd", auto_fill=False)
+                downloader.real_pcm_bytes = 4
+                FakeSpottyCacheManager.downloader = downloader
+                waiting, resume = threading.Event(), threading.Event()
+                results = []
+
+                def wait_for_real_pcm(*args, **kwargs):
+                    waiting.set()
+                    resume.wait(2)
+
+                downloader.wait_for_real_pcm = wait_for_real_pcm
+
+                def old_request():
+                    if body:
+                        results.append(b"".join(streamer.send_part_audio_stream(4, 48)))
+                    else:
+                        results.append(streamer.prepare_part_audio_stream(48))
+
+                worker = threading.Thread(target=old_request)
+                worker.start()
+                try:
+                    self.assertTrue(waiting.wait(1))
+                    streamer.terminate_stream()
+                    self.assertTrue(streamer.prepare_part_audio_stream(44))
+                    resume.set()
+                    worker.join(2)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual([b"" if body else False], results)
+                    self.assertFalse(downloader.aborted)
+                    self.assertEqual(b"abcd", b"".join(streamer.send_part_audio_stream(4, 44)))
+                finally:
+                    resume.set()
+                    worker.join(2)
 
     def test_delayed_generator_keeps_original_track_spec_during_natural_handoff(self):
         streamer = self.module.SpottyAudioStreamer(object())

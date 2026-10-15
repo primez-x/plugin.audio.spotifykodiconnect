@@ -192,8 +192,8 @@ class SpottyAudioStreamer:
             or self._is_terminated(stream_generation)
         ):
             return False
-        # Require the complete requested frame, plus a complete frame after any
-        # partial frame discarded by an unaligned downloader start.
+        # Serve an unaligned partial tail only after a following complete frame.
+        # The requested frame must also exist, or have valid clean-finish padding.
         requested_frame = (requested_real_start - pcm_start) // _PCM_FRAME_BYTES
         first_full_frame = (
             downloader_real_start - pcm_start + _PCM_FRAME_BYTES - 1
@@ -205,6 +205,9 @@ class SpottyAudioStreamer:
             return False
         # real_pcm_bytes starts at downloader_real_start, excluding header/gap bytes.
         target_real_pcm_bytes = requested_real_end - downloader_real_start
+        minimum_real_pcm_bytes = (
+            pcm_start + (first_full_frame + 1) * _PCM_FRAME_BYTES - downloader_real_start
+        )
 
         header_bytes_in_buffer = max(0, pcm_start - downloader.start_byte)
         target_bytes_in_buf = header_bytes_in_buffer + target_real_pcm_bytes
@@ -216,13 +219,23 @@ class SpottyAudioStreamer:
             # Compatibility for tests/older downloader doubles.
             return max(0, int(downloader.written_bytes) - header_bytes_in_buffer)
 
-        with downloader.cond:
-            if (
-                _real_pcm_bytes() >= target_real_pcm_bytes
+        def _ready_locked() -> bool:
+            real_pcm = _real_pcm_bytes()
+            has_requested_pcm = real_pcm >= target_real_pcm_bytes
+            has_clean_padding = (
+                downloader.is_finished
+                and real_pcm >= minimum_real_pcm_bytes
+                and downloader.written_bytes >= target_bytes_in_buf
+            )
+            return (
+                (has_requested_pcm or has_clean_padding)
                 and not downloader.error
                 and not downloader.aborted
                 and not self._is_terminated(stream_generation)
-            ):
+            )
+
+        with downloader.cond:
+            if _ready_locked():
                 return True
             written = downloader.written_bytes
 
@@ -235,7 +248,7 @@ class SpottyAudioStreamer:
         deadline = time.monotonic() + STARTUP_REAL_PCM_WAIT_SECONDS
         while not self._is_terminated(stream_generation):
             with downloader.cond:
-                ready = _real_pcm_bytes() >= target_real_pcm_bytes
+                ready = _ready_locked()
                 terminal = downloader.is_finished or downloader.error or downloader.aborted
                 if ready or terminal:
                     break
@@ -255,12 +268,7 @@ class SpottyAudioStreamer:
             finished = downloader.is_finished
             error = downloader.error
             aborted = downloader.aborted
-        ready = (
-            real_pcm_bytes >= target_real_pcm_bytes
-            and not error
-            and not aborted
-            and not self._is_terminated(stream_generation)
-        )
+            ready = _ready_locked()
         self._log_transfer(
             "startup-prime-ready",
             stream_track_id=track_id,
@@ -350,7 +358,27 @@ class SpottyAudioStreamer:
 
         return failed and no_real_pcm
 
-    def _cleanup_failed_startup_downloader(self, downloader) -> None:
+    def _cleanup_failed_startup_downloader(
+        self, downloader, stream_generation: int, wav_header: bytes
+    ) -> None:
+        # A superseded reader may share the downloader with the current generation.
+        if self._is_terminated(stream_generation):
+            return
+        pcm_start = len(wav_header)
+        real_start = max(pcm_start, int(downloader.start_byte))
+        minimum_real_pcm = (pcm_start - real_start) % _PCM_FRAME_BYTES + _PCM_FRAME_BYTES
+        with downloader.cond:
+            real_pcm = getattr(downloader, "real_pcm_bytes", None)
+            if real_pcm is None:
+                real_pcm = downloader.written_bytes - max(0, pcm_start - downloader.start_byte)
+            # Preserve healthy finished audio when only the requested position is unavailable.
+            if (
+                downloader.is_finished
+                and not downloader.error
+                and not downloader.aborted
+                and real_pcm >= minimum_real_pcm
+            ):
+                return
         try:
             downloader.cleanup()
         except Exception as ex:
@@ -395,7 +423,7 @@ class SpottyAudioStreamer:
                 f"superseded={self._is_terminated(stream_generation)}).",
                 LOGWARNING,
             )
-            self._cleanup_failed_startup_downloader(downloader)
+            self._cleanup_failed_startup_downloader(downloader, stream_generation, wav_header)
             return False
         return True
 
@@ -499,7 +527,7 @@ class SpottyAudioStreamer:
                     stream_track_id=track_id,
                     msg="Background downloader did not reach real PCM startup target",
                 )
-                self._cleanup_failed_startup_downloader(downloader)
+                self._cleanup_failed_startup_downloader(downloader, stream_generation, wav_header)
                 return
 
             while bytes_sent < range_len and not self._is_terminated(stream_generation):

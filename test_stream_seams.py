@@ -183,6 +183,63 @@ if sys.stdin.buffer.read(1):
             self.status.close()
 
 
+class _RetryPipeSpotty(RampSpotty):
+    """Real helper pipes with optional first-attempt exit control."""
+
+    def __init__(self, cuts, gate_first=False):
+        super().__init__(cuts)
+        self.gate_first = gate_first
+        self.processes = []
+        self.process = None
+        self.status_thread = None
+
+    def run_spotty(self, args):
+        self.calls.append(list(args))
+        start = 0
+        if "--start-position" in args:
+            start = _seek_frame(int(args[args.index("--start-position") + 1])) * 4
+        cut = self.cuts.pop(0) if self.cuts else None
+        producer = """
+import array, sys
+start, cut, gate = map(int, sys.argv[1:])
+pcm = array.array('I', range(30 * 44100)).tobytes()[start:]
+sys.stdout.buffer.write(pcm if cut < 0 else pcm[:cut])
+sys.stdout.buffer.flush()
+if gate:
+    sys.stdin.buffer.read(1)
+sys.exit(0 if cut < 0 else 1)
+"""
+        self.process = subprocess.Popen(
+            [sys.executable, "-c", producer, str(start), str(-1 if cut is None else cut),
+             str(int(self.gate_first and len(self.calls) == 1))],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            bufsize=1048576,
+        )
+        self.processes.append(self.process)
+        return self.process
+
+    def release(self, bulk=False):
+        for process in self.processes:
+            if process.poll() is None:
+                try:
+                    process.stdin.write(b"x")
+                    process.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+
+    def close(self):
+        for process in self.processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=2)
+            try:
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+            process.stdout.close()
+            print(f"retry-pipe reaped pid={process.pid} rc={process.returncode}")
+
+
 class _Request:
     method = "GET"
     headers = {}
@@ -333,7 +390,7 @@ class StreamSeamTests(unittest.TestCase):
         return self.cache.SpottyCacheManager.find_active_downloader(TRACK)
 
     @contextmanager
-    def _pipe_http(self, prefix_bytes=4):
+    def _pipe_http(self, prefix_bytes=4, spotty=None):
         from socketserver import ThreadingMixIn
         from wsgiref.simple_server import WSGIServer, WSGIRequestHandler, make_server
 
@@ -350,7 +407,7 @@ class StreamSeamTests(unittest.TestCase):
         import bottle
 
         self.http.bottle = bottle
-        spotty = _PipeSpotty(prefix_bytes)
+        spotty = spotty or _PipeSpotty(prefix_bytes)
         streamer = self._server(spotty)
         app = bottle.Bottle()
         app.route("/track/<track_id>/<duration>", callback=streamer.spotty_stream_audio_track)
@@ -509,6 +566,163 @@ class StreamSeamTests(unittest.TestCase):
                 spotty.close()
                 requester.join(4)
                 self.assertFalse(requester.is_alive())
+
+    @unittest.skipUnless(os.name == "posix", "producer status requires inherited descriptor")
+    def test_real_pipe_stop_then_reuse_survives_old_seek_cleanup(self):
+        import http.client
+
+        with self._pipe_http() as (server, spotty, port):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            waiting, resume = threading.Event(), threading.Event()
+            results = []
+            worker = None
+            try:
+                connection.request("GET", f"/track/{TRACK}/30.wav", headers={"Range": "bytes=0-47"})
+                with connection.getresponse() as response:
+                    self.assertEqual(self.ideal[:48], response.read())
+                downloader = self._downloader()
+                low = server._HTTPSpottyAudioStreamer__spotty_streamer
+                original_wait = downloader.wait_for_real_pcm
+
+                def wait_for_real_pcm(*args, **kwargs):
+                    waiting.set()
+                    resume.wait(2)
+
+                downloader.wait_for_real_pcm = wait_for_real_pcm
+                worker = threading.Thread(target=lambda: results.append(low.prepare_part_audio_stream(48)))
+                worker.start()
+                self.assertTrue(waiting.wait(1))
+                server.stop()
+                connection.request("GET", f"/track/{TRACK}/30.wav", headers={"Range": "bytes=44-47"})
+                with connection.getresponse() as response:
+                    self.assertEqual(self.ideal[44:48], response.read())
+                self.assertIs(downloader, self._downloader())
+                resume.set()
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual([False], results)
+                self.assertFalse(downloader.aborted)
+                downloader.wait_for_real_pcm = original_wait
+                spotty.release(bulk=True)
+                connection.request("GET", f"/track/{TRACK}/30.wav", headers={"Range": "bytes=48-"})
+                with connection.getresponse() as response:
+                    self.assertEqual(self.ideal[48:], response.read())
+                self.assertIs(downloader, self._downloader())
+                print("stop-reuse old_prepare=False cache_preserved=True remainder_exact=True")
+            finally:
+                resume.set()
+                if worker is not None:
+                    worker.join(2)
+                connection.close()
+
+    def test_real_pipe_post_commit_failure_truncates_once_then_replay_recovers(self):
+        import http.client
+
+        spotty = _RetryPipeSpotty([4, 0, 0, 0, None], gate_first=True)
+        notices, finished = [], []
+        with self._pipe_http(spotty=spotty) as (server, _, port):
+            sys.modules["xbmcgui"].Dialog = lambda: types.SimpleNamespace(
+                notification=lambda *args, **kwargs: notices.append(args))
+            sys.modules["xbmcaddon"].Addon = lambda **kwargs: types.SimpleNamespace(
+                getSetting=lambda key: "", getAddonInfo=lambda key: key,
+                getLocalizedString=lambda key: str(key))
+            server.set_notify_track_finished(finished.append)
+            low = server._HTTPSpottyAudioStreamer__spotty_streamer
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            try:
+                connection.request("GET", f"/track/{TRACK}/30.wav")
+                response = connection.getresponse()
+                self.assertEqual(200, response.status)
+                self.assertEqual(self.track_length, int(response.getheader("Content-Length")))
+                self.assertEqual(self.ideal[:48], response.read(48))
+                failed = self._downloader()
+                old_generation = low._SpottyAudioStreamer__terminate_generation
+                stale_body = low.send_part_audio_stream(4, 48)
+                spotty.release()
+                with self.assertRaises(http.client.IncompleteRead) as caught:
+                    response.read()
+                self.assertEqual(b"", caught.exception.partial)
+                failed.thread.join(2)
+                self.assertFalse(failed.thread.is_alive())
+                self.assertTrue(failed.error)
+                self.assertEqual(4, len(spotty.calls))
+                self.assertEqual([], finished)
+                self.assertEqual(1, len(notices))
+                server._notify_playback_failure(TRACK)
+                self.assertEqual(1, len(notices))
+                connection.close()
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+                connection.request("GET", f"/track/{TRACK}/30.wav")
+                with connection.getresponse() as replay:
+                    self.assertEqual(200, replay.status)
+                    self.assertEqual(self.ideal, replay.read())
+                fresh = self._downloader()
+                self.assertIsNot(failed, fresh)
+                fresh.thread.join(2)
+                self.assertFalse(fresh.thread.is_alive())
+                self.assertTrue(fresh.is_finished)
+                self.assertFalse(fresh.error)
+                self.assertGreater(low._SpottyAudioStreamer__terminate_generation, old_generation)
+                self.assertEqual(b"", b"".join(stale_body))
+                self.assertFalse(fresh.aborted)
+                self.assertEqual([TRACK], finished)
+                self.assertEqual(1, len(notices))
+                self.assertEqual(5, len(spotty.calls))
+                self.assertEqual([], spotty.seeks())
+                print("post-commit status=200 declared=5292044 received=48 "
+                      "client=IncompleteRead failures=1 false_finished=0 replay_exact=True")
+            finally:
+                spotty.release()
+                connection.close()
+
+    def test_real_pipe_partial_first_frame_retry_preserves_exact_bytes(self):
+        import http.client
+
+        spotty = _RetryPipeSpotty([2, 3, None])
+        with self._pipe_http(spotty=spotty) as (_, _, port):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            try:
+                connection.request("GET", f"/track/{TRACK}/30.wav")
+                with connection.getresponse() as response:
+                    self.assertEqual(200, response.status)
+                    self.assertEqual(self.ideal, response.read())
+                downloader = self._downloader()
+                downloader.thread.join(2)
+                self.assertFalse(downloader.thread.is_alive())
+                self.assertTrue(downloader.is_finished)
+                self.assertFalse(downloader.error)
+                self.assertEqual(3, len(spotty.calls))
+                self.assertEqual([], spotty.seeks())
+                print("partial-first-frame cuts=2,3 attempts=3 exact_bytes=True")
+            finally:
+                connection.close()
+
+    def test_clean_short_tail_range_preserves_finished_cache(self):
+        spotty = RampSpotty()
+        server = self._server(spotty)
+        head = self._get(server, "bytes=0-", duration="30.5.wav")
+        downloader = self._downloader()
+        downloader.thread.join(2)
+        self.assertFalse(downloader.thread.is_alive())
+        self.assertFalse(downloader.error)
+        padded_header, _ = sys.modules["spotty_audio_streamer"].create_wav_header_for_duration(30.5)
+        # Keep an early reader active to distinguish normal head trim from cache loss.
+        self.assertEqual(padded_header + RAMP[:4], next(head)[:48])
+        before = bytes(downloader._buffer)
+        begin = 44 + PCM_LEN + 100
+        tail = self._get(server, f"bytes={begin}-{begin + 7}", duration="30.5.wav")
+        self.assertEqual(206, int(str(self.http.bottle.response.status).split()[0]))
+        self.assertEqual(8, self.http.bottle.response.content_length)
+        self.assertEqual(bytes(8), self._read(tail))
+        self.assertFalse(downloader.aborted)
+        self.assertEqual(before, bytes(downloader._buffer))
+        low = server._HTTPSpottyAudioStreamer__spotty_streamer
+        self.assertTrue(low.prepare_part_audio_stream(begin))
+        self.assertEqual(self.ideal[44:48], self._read(
+            self._get(server, "bytes=44-47", duration="30.5.wav")))
+        self.assertIs(downloader, self._downloader())
+        self.assertEqual(1, len(spotty.calls))
+        self.assertEqual([], spotty.seeks())
 
     def test_full_stream_matches_declared_wav(self):
         spotty = RampSpotty()
