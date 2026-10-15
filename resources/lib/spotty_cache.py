@@ -530,7 +530,7 @@ class SpottyDownloader:
                     if self.aborted:
                         return
 
-                # stdout.read() stays blocking so PCM is drained efficiently.
+                # The stdout read blocks until PCM arrives.
                 # This watchdog kills only this attempt's process, unblocking the
                 # read without allowing a stale attempt to kill a newer retry.
                 def _watch_attempt(attempt_process=attempt_process):
@@ -591,6 +591,8 @@ class SpottyDownloader:
                 watchdog_thread = threading.Thread(target=_watch_attempt, daemon=True)
                 watchdog_thread.start()
 
+                # Return available PCM without waiting for a full buffered read.
+                read = getattr(process.stdout, "read1", None) or process.stdout.read
                 pending = b""
                 if resume_ref is not None:
                     partial = (attempt_start_byte - len(self.wav_header)) % 4
@@ -632,7 +634,7 @@ class SpottyDownloader:
                     if pending:
                         chunk, pending = pending, b""
                     else:
-                        chunk = process.stdout.read(_STDOUT_READ_BYTES)
+                        chunk = read(_STDOUT_READ_BYTES)
                     if not chunk:
                         break
                     if self.aborted:

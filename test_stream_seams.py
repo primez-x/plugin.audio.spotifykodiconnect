@@ -8,7 +8,9 @@ repeated or missing frame at a seam fails the comparison.
 """
 
 import array
+from contextlib import contextmanager
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -85,6 +87,100 @@ class RampSpotty:
 
     def seeks(self):
         return [c for c in self.calls if "--start-position" in c]
+
+
+class _PipeSpotty:
+    """Real buffered stdout with separate first-frame and bulk gates."""
+
+    def __init__(self, prefix_bytes=4):
+        self.prefix_bytes = prefix_bytes
+        self.prefix_written = threading.Event()
+        self.frame_written = threading.Event()
+        self.frame_written_at = None
+        self.bulk_released = False
+        self.bulk_released_at = None
+        self.process = None
+        self.status_thread = None
+        self.status = None
+
+    def run_spotty(self, args):
+        status_read, status_write = os.pipe()
+        producer = """
+import os, sys
+status, prefix = map(int, sys.argv[1:])
+frame = bytes(4)
+os.write(1, frame[:prefix])
+os.write(status, b'p')
+if prefix < 4:
+    if not sys.stdin.buffer.read(1):
+        sys.exit(0)
+    os.write(1, frame[prefix:])
+os.write(status, b'f')
+if sys.stdin.buffer.read(1):
+    import array
+    pcm = array.array('I', range(30 * 44100)).tobytes()
+    sys.stdout.buffer.write(pcm[4:])
+    sys.stdout.buffer.flush()
+"""
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, "-c", producer, str(status_write), str(self.prefix_bytes)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=1048576,
+                pass_fds=(status_write,),
+            )
+        except BaseException:
+            os.close(status_read)
+            raise
+        finally:
+            os.close(status_write)
+        self.status = os.fdopen(status_read, "rb", buffering=0)
+
+        def acknowledge():
+            while True:
+                marker = self.status.read(1)
+                if not marker:
+                    return
+                if marker == b'p':
+                    self.prefix_written.set()
+                elif marker == b'f':
+                    self.frame_written_at = time.monotonic()
+                    self.frame_written.set()
+
+        self.status_thread = threading.Thread(target=acknowledge)
+        self.status_thread.start()
+        return self.process
+
+    def release(self, bulk=False):
+        if bulk:
+            self.bulk_released = True
+            if self.bulk_released_at is None:
+                self.bulk_released_at = time.monotonic()
+        if self.process is not None and self.process.poll() is None:
+            try:
+                self.process.stdin.write(b'x')
+                self.process.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
+
+    def close(self):
+        self.release()
+        self.release(bulk=True)
+        if self.process is not None:
+            if self.process.poll() is None:
+                self.process.kill()
+            self.process.wait(timeout=2)
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                pass
+            self.process.stdout.close()
+        if self.status_thread is not None:
+            self.status_thread.join(2)
+        if self.status is not None:
+            self.status.close()
 
 
 class _Request:
@@ -235,6 +331,184 @@ class StreamSeamTests(unittest.TestCase):
 
     def _downloader(self):
         return self.cache.SpottyCacheManager.find_active_downloader(TRACK)
+
+    @contextmanager
+    def _pipe_http(self, prefix_bytes=4):
+        from socketserver import ThreadingMixIn
+        from wsgiref.simple_server import WSGIServer, WSGIRequestHandler, make_server
+
+        class Server(ThreadingMixIn, WSGIServer):
+            daemon_threads = True
+
+        class Handler(WSGIRequestHandler):
+            def log_message(self, *args):
+                pass
+
+        sys.modules.pop("bottle", None)
+        deps = os.path.join(LIB_DIR, "deps")
+        sys.path.insert(0, deps)
+        import bottle
+
+        self.http.bottle = bottle
+        spotty = _PipeSpotty(prefix_bytes)
+        streamer = self._server(spotty)
+        app = bottle.Bottle()
+        app.route("/track/<track_id>/<duration>", callback=streamer.spotty_stream_audio_track)
+        server = make_server("127.0.0.1", 0, app, Server, Handler)
+        server_thread = threading.Thread(target=server.serve_forever)
+        server_thread.start()
+        try:
+            yield streamer, spotty, server.server_port
+        finally:
+            downloader = self._downloader()
+            try:
+                self.cache.SpottyCacheManager.cleanup_all()
+                spotty.close()
+                if downloader is not None and downloader.thread is not None:
+                    downloader.thread.join(2)
+            finally:
+                server.shutdown()
+                server.server_close()
+                server_thread.join(2)
+                sys.path.remove(deps)
+            if downloader is not None and downloader.thread is not None:
+                self.assertFalse(downloader.thread.is_alive(), "downloader survived cleanup")
+            self.assertFalse(server_thread.is_alive(), "HTTP server survived cleanup")
+            if spotty.status_thread is not None:
+                self.assertFalse(spotty.status_thread.is_alive(), "status reader survived cleanup")
+                self.assertIsNotNone(spotty.process.returncode, "producer was not reaped")
+                print(f"real-pipe reaped pid={spotty.process.pid} rc={spotty.process.returncode} "
+                      "downloader_joined=True status_joined=True server_joined=True")
+
+    def _assert_pipe_http(self, begin=None, end=None, prefix_bytes=4):
+        import http.client
+
+        with self._pipe_http(prefix_bytes) as (streamer, spotty, port):
+            first_response = threading.Event()
+            finish_response = threading.Event()
+            received, errors, headers, read_times = [], [], [], []
+            start = time.monotonic()
+            first_count = 48 if begin is None else end - begin + 1
+
+            def request():
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+                try:
+                    request_headers = {} if begin is None else {"Range": f"bytes={begin}-{end}"}
+                    connection.request("GET", f"/track/{TRACK}/30.wav", headers=request_headers)
+                    with connection.getresponse() as response:
+                        headers.append((response.status, time.monotonic() - start))
+                        received.append(response.read(first_count))
+                        read_times.append(time.monotonic() - start)
+                        first_response.set()
+                        if begin is None:
+                            finish_response.wait(3)
+                            received.append(response.read())
+                except Exception as exc:
+                    errors.append(exc)
+                    first_response.set()
+                finally:
+                    connection.close()
+
+            requester = threading.Thread(target=request)
+            requester.start()
+            try:
+                self.assertTrue(spotty.prefix_written.wait(2), "producer never wrote prefix")
+                if prefix_bytes < 4:
+                    downloader = self._downloader()
+                    with downloader.cond:
+                        self.assertTrue(downloader.cond.wait_for(
+                            lambda: downloader.real_pcm_bytes == prefix_bytes, timeout=2
+                        ), "partial PCM never left the real pipe")
+                    self.assertFalse(first_response.is_set(), "partial frame admitted HTTP response")
+                    self.assertEqual([], headers, "partial frame admitted HTTP headers")
+                    released = []
+                    self.assertFalse(streamer.release_stream(lambda: released.append(True)))
+                    self.assertEqual([], released, "stale Stop released startup resources")
+                    spotty.release()
+                self.assertTrue(spotty.frame_written.wait(2), "producer never wrote complete frame")
+                self.assertTrue(first_response.wait(1), "HTTP waited for bulk despite complete real frame")
+                self.assertEqual([], errors)
+                self.assertFalse(spotty.bulk_released)
+                expected = self.ideal[:48] if begin is None else self.ideal[begin:end + 1]
+                self.assertEqual([expected], received)
+                self.assertEqual(200 if begin is None else 206, headers[0][0])
+                print(f"real-pipe prefix={prefix_bytes} range={begin}:{end} "
+                      f"headers_ms={headers[0][1] * 1000:.3f} "
+                      f"first_read_ms={read_times[0] * 1000:.3f} "
+                      f"frame_ack_ms={(spotty.frame_written_at - start) * 1000:.3f} bulk_released=False")
+                spotty.release(bulk=True)
+                finish_response.set()
+                requester.join(3)
+                self.assertFalse(requester.is_alive(), "HTTP request survived bulk release")
+                self.assertEqual([], errors)
+                if begin is None:
+                    self.assertEqual(self.ideal, b"".join(received))
+            finally:
+                if prefix_bytes < 4 and not spotty.frame_written.is_set():
+                    spotty.release()
+                spotty.release(bulk=True)
+                finish_response.set()
+                requester.join(4)
+                self.assertFalse(requester.is_alive(), "HTTP request survived cleanup")
+                print(f"real-pipe cleanup producer_pid={spotty.process.pid if spotty.process else None} "
+                      f"request_done={first_response.is_set()} first_read_bytes="
+                      f"{len(received[0]) if received else 0} errors={len(errors)} "
+                      f"headers_ms={headers[0][1] * 1000 if headers else None} "
+                      f"bulk_release_ms={(spotty.bulk_released_at - start) * 1000:.3f}")
+
+    @unittest.skipUnless(os.name == "posix", "producer status requires inherited descriptor")
+    def test_real_pipe_serves_header_and_frame_before_bulk_release(self):
+        self._assert_pipe_http()
+
+    @unittest.skipUnless(os.name == "posix", "producer status requires inherited descriptor")
+    def test_real_pipe_exact_ranges_require_complete_frame(self):
+        for begin, end in ((0, 3), (0, 47), (20, 47), (43, 47), (44, 47)):
+            with self.subTest(begin=begin, end=end):
+                self._assert_pipe_http(begin, end)
+
+    @unittest.skipUnless(os.name == "posix", "producer status requires inherited descriptor")
+    def test_real_pipe_fragmented_frame_survives_stale_stop(self):
+        for prefix_bytes in (1, 2, 3):
+            with self.subTest(prefix_bytes=prefix_bytes):
+                self._assert_pipe_http(0, 3, prefix_bytes)
+
+    @unittest.skipUnless(os.name == "posix", "producer status requires inherited descriptor")
+    def test_real_pipe_cancel_unblocks_partial_frame_without_bulk(self):
+        with self._pipe_http(3) as (_, spotty, port):
+            import http.client
+
+            done = threading.Event()
+            errors, responses = [], []
+
+            def request():
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+                try:
+                    connection.request("GET", f"/track/{TRACK}/30.wav")
+                    with connection.getresponse() as response:
+                        responses.append((response.status, response.read()))
+                except Exception as exc:
+                    errors.append(exc)
+                finally:
+                    connection.close()
+                    done.set()
+
+            requester = threading.Thread(target=request)
+            requester.start()
+            try:
+                self.assertTrue(spotty.prefix_written.wait(2))
+                downloader = self._downloader()
+                downloader.abort()
+                self.assertTrue(done.wait(1), "canceled HTTP startup did not return")
+                downloader.thread.join(1)
+                self.assertFalse(downloader.thread.is_alive(), "cancel left stdout read blocked")
+                self.assertFalse(spotty.bulk_released)
+                self.assertEqual([], errors)
+                self.assertEqual(1, len(responses))
+                self.assertGreaterEqual(responses[0][0], 400)
+            finally:
+                spotty.close()
+                requester.join(4)
+                self.assertFalse(requester.is_alive())
 
     def test_full_stream_matches_declared_wav(self):
         spotty = RampSpotty()
