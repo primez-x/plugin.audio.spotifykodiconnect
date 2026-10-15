@@ -656,7 +656,7 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
         self.assertEqual(0, service._prebuffer_token)
 
     def test_confirmed_spotify_playback_publishes_current_track_hook(self):
-        for token in ("213.560.wav", "213560ms"):
+        for token in ("213.560.wav", "213560ms.xwav"):
             with self.subTest(token=token):
                 url = f"http://127.0.0.1:52309/track/track-1/{token}"
                 main_service = import_main_service(
@@ -677,8 +677,8 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
     def test_canonical_next_track_prebuffer_receives_seconds(self):
         main_service = import_main_service({}, {"prebuffer_enabled": "true"})
         main_service.get_next_playlist_item = lambda: (
-            {"file": "http://127.0.0.1:52309/track/current/180000ms"},
-            {"file": "http://127.0.0.1:52309/track/next/213560ms"},
+            {"file": "http://127.0.0.1:52309/track/current/180000ms.xwav"},
+            {"file": "http://127.0.0.1:52309/track/next/213560ms.xwav"},
         )
         calls = []
         service = object.__new__(main_service.MainService)
@@ -1386,8 +1386,8 @@ class SpotifyAutoplayGatingTests(unittest.TestCase):
         self.assertEqual([("recommendations", ("seed",), 49)], calls)
         self.assertEqual(
             [
-                "http://127.0.0.1:52309/track/rec-1/213560ms",
-                "http://127.0.0.1:52309/track/rec-3/213560ms",
+                "http://127.0.0.1:52309/track/rec-1/213560ms.xwav",
+                "http://127.0.0.1:52309/track/rec-3/213560ms.xwav",
             ],
             [url for url, _li in added],
         )
@@ -1508,8 +1508,8 @@ class PlaybackStopReleaseTests(unittest.TestCase):
         main_service.bottle_manager.stop_thread = lambda: events.append("stop_http")
         main_service.SPOTIFY_ADDON.getSetting = lambda key: "true" if key == "prebuffer_enabled" else ""
         main_service.get_next_playlist_item = lambda: (
-            {"file": "http://127.0.0.1:52309/track/current/180000ms"},
-            {"file": "http://127.0.0.1:52309/track/next/180000ms"},
+            {"file": "http://127.0.0.1:52309/track/current/180000ms.xwav"},
+            {"file": "http://127.0.0.1:52309/track/next/180000ms.xwav"},
         )
         pending = []
         main_service._start_daemon_thread = lambda target, **kwargs: pending.append(target)

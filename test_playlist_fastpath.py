@@ -758,7 +758,7 @@ class PlaylistFastPathTests(unittest.TestCase):
         self.assertEqual(50, len(RecordingPlaylist.instances[0].items))
         # The URL duration sets the WAV length and must keep millisecond precision.
         url = RecordingPlaylist.instances[0].items[0][0]
-        self.assertRegex(url, r"/track/track-\d+/180000ms$")
+        self.assertRegex(url, r"/track/track-\d+/180000ms\.xwav$")
 
     def test_old_track_advance_during_first_page_preserves_full_replacement(self):
         import test_main_service_osd as osd

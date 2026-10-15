@@ -490,7 +490,7 @@ class StreamSeamTests(unittest.TestCase):
             service = self._stop_service(server)
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             try:
-                path = f"/track/{TRACK}/180000ms"
+                path = f"/track/{TRACK}/180000ms.xwav"
                 connection.request("GET", path, headers={"Range": "bytes=0-12582911"})
                 with connection.getresponse() as response:
                     self.assertEqual(206, response.status)
@@ -1410,7 +1410,7 @@ class StreamSeamTests(unittest.TestCase):
         with self._pipe_http(spotty=spotty) as (server, _, port):
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
             try:
-                connection.request("GET", f"/track/{TRACK}/1000ms")
+                connection.request("GET", f"/track/{TRACK}/1000ms.xwav")
                 with connection.getresponse() as response:
                     served = response.read()
                     self.assertEqual(176444, len(served))
@@ -1421,7 +1421,7 @@ class StreamSeamTests(unittest.TestCase):
                 self.assertEqual(176444, downloader.written_bytes)
                 self.assertEqual(downloader.wav_header + _ramp(FRAMES_PER_SEC), served)
                 self._stop_service(server)._release_after_stop()
-                connection.request("GET", f"/track/{TRACK}/1000ms")
+                connection.request("GET", f"/track/{TRACK}/1000ms.xwav")
                 with connection.getresponse() as response:
                     self.assertEqual(served, response.read())
                 self.assertIs(downloader, self._downloader())
@@ -1437,7 +1437,7 @@ class StreamSeamTests(unittest.TestCase):
         with self._pipe_http(spotty=spotty) as (streamer, _, port):
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
             try:
-                path = f"/track/{TRACK}/213560ms"
+                path = f"/track/{TRACK}/213560ms.xwav"
                 connection.request("HEAD", path)
                 with connection.getresponse() as response:
                     self.assertEqual(200, response.status)
@@ -1459,7 +1459,7 @@ class StreamSeamTests(unittest.TestCase):
                     self.assertEqual(_ramp(frames), pcm)
                     self.assertEqual(213.560, wav.getnframes() / wav.getframerate())
                 self.assertEqual(213.560, streamer._HTTPSpottyAudioStreamer__spotty_streamer.get_stream_spec().track_duration)
-                print(f"canonical-http token=213560ms seconds=213.560 frames={frames} "
+                print(f"canonical-http token=213560ms.xwav seconds=213.560 frames={frames} "
                       f"head_bytes={head_length} get_bytes={len(served)} "
                       f"pcm_sha256={hashlib.sha256(pcm).hexdigest()} exact_pcm=True")
             finally:
@@ -1469,11 +1469,11 @@ class StreamSeamTests(unittest.TestCase):
         import http.client
 
         for token, frames in (
-            ("1250ms", 55125),
+            ("1250ms.xwav", 55125),
             ("1.250.wav", 55125),
             ("1.250", 55125),
-            ("250ms", 44100),
-            ("0ms", 44100),
+            ("250ms.xwav", 44100),
+            ("0ms.xwav", 44100),
             ("0.wav", 44100),
         ):
             with self.subTest(token=token), self._pipe_http(spotty=_RetryPipeSpotty([])) as (_, spotty, port):
@@ -1501,7 +1501,7 @@ class StreamSeamTests(unittest.TestCase):
 
         spotty = _RetryPipeSpotty([])
         with self._pipe_http(spotty=spotty) as (streamer, _, port):
-            for token in ("1.5ms", "-1ms", "+1000ms", "nanms", "1e3ms", "ms", "213560ms.wav", "1" + "0" * 400 + "ms"):
+            for token in ("1.5ms.xwav", "-1ms.xwav", "+1000ms.xwav", "nanms.xwav", "1e3ms.xwav", "ms.xwav", "213560ms", "213560ms.wav", "1" + "0" * 400 + "ms.xwav"):
                 for method in ("HEAD", "GET"):
                     with self.subTest(token=token, method=method):
                         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)

@@ -36,9 +36,13 @@ _PLAY_QUEUE_PROPS = (
 
 
 def build_stream_url(track_id: str, duration_ms: int) -> str:
-    """Preserve millisecond WAV length without a file extension that triggers TagLib."""
+    """Preserve millisecond WAV length in an audio URL that Kodi does not tag-probe.
+
+    Kodi lists .xwav as an audio extension, so a song starts inside the music queue,
+    but Kodi has no tag reader for .xwav (unlike .wav, which TagLib opens twice).
+    """
     duration_ms = max(1000, int(duration_ms or 0))
-    return f"http://{PROXY_HOST}:{PROXY_PORT}/track/{track_id}/{duration_ms}ms"
+    return f"http://{PROXY_HOST}:{PROXY_PORT}/track/{track_id}/{duration_ms}ms.xwav"
 
 
 def bind_stream_item(listitem, track_id: str, owner: str = "") -> None:

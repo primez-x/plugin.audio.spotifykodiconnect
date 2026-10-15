@@ -21,9 +21,9 @@ from xbmc import LOGDEBUG
 # Kodi music playlist id
 PLAYLIST_MUSIC = 0
 
-# Canonical integer milliseconds have no file extension. Saved URLs can use seconds.
+# Canonical URLs carry integer milliseconds with .xwav. Saved URLs can use seconds.
 _TRACK_URL_PATTERN = re.compile(
-    r"^https?://(?:localhost|127\.0\.0\.1)(?::\d+)?/track/([^/]+)/([0-9]+ms|[0-9]+(?:\.[0-9]+)?(?:\.wav)?)/?$",
+    r"^https?://(?:localhost|127\.0\.0\.1)(?::\d+)?/track/([^/]+)/([0-9]+ms\.xwav|[0-9]+(?:\.[0-9]+)?(?:\.wav)?)/?$",
     re.I,
 )
 
@@ -130,8 +130,8 @@ def parse_track_url(file_url):
     track_id, duration_str = m.group(1), m.group(2)
     try:
         duration_str = duration_str.lower()
-        if duration_str.endswith("ms"):
-            duration_sec = int(duration_str[:-2]) / 1000.0
+        if duration_str.endswith("ms.xwav"):
+            duration_sec = int(duration_str[:-7]) / 1000.0
         else:
             duration_sec = float(duration_str[:-4] if duration_str.endswith(".wav") else duration_str)
         return track_id, duration_sec

@@ -827,11 +827,11 @@ class HTTPSpottyAudioStreamer:
     SPOTTY_AUDIO_TRACK_ROUTE = "/track/<track_id>/<duration>"
 
     def spotty_stream_audio_track(self, track_id: str, duration: str) -> bottle.Response:
-        # MIME selects PAPlayer. Extension-free URLs skip the empty WAV TagLib probe.
+        # .xwav marks the item as audio without the empty WAV TagLib probe; MIME selects the codec.
         # Normalize saved decimal-second URLs and canonical milliseconds before HEAD/GET.
         try:
-            if re.fullmatch(r"[0-9]+ms", duration):
-                duration = int(duration[:-2]) / 1000.0
+            if re.fullmatch(r"[0-9]+ms\.xwav", duration):
+                duration = int(duration[:-7]) / 1000.0
             elif re.fullmatch(r"[0-9]+(?:\.[0-9]+)?(?:\.wav)?", duration):
                 duration = float(duration[:-4] if duration.endswith(".wav") else duration)
             else:
