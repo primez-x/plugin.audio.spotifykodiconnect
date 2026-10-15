@@ -685,9 +685,14 @@ class PerformanceTests(ContentTestCase):
         )
         self.assertTrue(any("?action=follow_artist&artistid=artist-1)" in c for c in commands[0]))
         self.assertTrue(any("?action=unfollow_artist&artistid=artist-2)" in c for c in commands[1]))
-        self.assertEqual(12, len(menus[0]))
+        # Song rows are not playable rows, so the menu carries the queue entries.
+        self.assertEqual(
+            ["?action=queue_track&track=track-1&next=1)", "?action=queue_track&track=track-1)"],
+            [c.split("/", 3)[-1] for c in commands[0][:2]],
+        )
+        self.assertEqual(14, len(menus[0]))
         foreign = self.render("track", rows, playlist_details={"id": "p", "owner": {"id": "x"}})
-        self.assertEqual(11, len(foreign[0]), "no remove-from-playlist on foreign playlists")
+        self.assertEqual(13, len(foreign[0]), "no remove-from-playlist on foreign playlists")
 
     def test_render_applies_newer_override_to_lean_rows(self):
         spotify = ContentSpotify(fp.RecordingPlayer.events)

@@ -21,9 +21,17 @@ import xbmcgui
 import xbmcplugin
 import xbmcvfs
 from like_actions import send_liked_to_service
+from playlist_next import parse_track_url
 from spotty_auth import SpottyAuth
 from spotty_helper import SpottyHelper
 from string_ids import *
+from play_in_queue import (
+    ACTION as PLAY_IN_QUEUE_ACTION,
+    FIRST_PARAM,
+    LAST_PARAM,
+    STREAM_ROWS_PARAM,
+    STREAM_ROWS_VALUE,
+)
 from play_queue import (
     bind_stream_item as play_queue_bind_stream_item,
     build_stream_url,
@@ -729,6 +737,8 @@ class PluginContent:
             "browse_album",
             "browse_playlist",
             "play_playlist",
+            "play_in_queue",
+            "queue_track",
             "browse_category",
             "browse_playlists",
             "browse_new_releases",
@@ -1471,20 +1481,80 @@ class PluginContent:
         append_artist_to_label: bool = False,
         playlist_details: Optional[Dict[str, Any]] = None,
     ) -> List[Tuple[str, xbmcgui.ListItem, bool]]:
+        # The queue loads stream rows. Song lists show click rows that play inside that queue.
+        stream_rows = self.__params.get(STREAM_ROWS_PARAM, [""])[0] == STREAM_ROWS_VALUE
+        listing = urllib.parse.urlencode(
+            [(k, v[0] if isinstance(v, (list, tuple)) else v) for k, v in self.__params.items()]
+        )
         result = []
         for track in tracks:
             if not isinstance(track, dict) or not track.get("id"):
                 continue
-            context_items = self.__get_playlist_track_context_menu_items(
-                track,
-                track.get("saved"),
-                playlist_details,
-                track.get("artist_followed"),
-            )
+            context_items = None
+            if not stream_rows:
+                context_items = self.__get_playlist_track_context_menu_items(
+                    track,
+                    track.get("saved"),
+                    playlist_details,
+                    track.get("artist_followed"),
+                )
             item = self.__get_track_item(track, append_artist_to_label, context_items)
-            if item is not None:
-                result.append(item + (False,))
+            if item is None:
+                continue
+            if not stream_rows:
+                item = self.__get_song_click_row(item, len(result), listing)
+            result.append(item + (False,))
+        if stream_rows:
+            # Click-row positions index the full list, so slice after the rows exist.
+            last = self.__params.get(LAST_PARAM)
+            return result[int(self.__params[FIRST_PARAM][0]) : int(last[0]) if last else None]
         return result
+
+    def __get_song_click_row(
+        self, item: Tuple[str, xbmcgui.ListItem], position: int, listing: str
+    ) -> Tuple[str, xbmcgui.ListItem]:
+        """Route a click to play_in_queue. Kodi rebuilds the whole queue for a playable row."""
+        stream_url, li = item
+        track_id, duration_sec = parse_track_url(stream_url)
+        li.setProperty("isPlayable", "false")
+        click_url = self.__build_url(
+            {
+                "action": PLAY_IN_QUEUE_ACTION,
+                "position": position,
+                "track": track_id,
+                "ms": round(duration_sec * 1000),
+                "list": listing,
+            }
+        )
+        return click_url, li
+
+    def play_in_queue(self) -> None:
+        """Resolve a song row that Kodi opens with PlayMedia, for example from a widget."""
+        if self.__addon_handle < 0:
+            return
+        track_id = self.__params["track"][0]
+        url = build_stream_url(track_id, int(self.__params["ms"][0]))
+        li = xbmcgui.ListItem(path=url, offscreen=True)
+        play_queue_bind_stream_item(li, track_id)
+        xbmcplugin.setResolvedUrl(self.__addon_handle, True, li)
+
+    def queue_track(self) -> None:
+        """Add a song after the playing song or at the queue end, as Kodi does for playable rows."""
+        tracks = self.__prepare_track_listitems(
+            track_ids=[self.__params["track"][0]],
+            include_context_items=False,
+            include_artist_fanart=False,
+        )
+        item = self.__get_track_item(tracks[0], True) if tracks else None
+        if item is None:
+            return
+        url, li = item
+        playlist = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
+        position = playlist.getposition()
+        if self.__params.get("next", [""])[0] == "1" and position >= 0:
+            playlist.add(url, li, position + 1)
+        else:
+            playlist.add(url, li)
 
     def _track_album_description(self, track: Dict[str, Any], album: Dict[str, Any]) -> str:
         """Build album description from Spotify data (release date, genre). Label/copyright only in full album API."""
@@ -3080,7 +3150,17 @@ class PluginContent:
         loc = self.__localized
         plugin = f"plugin://{ADDON_ID}/"
 
-        context_items = []
+        # Song rows are not playable rows, so Kodi omits its own queue entries.
+        context_items = [
+            (
+                self.__kodi_localized(KODI_PLAY_NEXT_STR_ID),
+                f"RunPlugin({plugin}?action=queue_track&track={track['id']}&next=1)",
+            ),
+            (
+                self.__kodi_localized(KODI_QUEUE_ITEM_STR_ID),
+                f"RunPlugin({plugin}?action=queue_track&track={track['id']})",
+            ),
+        ]
 
         if is_saved is True:
             context_items.append(

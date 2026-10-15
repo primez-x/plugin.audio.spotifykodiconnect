@@ -15,6 +15,7 @@ from contextlib import contextmanager
 
 import xbmcgui
 
+from play_in_queue import PROP_LISTING
 from utils import ADDON_DATA_PATH, ADDON_WINDOW_ID, PROXY_HOST, PROXY_PORT, log_msg
 from xbmc import LOGDEBUG
 
@@ -90,7 +91,10 @@ def session_guard(owner=None):
 
 
 def clear(owner=None) -> bool:
-    """Clear a matching owner's queue under the lock; report whether cleanup ran."""
+    """Clear a matching owner's queue under the lock; report whether cleanup ran.
+
+    The song-list mapping survives Stop, because the queue survives Stop.
+    """
     with session_guard(owner) as win:
         if win is None:
             return False
@@ -109,6 +113,7 @@ def start_session(original_total: int) -> str:
         win.setProperty(PROP_ORIGINAL_LOADED, "0")
         win.setProperty(PROP_ORIGINAL_COMPLETE, complete)
         win.setProperty(PROP_AUTOPLAY_FETCHED, "false")
+        win.clearProperty(PROP_LISTING)
     log_msg(
         f"PlayQueue: session {token} started"
         f" (total={original_total}, complete={complete}).",

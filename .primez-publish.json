@@ -7,6 +7,7 @@
     ["python3", "-m", "unittest", "test_http_spotty_audio_streamer"],
     ["python3", "-m", "unittest", "test_listing_timing"],
     ["python3", "-m", "unittest", "test_main_service_osd"],
+    ["python3", "-m", "unittest", "test_play_in_queue"],
     ["python3", "-m", "unittest", "test_play_queue"],
     ["python3", "-m", "unittest", "test_playlist_fastpath"],
     ["python3", "-m", "unittest", "test_plugin_auth"],
