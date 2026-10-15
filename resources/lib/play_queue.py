@@ -55,8 +55,6 @@ def bind_stream_item(listitem, track_id: str, owner: str = "") -> None:
     """
     listitem.setProperty("spotifytrackid", track_id)
     listitem.setProperty(ITEM_OWNER_PROPERTY, f"{owner}:{track_id}")
-    # Spotify proxy tracks have no entry in Kodi's local music library.
-    listitem.setProperty("database-lookup", "false")
     listitem.setMimeType("audio/x-wav")
     listitem.setContentLookup(False)
 
