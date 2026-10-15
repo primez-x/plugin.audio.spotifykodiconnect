@@ -571,6 +571,7 @@ class StreamSeamTests(unittest.TestCase):
     def test_real_pipe_stop_then_reuse_survives_old_seek_cleanup(self):
         import http.client
 
+        # server.stop() models shutdown. User Stop calls release_stream(cleanup_all).
         with self._pipe_http() as (server, spotty, port):
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
             waiting, resume = threading.Event(), threading.Event()
