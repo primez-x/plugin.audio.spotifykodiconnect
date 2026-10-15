@@ -16,6 +16,7 @@ import subprocess
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 REPO_ROOT = os.path.dirname(__file__)
 LIB_DIR = os.path.join(REPO_ROOT, "resources", "lib")
@@ -103,6 +104,8 @@ from spotty_auth import SpottyAuth  # noqa: E402
 
 class FakeSpotty:
     """Minimal Spotty stand-in exposing the path helpers SpottyAuth uses."""
+
+    get_spotty_credentials_identity = spotty_auth.Spotty.get_spotty_credentials_identity
 
     def __init__(self, cache_dir):
         self._cache_dir = cache_dir
@@ -264,8 +267,13 @@ class RestoreCredentialsFromBackupTests(unittest.TestCase):
     def test_restores_when_live_missing_and_backup_exists(self):
         """The core regression: live creds gone, .bak present -> restored."""
         self._write(self.spotty.cred_backup, '{"username":"u","auth_type":1,"auth_data":"abc"}')
+        self.assertIsNone(self.spotty.get_spotty_credentials_identity())
         result = self.auth.restore_credentials_from_backup_if_needed()
-        self.assertTrue(result, "restore should return True when it performed a copy")
+        self.assertTrue(result, "restore must copy the backup")
+        with patch("builtins.open", side_effect=AssertionError("metadata read opened credential contents")):
+            restored_identity = self.spotty.get_spotty_credentials_identity()
+            self.assertIsNotNone(restored_identity)
+            self.assertTrue(restored_identity == self.spotty.get_spotty_credentials_identity())
         self.assertTrue(
             os.path.exists(self.spotty.cred_file), "credentials.json should exist after restore"
         )
@@ -278,23 +286,44 @@ class RestoreCredentialsFromBackupTests(unittest.TestCase):
         """Happy path: nothing to do when credentials.json already exists."""
         self._write(self.spotty.cred_file, '{"username":"u"}')
         self._write(self.spotty.cred_backup, '{"username":"old"}')
+        before = self.spotty.get_spotty_credentials_identity()
         result = self.auth.restore_credentials_from_backup_if_needed()
-        self.assertFalse(result, "restore should return False when live file exists")
+        self.assertFalse(result, "restore must preserve the live file")
+        self.assertTrue(before == self.spotty.get_spotty_credentials_identity())
         # Live file must be untouched.
         with open(self.spotty.cred_file) as f:
             self.assertEqual(f.read(), '{"username":"u"}')
+        self._write(self.spotty.cred_backup, '{"username":"v"}')
+        os.replace(self.spotty.cred_backup, self.spotty.cred_file)
+        self.assertTrue(before != self.spotty.get_spotty_credentials_identity())
+        with patch.object(spotty_auth.utils, "zeroconf_pairing_in_progress", return_value=True):
+            self.assertIsNone(self.spotty.get_spotty_credentials_identity())
 
     def test_noop_when_neither_file_exists(self):
         """Fresh install with no prior auth: warn but do not raise."""
         result = self.auth.restore_credentials_from_backup_if_needed()
         self.assertFalse(result)
         self.assertFalse(os.path.exists(self.spotty.cred_file))
+        self.assertIsNone(self.spotty.get_spotty_credentials_identity())
+        self._write(self.spotty.cred_file, "")
+        self.assertIsNone(self.spotty.get_spotty_credentials_identity())
 
     def test_noop_when_only_live_exists(self):
         """Normal operating state: live creds, no backup yet."""
         self._write(self.spotty.cred_file, '{"username":"u"}')
         result = self.auth.restore_credentials_from_backup_if_needed()
         self.assertFalse(result)
+
+        before = os.stat(self.spotty.cred_file)
+        changed = types.SimpleNamespace(
+            st_dev=before.st_dev, st_ino=before.st_ino,
+            st_mtime_ns=before.st_mtime_ns, st_ctime_ns=before.st_ctime_ns,
+            st_size=before.st_size + 1,
+        )
+        with patch.object(os, "stat", side_effect=[before, changed]):
+            self.assertIsNone(self.spotty.get_spotty_credentials_identity())
+        with patch.object(os, "stat", side_effect=PermissionError("denied")):
+            self.assertIsNone(self.spotty.get_spotty_credentials_identity())
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,6 @@
+import os
 import re
+import tempfile
 import threading
 import time
 from array import array
@@ -18,6 +20,54 @@ _WATCHDOG_POLL_SECONDS = 0.1
 _STDERR_TAIL_LINES = 32
 _STDERR_LINE_MAX_CHARS = 512
 _STDERR_PENDING_MAX_CHARS = 8192
+_RETAIN_IDLE_SECONDS = 60.0
+
+
+def _account_identity(spotty):
+    reader = getattr(spotty, "get_spotty_credentials_identity", None)
+    return reader() if callable(reader) else None
+
+
+class _PCMFile:
+    """One anonymous store with serialized portable offset I/O."""
+
+    def __init__(self, capacity, release):
+        from utils import ADDON_DATA_PATH
+
+        self.capacity = capacity
+        self._release = release
+        self._lock = threading.Lock()
+        directory = os.path.join(ADDON_DATA_PATH, "spotty-cache")
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        self._file = tempfile.TemporaryFile(mode="w+b", buffering=0, dir=directory)
+
+    def append(self, offset, data):
+        if offset < 0 or offset + len(data) > self.capacity:
+            raise OSError("PCM exceeds declared WAV length")
+        with self._lock:
+            self._file.seek(offset)
+            view = memoryview(data)
+            while view:
+                count = self._file.write(view)
+                if count is None or count <= 0 or count > len(view):
+                    raise OSError("Incomplete PCM write")
+                view = view[count:]
+
+    def read(self, offset, size):
+        with self._lock:
+            self._file.seek(offset)
+            data = self._file.read(size)
+            if len(data) != size:
+                raise OSError("Incomplete committed PCM read")
+            return data
+
+    def close(self):
+        with self._lock:
+            if self._file.closed:
+                return
+            self._file.close()
+            self._release(self.capacity)
+
 
 # Writer-side backpressure.  The writer stops pulling Spotty stdout once it is
 # _BP_HIGH_BYTES ahead of the leading reader (or of the furthest consumed byte
@@ -189,9 +239,9 @@ def _clamp_volume(value: int) -> int:
 
 
 class SpottyDownloader:
-    """Downloads a single track from spotty into an in-memory buffer in the background."""
+    """Download PCM into one admitted file or the bounded rolling RAM buffer."""
 
-    # Memory is bounded on two sides:
+    # The rolling RAM fallback is bounded on two sides:
     #
     # * Writer backpressure (_wait_for_room): the writer pauses reading Spotty
     #   stdout once it is _BP_HIGH_BYTES ahead of the leading reader and
@@ -238,6 +288,18 @@ class SpottyDownloader:
         self.volume = _clamp_volume(volume)
         self.wav_header = wav_header
         self.track_length = track_length
+        self.account_identity = _account_identity(spotty)
+        self.audio_identity = (
+            track_id, duration_sec, bytes(wav_header), track_length,
+            bitrate, normalization, self.volume,
+        )
+        self._file_store = None
+        self._file_admission = False
+        self._optional = False
+        self._start_lock = threading.Lock()
+        self._retained_until = None
+        self._retained_idle = False
+        self._ever_retained = False
 
         self._buffer = bytearray()
         self._consumed_pos = 0  # furthest byte any consumer has read (abs, rel start_byte)
@@ -266,20 +328,165 @@ class SpottyDownloader:
         self._peak_buffer_bytes = 0
 
     def start(self):
-        with self.cond:
+        with self._start_lock:
             if self.thread is not None:
-                return
-
+                return True
+            if self.aborted:
+                return False
+            if self._file_admission and self.start_byte == 0:
+                try:
+                    self._file_store = SpottyCacheManager._open_store(self.track_length)
+                except OSError:
+                    self._storage_failed()
+                    self.is_finished = True
+                    return False
+                if self._file_store is None and self._optional:
+                    return False
             header_len = len(self.wav_header)
-            if self.start_byte == 0:
-                self._buffer.extend(self.wav_header)
-                self.written_bytes = header_len
-            elif self.start_byte < header_len:
-                self._buffer.extend(self.wav_header[self.start_byte :])
-                self.written_bytes = header_len - self.start_byte
+            try:
+                if self.start_byte < header_len:
+                    self._append(self.wav_header[self.start_byte :])
+            except OSError:
+                self._storage_failed()
+                self.is_finished = True
+                return False
+            with self.cond:
+                if self.aborted:
+                    return False
+                self.thread = threading.Thread(target=self._download_loop, daemon=True)
+                self.thread.start()
+            return True
 
-            self.thread = threading.Thread(target=self._download_loop, daemon=True)
-            self.thread.start()
+    def matches(self, stream_spec, account_identity) -> bool:
+        expected = (
+            stream_spec.track_id, stream_spec.track_duration, bytes(stream_spec.wav_header),
+            stream_spec.track_length, stream_spec.bitrate,
+            stream_spec.normalization_gain_type, _clamp_volume(stream_spec.initial_volume),
+        )
+        return (
+            self.audio_identity == expected
+            and account_identity is not None
+            and self.account_identity == account_identity
+        )
+
+    def identity_valid(self) -> bool:
+        current = _account_identity(self.spotty)
+        return current is not None and current == self.account_identity
+
+    def _storage_failed(self):
+        with self.cond:
+            self.error = True
+            self.failure_cause = "storage"
+            self.cond.notify_all()
+        log_msg("PCM store failed; refusing incomplete audio.", LOGWARNING)
+        process = self.process
+        if process is not None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    def _append(self, data, real_pcm=False):
+        with self.cond:
+            if self.aborted or self.error:
+                return
+            offset = self.written_bytes
+        if offset + len(data) > self.track_length - self.start_byte:
+            self._storage_failed()
+            raise OSError("PCM exceeds declared WAV length")
+        if self._file_store is not None:
+            try:
+                self._file_store.append(offset, data)
+            except (OSError, ValueError):
+                self._storage_failed()
+                raise OSError("PCM store write failed") from None
+        with self.cond:
+            if self.aborted or self.error:
+                return
+            if self._file_store is None:
+                self._buffer.extend(data)
+            self.written_bytes += len(data)
+            if real_pcm:
+                self._record_real_pcm_locked(len(data))
+            self._peak_buffer_bytes = max(self._peak_buffer_bytes, len(self._buffer))
+            self._trim_head_locked()
+            self.cond.notify_all()
+
+    def read_range(self, offset, size):
+        """Read only committed bytes, relative to the downloader origin."""
+        with self.cond:
+            if self.aborted or self.error or offset < self._trim_offset:
+                return b""
+            size = max(0, min(int(size), 1048576, self.written_bytes - offset))
+            if self._file_store is None:
+                index = offset - self._trim_offset
+                return bytes(self._buffer[index : index + size])
+        try:
+            data = self._file_store.read(offset, size)
+        except (OSError, ValueError):
+            self._storage_failed()
+            return b""
+        with self.cond:
+            return b"" if self.aborted or self.error else data
+
+    def retain_after_stop(self):
+        if not self.identity_valid():
+            return False
+        process = self.process
+        with self.cond:
+            eligible = (
+                self.start_byte == 0 and self._file_store is not None
+                and self.real_pcm_bytes >= 4 and not self.error and not self.aborted
+                and (
+                    self.is_finished or self.written_bytes >= self.track_length
+                    or (process is not None and process.poll() is None)
+                )
+            )
+            if eligible:
+                if self._retained_until is None:
+                    self._retained_until = time.monotonic() + _RETAIN_IDLE_SECONDS
+                self._ever_retained = True
+                self._retained_idle = not self.is_finished
+                self.cond.notify_all()
+            return eligible
+
+    def reusable(self):
+        if not self.identity_valid():
+            return False
+        with self.cond:
+            if self.error or self.aborted:
+                return False
+            retained = self._retained_until
+            finished = self.is_finished or self.written_bytes >= self.track_length - self.start_byte
+            process = self.process
+        if retained is not None and not finished:
+            return time.monotonic() < retained and process is not None and process.poll() is None
+        return True
+
+    def notify_readers(self):
+        with self.cond:
+            self.cond.notify_all()
+
+    def _resume_for_target_locked(self, target):
+        if self._retained_idle and target > self.written_bytes:
+            self._retained_idle = False
+            self._retained_until = None
+            self.cond.notify_all()
+
+    def attach_reader_locked(self, position):
+        consumer_id = self._next_consumer_id
+        self._next_consumer_id += 1
+        self._consumer_positions[consumer_id] = max(0, position)
+        self._retained_until = None
+        self.cond.notify_all()
+        return consumer_id
+
+    def release_reader_locked(self, consumer_id):
+        self._consumer_positions.pop(consumer_id, None)
+        if self._retained_idle and not self._consumer_positions and self._retained_until is None:
+            self._retained_until = time.monotonic() + _RETAIN_IDLE_SECONDS
+        self._trim_head_locked()
+        self.cond.notify_all()
 
     def has_real_pcm(self) -> bool:
         with self.cond:
@@ -360,7 +567,7 @@ class SpottyDownloader:
             if self.aborted:
                 return
             ahead = self._bytes_ahead_locked()
-            if ahead < _BP_HIGH_BYTES:
+            if ahead < _BP_HIGH_BYTES and not self._retained_idle:
                 return
             readers = len(self._consumer_positions)
             self._bp_paused = True
@@ -373,8 +580,19 @@ class SpottyDownloader:
         )
         with self.cond:
             try:
-                while not self.aborted and self._bytes_ahead_locked() > _BP_LOW_BYTES:
-                    self.cond.wait(1.0)
+                while not self.aborted and not self.error and (
+                    self._retained_idle
+                    or self._bytes_ahead_locked() > _BP_LOW_BYTES
+                ):
+                    if self._retained_until is not None:
+                        remaining = self._retained_until - time.monotonic()
+                        if remaining <= 0:
+                            self.aborted = True
+                            self.cond.notify_all()
+                            break
+                        self.cond.wait(min(1.0, remaining))
+                    else:
+                        self.cond.wait(1.0)
             finally:
                 self._bp_paused = False
                 paused_for = time.monotonic() - paused_at
@@ -392,16 +610,19 @@ class SpottyDownloader:
             LOGDEBUG,
         )
 
-    def wait_for_real_pcm(self, target_real_pcm_bytes: int, timeout: float = None) -> bool:
+    def wait_for_real_pcm(self, target_real_pcm_bytes: int, timeout: float = None, cancelled=None) -> bool:
         """Wait for actual Spotty PCM, excluding the generated WAV header."""
         target = max(1, int(target_real_pcm_bytes))
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
         with self.cond:
+            if not (cancelled and cancelled()):
+                self._resume_for_target_locked(max(0, len(self.wav_header) - self.start_byte) + target)
             while (
                 self.real_pcm_bytes < target
                 and not self.is_finished
                 and not self.error
                 and not self.aborted
+                and not (cancelled and cancelled())
             ):
                 if deadline is None:
                     self.cond.wait(1.0)
@@ -410,7 +631,10 @@ class SpottyDownloader:
                 if remaining <= 0:
                     break
                 self.cond.wait(remaining)
-            return self.real_pcm_bytes >= target and not self.error and not self.aborted
+            return (
+                self.real_pcm_bytes >= target and not self.error and not self.aborted
+                and not (cancelled and cancelled())
+            )
 
     def _record_real_pcm_locked(self, byte_count: int) -> None:
         if byte_count <= 0:
@@ -448,18 +672,16 @@ class SpottyDownloader:
             args += ["--start-position", str(start_sec_wav)]
         return args, pcm_target_offset - start_sec_wav * PCM_BYTES_PER_SEC
 
-    def _resume_reference_locked(self, resume_byte: int):
+    def _resume_reference(self, resume_byte: int):
         """Already-written real PCM ending at the frame boundary at/before
-        *resume_byte*, or None when not enough of it is buffered.  Caller
-        holds self.cond."""
+        *resume_byte*, or None when insufficient committed PCM remains."""
         header_len = len(self.wav_header)
         frame_end = resume_byte - (resume_byte - header_len) % 4
         ref_start = frame_end - _RESUME_REF_BYTES
         buffer_start = self.start_byte + self._trim_offset
         if ref_start < max(buffer_start, header_len, self.start_byte):
             return None
-        index = ref_start - buffer_start
-        return bytes(self._buffer[index : index + _RESUME_REF_BYTES])
+        return self.read_range(ref_start - self.start_byte, _RESUME_REF_BYTES)
 
     def _read_prefix(self, process, size, attempt_state, attempt_state_lock) -> bytes:
         prefix = bytearray()
@@ -489,12 +711,15 @@ class SpottyDownloader:
         failures = 0
         while True:
             attempt += 1
+            self._wait_for_room({"bp_paused": False}, threading.Lock())
             if self.aborted:
+                self.cleanup()
                 return
 
             process = None
             pcm_bytes_read = 0
             attempt_exception = None
+            stopped_at_declared_end = False
             attempt_done = threading.Event()
             attempt_state_lock = threading.Lock()
             attempt_state = {
@@ -509,7 +734,11 @@ class SpottyDownloader:
             try:
                 with self.cond:
                     attempt_start_byte = self.start_byte + self.written_bytes
-                    resume_ref = self._resume_reference_locked(attempt_start_byte)
+                resume_ref = self._resume_reference(attempt_start_byte)
+                if self.error:
+                    raise OSError("PCM resume reference read failed")
+                if attempt > 0 and self._ever_retained and not resume_ref:
+                    raise ValueError("Retained PCM has no exact resume reference")
                 lead_sec = _RESUME_LEAD_SECONDS if resume_ref is not None else 0
                 args, pcm_skip = self._build_args(attempt_start_byte, lead_sec)
                 log_msg(
@@ -539,6 +768,31 @@ class SpottyDownloader:
                         if self.aborted:
                             return
                         now = time.monotonic()
+                        with self.cond:
+                            retained = self._retained_until
+                            retained_idle = self._retained_idle
+                        if retained_idle:
+                            if retained is not None and now >= retained:
+                                with self.cond:
+                                    expired = (
+                                        self._retained_idle and self._retained_until is not None
+                                        and now >= self._retained_until
+                                        and self.process is attempt_process
+                                        and not attempt_done.is_set()
+                                    )
+                                    if expired:
+                                        self.aborted = True
+                                        self.cond.notify_all()
+                                if expired:
+                                    try:
+                                        attempt_process.kill()
+                                    except Exception:
+                                        pass
+                                    return
+                            with attempt_state_lock:
+                                attempt_state["started_at"] = now
+                                attempt_state["last_output_at"] = now
+                            continue
                         with attempt_state_lock:
                             if attempt_state["timeout_reason"]:
                                 return
@@ -610,6 +864,8 @@ class SpottyDownloader:
                         nominal + _RESUME_SEARCH_AFTER_BYTES,
                     )
                     if match is None:
+                        if self._ever_retained:
+                            raise ValueError("Retained PCM resume has no content match")
                         log_msg(
                             f"Spotty resume for {self.track_id} at byte {attempt_start_byte}: "
                             f"no content match, using nominal skip {pcm_skip}.",
@@ -627,9 +883,9 @@ class SpottyDownloader:
                 elif pcm_skip > 0:
                     self._read_prefix(process, pcm_skip, attempt_state, attempt_state_lock)
 
-                while not self.aborted:
+                while not self.aborted and not self.error:
                     self._wait_for_room(attempt_state, attempt_state_lock)
-                    if self.aborted:
+                    if self.aborted or self.error:
                         break
                     if pending:
                         chunk, pending = pending, b""
@@ -639,20 +895,23 @@ class SpottyDownloader:
                         break
                     if self.aborted:
                         break
+                    with self.cond:
+                        remaining = self.track_length - self.start_byte - self.written_bytes
+                    chunk = chunk[:remaining]
+                    if not chunk:
+                        break
                     pcm_bytes_read += len(chunk)
                     with attempt_state_lock:
                         attempt_state["has_real_pcm"] = True
                         attempt_state["last_output_at"] = time.monotonic()
-                    with self.cond:
-                        self._buffer.extend(chunk)
-                        self.written_bytes += len(chunk)
-                        self._record_real_pcm_locked(len(chunk))
-                        if len(self._buffer) > self._peak_buffer_bytes:
-                            self._peak_buffer_bytes = len(self._buffer)
-                        self._trim_head_locked()
-                        self.cond.notify_all()
+                    self._append(chunk, real_pcm=True)
+                    if self.written_bytes >= self.track_length - self.start_byte:
+                        break
 
                 if process.poll() is None and not self.aborted:
+                    if self.written_bytes >= self.track_length - self.start_byte:
+                        process.kill()
+                        stopped_at_declared_end = True
                     process.wait(timeout=2.0)
 
             except Exception as exc:
@@ -666,6 +925,10 @@ class SpottyDownloader:
                             process.kill()
                     except Exception:
                         pass
+                    try:
+                        process.wait(timeout=0.5)
+                    except Exception:
+                        pass
                 if watchdog_thread is not None:
                     # A retry must not start until the prior attempt's watchdog
                     # has exited; combined with the value-captured process this
@@ -676,6 +939,12 @@ class SpottyDownloader:
                     stderr_tail.join()
 
             if self.aborted:
+                self.cleanup()
+                return
+            if self.error:
+                with self.cond:
+                    self.is_finished = True
+                    self.cond.notify_all()
                 return
 
             rc = getattr(process, "returncode", None) if process else -1
@@ -684,6 +953,8 @@ class SpottyDownloader:
                     rc = process.wait(timeout=0.5)
                 except Exception:
                     rc = -1
+            if stopped_at_declared_end and attempt_exception is None:
+                rc = 0
             with attempt_state_lock:
                 timeout_reason = attempt_state["timeout_reason"]
             diagnostics = stderr_tail.snapshot() if stderr_tail is not None else ""
@@ -703,6 +974,13 @@ class SpottyDownloader:
             )
             if terminal_cause not in ("auth", "premium"):
                 terminal_cause = None
+            if self._ever_retained and isinstance(attempt_exception, ValueError):
+                with self.cond:
+                    self.error = True
+                    self.failure_cause = "resume"
+                    self.is_finished = True
+                    self.cond.notify_all()
+                return
             if diagnostics and (retryable_finish or rc != 0):
                 log_msg(
                     f"Spotty diagnostic tail for {self.track_id}, attempt {attempt + 1}: "
@@ -750,6 +1028,19 @@ class SpottyDownloader:
                         return
                 continue
 
+            if (
+                terminal_cause is None and not timeout_reason and attempt_exception is None
+                and pcm_bytes_read > 0 and rc == 0
+                and 0 < remaining <= _SHORT_FINISH_PADDING_MAX_BYTES
+            ):
+                try:
+                    while remaining > 0 and not self.aborted:
+                        padding = bytes(min(remaining, _STDOUT_READ_BYTES))
+                        self._append(padding)
+                        remaining -= len(padding)
+                except OSError:
+                    pass
+
             # Normal finish or final retry failure.
             with self.cond:
                 if not self.aborted:
@@ -778,21 +1069,13 @@ class SpottyDownloader:
                         )
                         self.error = True
                     elif remaining > 0:
-                        if rc == 0 and remaining <= _SHORT_FINISH_PADDING_MAX_BYTES:
-                            log_msg(
-                                f"Padding {remaining} bytes to end of {self.track_id}"
-                                f" (spotty exited cleanly but short)",
-                            )
-                            self._buffer.extend(bytes(remaining))
-                            self.written_bytes += remaining
-                        else:
-                            log_msg(
-                                f"Spotty ended {remaining} bytes short for {self.track_id}"
-                                f" after {self._MAX_SESSION_RETRIES} retries (rc={rc})."
-                                f" Marking downloader as errored.",
-                                LOGWARNING,
-                            )
-                            self.error = True
+                        log_msg(
+                            f"Spotty ended {remaining} bytes short for {self.track_id}"
+                            f" after {self._MAX_SESSION_RETRIES} retries (rc={rc})."
+                            f" Marking downloader as errored.",
+                            LOGWARNING,
+                        )
+                        self.error = True
                     elif rc != 0:
                         log_msg(
                             f"Spotty exited with code {rc} for {self.track_id},"
@@ -835,6 +1118,8 @@ class SpottyDownloader:
         memmove.  The unread-tail cap is insurance
         for the no-reader case; backpressure keeps the buffer below it.
         """
+        if self._file_store is not None:
+            return
         safe_consumed_pos = (
             min(self._consumer_positions.values())
             if self._consumer_positions
@@ -855,6 +1140,12 @@ class SpottyDownloader:
 
     def cleanup(self):
         self.abort()
+        with self._start_lock:
+            if self._file_store is not None:
+                self._file_store.close()
+        thread = self.thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
         with self.cond:
             self._buffer.clear()
             self._consumed_pos = 0
@@ -864,23 +1155,29 @@ class SpottyDownloader:
             self.first_real_pcm_monotonic = None
             self.last_progress_monotonic = None
 
-    def wait_for_bytes(self, target_bytes: int, timeout: float = None) -> bool:
+    def wait_for_bytes(self, target_bytes: int, timeout: float = None, cancelled=None) -> bool:
         with self.cond:
-            start_time = time.time()
+            if not (cancelled and cancelled()):
+                self._resume_for_target_locked(target_bytes)
+            start_time = time.monotonic()
             while (
                 self.written_bytes < target_bytes
                 and not self.is_finished
                 and not self.error
                 and not self.aborted
+                and not (cancelled and cancelled())
             ):
                 if timeout:
-                    elapsed = time.time() - start_time
+                    elapsed = time.monotonic() - start_time
                     if elapsed >= timeout:
                         break
                     self.cond.wait(timeout - elapsed)
                 else:
                     self.cond.wait(1.0)
-            return self.written_bytes >= target_bytes or self.is_finished
+            return (
+                (self.written_bytes >= target_bytes or self.is_finished)
+                and not (cancelled and cancelled())
+            )
 
 
 # With no reader attached the buffer holds at most HIGH (+ one stdout read)
@@ -901,198 +1198,216 @@ assert (
 class SpottyCacheManager:
     _instances = {}
     _lock = threading.Lock()
-    _recent_tracks = []
+    _closed = False
+    _current_key = None
+    _prebuffer_key = None
     _MAX_CACHE_BYTES = 64 * 1024 * 1024
+    _MAX_FILE_BYTES = 256 * 1024 * 1024
+    _file_bytes = 0
+    _quota_lock = threading.Lock()
 
     @classmethod
-    def _enforce_memory_budget_locked(cls, protected_keys=()):
-        total_bytes = 0
-        candidates = []
-        recent_order = {track_id: index for index, track_id in enumerate(cls._recent_tracks)}
-        protected_track = cls._recent_tracks[-1] if cls._recent_tracks else None
+    def _release_file(cls, capacity):
+        with cls._quota_lock:
+            cls._file_bytes -= capacity
 
-        for key, inst in cls._instances.items():
-            cond = getattr(inst, "cond", None)
-            if cond is None:
-                continue
-            with cond:
-                buffer_size = len(getattr(inst, "_buffer", ()))
-                total_bytes += buffer_size
-                has_active_consumers = bool(
-                    getattr(inst, "_consumer_positions", {})
-                )
-                is_terminal = bool(
-                    inst.is_finished or inst.error or inst.aborted
-                )
-            if (
-                is_terminal
-                and not has_active_consumers
-                and key not in protected_keys
-                and key[0] != protected_track
-            ):
-                candidates.append(
-                    (recent_order.get(key[0], -1), key, inst, buffer_size)
-                )
-
-        candidates.sort(key=lambda candidate: candidate[0])
-        for _recent_index, key, inst, _buffer_size in candidates:
-            if total_bytes <= cls._MAX_CACHE_BYTES:
-                break
-            with inst.cond:
-                if cls._instances.get(key) is not inst:
-                    continue
-                if getattr(inst, "_consumer_positions", {}) or not (
-                    inst.is_finished or inst.error or inst.aborted
-                ):
-                    continue
-                buffer_size = len(getattr(inst, "_buffer", ()))
-                inst.aborted = True
-                if hasattr(inst, "_buffer"):
-                    inst._buffer.clear()
-                if hasattr(inst, "_trim_offset"):
-                    inst._trim_offset = 0
-                inst.cond.notify_all()
-                del cls._instances[key]
-            total_bytes -= buffer_size
-
-        active_ids = {key[0] for key in cls._instances}
-        cls._recent_tracks = [
-            track_id for track_id in cls._recent_tracks if track_id in active_ids
-        ]
+    @classmethod
+    def _open_store(cls, capacity):
+        with cls._quota_lock:
+            if capacity <= 0 or cls._file_bytes + capacity > cls._MAX_FILE_BYTES:
+                return None
+            cls._file_bytes += capacity
+        try:
+            return _PCMFile(capacity, cls._release_file)
+        except BaseException:
+            cls._release_file(capacity)
+            raise
 
     @classmethod
     def enforce_memory_budget(cls):
+        retired = []
         with cls._lock:
-            cls._enforce_memory_budget_locked()
+            total = sum(len(value._buffer) for value in cls._instances.values())
+            candidates = sorted(cls._instances.items(), key=lambda pair: pair[1].created_monotonic)
+            for key, candidate in candidates:
+                with candidate.cond:
+                    readers = bool(candidate._consumer_positions)
+                    terminal = candidate.is_finished or candidate.error or candidate.aborted
+                    size = len(candidate._buffer)
+                owned = key in (cls._current_key, cls._prebuffer_key)
+                if readers or owned:
+                    continue
+                if terminal or total > cls._MAX_CACHE_BYTES:
+                    retired.append(candidate)
+                    del cls._instances[key]
+                    total -= size
+        for candidate in retired:
+            candidate.cleanup()
 
     @classmethod
     def get_or_start(
-        cls,
-        spotty: Spotty,
-        track_id: str,
-        duration_sec: float,
-        start_byte: int,
-        bitrate: str,
-        norm: str,
-        volume: int,
-        wav_header: bytes,
-        track_length: int,
-        allow_abort_others: bool = True,
+        cls, spotty: Spotty, track_id: str, duration_sec: float, start_byte: int,
+        bitrate: str, norm: str, volume: int, wav_header: bytes, track_length: int,
+        allow_abort_others: bool = True, request_byte=None, cancelled=None,
     ) -> SpottyDownloader:
-        with cls._lock:
-            if track_id in cls._recent_tracks:
-                cls._recent_tracks.remove(track_id)
-            cls._recent_tracks.append(track_id)
+        from spotty_audio_streamer import SpottyStreamSpec
 
-            key = (track_id, start_byte)
-            if key in cls._instances:
-                inst = cls._instances[key]
-                readable_start = inst.start_byte + getattr(inst, "_trim_offset", 0)
-                if not inst.aborted and not inst.error and readable_start <= start_byte:
-                    return inst
-                else:
-                    inst.cleanup()
-                    del cls._instances[key]
-
-            if not allow_abort_others:
-                for k, other in list(cls._instances.items()):
-                    if k != key and not other.is_finished and not other.aborted and not other.error:
-                        log_msg(
-                            f"Deferring download for {track_id}: active downloader "
-                            f"{k[0]} is still running.",
-                            LOGDEBUG,
-                        )
-                        cls._recent_tracks = [t for t in cls._recent_tracks if t != track_id]
-                        return None
-
-            inst = SpottyDownloader(
-                spotty,
-                track_id,
-                duration_sec,
-                start_byte,
-                bitrate,
-                norm,
-                volume,
-                wav_header,
-                track_length,
+        spec = SpottyStreamSpec(track_id, duration_sec, wav_header, track_length,
+                                bitrate, norm, _clamp_volume(volume))
+        identity = _account_identity(spotty)
+        if identity is None:
+            return None
+        key = (track_id, start_byte)
+        request_byte = start_byte if request_byte is None else request_byte
+        acquisition_owner = object()
+        while True:
+            if cancelled and cancelled():
+                return None
+            with cls._lock:
+                if cls._closed:
+                    return None
+                existing = cls._instances.get(key)
+            compatible = (
+                existing is not None and existing.matches(spec, identity)
+                and existing.reusable()
+                and existing.start_byte + existing._trim_offset <= request_byte
             )
-            cls._instances[key] = inst
-
-            if allow_abort_others:
-                # Abort all other still-running downloads before starting this one.
-                # librespot only allows one active Spotify stream per account; a second
-                # spotty process connecting kicks the first (and vice-versa), causing a
-                # mutual-kick loop that leaves every track with only the 44-byte WAV header.
-                for k, other in list(cls._instances.items()):
-                    if k != key and not other.is_finished and not other.aborted:
-                        other.abort()
-
-            inst.start()
-
-            # Keep only the 3 most recent tracks in memory
-            tracks_to_keep = set(cls._recent_tracks[-3:])
-            for k in list(cls._instances.keys()):
-                inst = cls._instances[k]
-                has_active_consumers = False
-                cond = getattr(inst, "cond", None)
-                if cond is not None and hasattr(inst, "_consumer_positions"):
-                    with cond:
-                        has_active_consumers = bool(inst._consumer_positions)
-                if has_active_consumers:
+            candidate = existing if compatible else SpottyDownloader(
+                spotty, track_id, duration_sec, start_byte, bitrate, norm, volume,
+                wav_header, track_length,
+            )
+            retired = []
+            with cls._lock:
+                if cls._closed:
+                    return None
+                if cls._instances.get(key) is not existing:
                     continue
-                if k[0] not in tracks_to_keep:
-                    inst.cleanup()
-                    del cls._instances[k]
-
-            # Trim _recent_tracks to only entries with active instances; prevents
-            # unbounded list growth and ensures stale track IDs can't skew eviction.
-            active_ids = {k[0] for k in cls._instances}
-            cls._recent_tracks = [t for t in cls._recent_tracks if t in active_ids]
-            cls._enforce_memory_budget_locked(protected_keys={key})
-
-            return inst
-
-    @classmethod
-    def find_active_downloader(cls, track_id: str):
-        """Return the downloader that best represents live playback for a track.
-
-        Unlike find_best_downloader(), this lookup is intentionally independent
-        of whether byte zero (or any other requested range) has been trimmed.
-        Active consumers take priority, followed by real-PCM/running state and
-        the most recent seek origin.
-        """
-        with cls._lock:
-            best = None
-            best_score = None
-            for key, inst in cls._instances.items():
-                if key[0] != track_id:
-                    continue
-                with inst.cond:
-                    if inst.aborted or inst.error:
+                if cancelled and cancelled():
+                    return None
+                if not allow_abort_others:
+                    if identity is None or key == cls._current_key or any(
+                        other is not existing and not other.is_finished
+                        and not other.aborted and not other.error
+                        for other in cls._instances.values()
+                    ):
+                        return None
+                if existing is not None and not compatible:
+                    retired.append(existing)
+                for other_key, other in list(cls._instances.items()):
+                    if other_key == key:
                         continue
-                    score = (
-                        bool(inst._consumer_positions),
-                        int(getattr(inst, "real_pcm_bytes", 0) or 0) > 0,
-                        not inst.is_finished,
-                        int(inst.start_byte),
-                    )
-                if best_score is None or score > best_score:
-                    best = inst
-                    best_score = score
-            return best
+                    with other.cond:
+                        readers = bool(other._consumer_positions)
+                        active = (
+                            not other.is_finished and not other.aborted
+                            and other.written_bytes < other.track_length - other.start_byte
+                        )
+                    if allow_abort_others and (active or not readers):
+                        retired.append(other)
+                        del cls._instances[other_key]
+                    elif not allow_abort_others and other_key != cls._current_key and not readers:
+                        retired.append(other)
+                        del cls._instances[other_key]
+                cls._instances[key] = candidate
+                if allow_abort_others:
+                    cls._current_key = key
+                    cls._prebuffer_key = None
+                else:
+                    cls._prebuffer_key = key
+                candidate._acquisition_owner = acquisition_owner
+                candidate._file_admission = identity is not None
+                candidate._optional = not allow_abort_others
+            for other in retired:
+                other.cleanup()
+            started = candidate.start()
+            with cls._lock:
+                closed = cls._closed
+            cancelled_now = closed or bool(cancelled and cancelled())
+            if started is False or cancelled_now:
+                dispose = False
+                with cls._lock:
+                    if cls._instances.get(key) is candidate and (
+                        candidate._acquisition_owner is acquisition_owner
+                    ):
+                        del cls._instances[key]
+                        if cls._prebuffer_key == key:
+                            cls._prebuffer_key = None
+                        dispose = True
+                if dispose:
+                    candidate.cleanup()
+                return None
+            cls.enforce_memory_budget()
+            return candidate
 
     @classmethod
-    def find_best_downloader(cls, track_id: str, request_byte: int):
+    def find_active_downloader(cls, track_id: str, stream_spec=None, spotty=None):
+        """Find healthy playback independently of the readable range."""
+        identity = _account_identity(spotty) if spotty is not None else None
         with cls._lock:
-            best = None
-            for k, inst in cls._instances.items():
-                if k[0] == track_id and not inst.aborted and not inst.error:
-                    if inst.start_byte <= request_byte:
-                        # Skip downloaders that have trimmed past the requested byte.
-                        if inst.start_byte + inst._trim_offset <= request_byte:
-                            if best is None or inst.start_byte > best.start_byte:
-                                best = inst
-            return best
+            candidates = [value for key, value in cls._instances.items() if key[0] == track_id]
+        best = None
+        best_score = None
+        for candidate in candidates:
+            if stream_spec is not None and not candidate.matches(stream_spec, identity):
+                continue
+            if not candidate.reusable():
+                continue
+            with candidate.cond:
+                score = (
+                    bool(candidate._consumer_positions), candidate.real_pcm_bytes > 0,
+                    not candidate.is_finished, candidate.start_byte,
+                )
+            if best_score is None or score > best_score:
+                best, best_score = candidate, score
+        return best
+
+    @classmethod
+    def find_best_downloader(cls, track_id: str, request_byte: int, stream_spec=None, spotty=None):
+        identity = _account_identity(spotty) if spotty is not None else None
+        with cls._lock:
+            candidates = [value for key, value in cls._instances.items() if key[0] == track_id]
+        best = None
+        for candidate in candidates:
+            if stream_spec is not None and not candidate.matches(stream_spec, identity):
+                continue
+            if not candidate.reusable():
+                continue
+            with candidate.cond:
+                readable = candidate.start_byte + candidate._trim_offset <= request_byte
+            if readable and (best is None or candidate.start_byte > best.start_byte):
+                best = candidate
+        return best
+
+    @classmethod
+    def retain_after_stop(cls, stream_spec):
+        with cls._lock:
+            candidates = list(cls._instances.items())
+        retained = None
+        for key, candidate in candidates:
+            matches = (
+                candidate.matches(stream_spec, _account_identity(candidate.spotty))
+                if stream_spec is not None else candidate._ever_retained
+            )
+            if retained is None and matches and candidate.retain_after_stop():
+                retained = candidate
+        with cls._lock:
+            retired = []
+            for key, candidate in list(cls._instances.items()):
+                if candidate is not retained:
+                    retired.append(candidate)
+                    del cls._instances[key]
+            cls._current_key = (retained.track_id, retained.start_byte) if retained is not None else None
+            cls._prebuffer_key = None
+        for candidate in retired:
+            candidate.cleanup()
+        return retained is not None
+
+    @classmethod
+    def notify_readers(cls):
+        with cls._lock:
+            candidates = list(cls._instances.values())
+        for candidate in candidates:
+            candidate.notify_readers()
 
     @classmethod
     def get_failure_cause(cls, track_id: str) -> Optional[str]:
@@ -1110,9 +1425,14 @@ class SpottyCacheManager:
         return None
 
     @classmethod
-    def cleanup_all(cls):
+    def cleanup_all(cls, shutdown=False):
         with cls._lock:
-            for inst in cls._instances.values():
-                inst.cleanup()
+            if shutdown:
+                cls._closed = True
+            candidates = list(cls._instances.values())
             cls._instances.clear()
-            cls._recent_tracks.clear()
+            cls._current_key = None
+            cls._prebuffer_key = None
+        for candidate in candidates:
+            candidate.cleanup()
+        return bool(candidates)

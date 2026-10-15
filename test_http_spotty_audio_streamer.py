@@ -60,18 +60,20 @@ class FakeAddon:
 
 
 class FakeStreamSpec:
-    def __init__(self, track_id, duration, bitrate="320", normalization="auto"):
+    def __init__(self, track_id, duration, wav_header=None, track_length=None,
+                 bitrate="320", normalization="auto", initial_volume=35):
         self.track_id = track_id
-        self.track_duration = int(max(1, duration or 1))
-        self.wav_header = b"0" * 44
-        self.track_length = 44 + int(self.track_duration * 176400)
+        self.track_duration = float(max(1, duration or 1))
+        self.wav_header = wav_header or b"0" * 44
+        self.track_length = track_length or 44 + int(self.track_duration * 176400)
         self.bitrate = bitrate
         self.normalization_gain_type = normalization
-        self.initial_volume = 35
+        self.initial_volume = initial_volume
 
 
 class FakeSpottyAudioStreamer:
     def __init__(self, spotty):
+        self.initial_volume = 35
         self.normalization_gain_type = "auto"
         self.use_autoplay = False
         self.bitrate = "320"
@@ -95,6 +97,12 @@ class FakeSpottyAudioStreamer:
         self.terminate_generation += 1
         return True
 
+    def get_stream_generation(self):
+        return self.terminate_generation
+
+    def _is_terminated(self, generation):
+        return self.terminate_generation != generation
+
     def set_track(self, track_id, duration):
         self.track_id = track_id
         self.duration = duration
@@ -107,8 +115,8 @@ class FakeSpottyAudioStreamer:
         return FakeStreamSpec(
             self.track_id,
             self.duration,
-            self.bitrate,
-            self.normalization_gain_type,
+            bitrate=self.bitrate,
+            normalization=self.normalization_gain_type,
         )
 
     def restore_stream_spec(self, stream_spec):
@@ -117,7 +125,7 @@ class FakeSpottyAudioStreamer:
         self.bitrate = stream_spec.bitrate
         self.normalization_gain_type = stream_spec.normalization_gain_type
 
-    def send_part_audio_stream(self, range_len, range_begin, stream_spec=None):
+    def send_part_audio_stream(self, range_len, range_begin, stream_spec=None, downloader=None, stream_generation=None):
         captured_spec = stream_spec or self.get_stream_spec()
         captured_generation = self.terminate_generation
 
@@ -129,7 +137,10 @@ class FakeSpottyAudioStreamer:
 
         return generate()
 
-    def prepare_part_audio_stream(self, range_begin, stream_spec=None):
+    def _get_or_start_downloader(self, stream_spec, range_begin, stream_generation=None):
+        return ActiveDownloader()
+
+    def prepare_part_audio_stream(self, range_begin, stream_spec=None, downloader=None, stream_generation=None):
         self.prepare_calls.append(range_begin)
         self.prepare_entered.set()
         if self.prepare_release is not None:
@@ -208,6 +219,9 @@ class ActiveDownloader:
         self._has_recent_progress = has_recent_progress
         self.cleanup_calls = 0
 
+    def identity_valid(self):
+        return True
+
     def has_real_pcm(self):
         return self._has_real_pcm
 
@@ -223,7 +237,7 @@ class FakeSpottyCacheManager:
     active_downloader = ActiveDownloader()
 
     @classmethod
-    def find_best_downloader(cls, track_id, request_byte):
+    def find_best_downloader(cls, track_id, request_byte, stream_spec=None, spotty=None):
         if track_id == "current-track":
             return cls.active_downloader
         return None
@@ -231,14 +245,14 @@ class FakeSpottyCacheManager:
 
 class MissingSpottyCacheManager:
     @classmethod
-    def find_best_downloader(cls, track_id, request_byte):
+    def find_best_downloader(cls, track_id, request_byte, stream_spec=None, spotty=None):
         return None
 
 
 def install_downloader_cache(downloader, track_id="current-track", start_byte=0):
     class FixedSpottyCacheManager:
         @classmethod
-        def find_best_downloader(cls, requested_track_id, request_byte):
+        def find_best_downloader(cls, requested_track_id, request_byte, stream_spec=None, spotty=None):
             if requested_track_id == track_id and start_byte <= request_byte:
                 return downloader
             return None
@@ -251,12 +265,12 @@ def install_downloader_cache(downloader, track_id="current-track", start_byte=0)
 def install_trimmed_active_cache(downloader, track_id="current-track"):
     class TrimAwareSpottyCacheManager:
         @classmethod
-        def find_best_downloader(cls, requested_track_id, request_byte):
+        def find_best_downloader(cls, requested_track_id, request_byte, stream_spec=None, spotty=None):
             # Byte zero has already been trimmed and is no longer readable.
             return None
 
         @classmethod
-        def find_active_downloader(cls, requested_track_id):
+        def find_active_downloader(cls, requested_track_id, stream_spec=None, spotty=None):
             return downloader if requested_track_id == track_id else None
 
     spotty_cache = types.ModuleType("spotty_cache")
@@ -353,7 +367,7 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
             server_thread.start()
             for begin, end in ((0, 3), (0, 51), (20, 51), (44, 51), (47, 51)):
                 with self.subTest(begin=begin, end=end):
-                    streamer.release_stream(fixture.cache.SpottyCacheManager.cleanup_all)
+                    streamer.release_stream(lambda spec: fixture.cache.SpottyCacheManager.cleanup_all())
                     release_bulk.clear()
                     first_frame.clear()
                     received = []
@@ -393,7 +407,7 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
         finally:
             release_bulk.set()
             if server is not None:
-                streamer.release_stream(fixture.cache.SpottyCacheManager.cleanup_all)
+                streamer.release_stream(lambda spec: fixture.cache.SpottyCacheManager.cleanup_all())
                 server.shutdown()
                 server.server_close()
                 server_thread.join(2)
@@ -415,7 +429,7 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
                     result = streamer.spotty_stream_audio_track("partial", "1.wav")
                     self.assertEqual(503, fixture.http.bottle.response.status)
                     self.assertIsInstance(result, str)
-                    streamer.release_stream(fixture.cache.SpottyCacheManager.cleanup_all)
+                    streamer.release_stream(lambda spec: fixture.cache.SpottyCacheManager.cleanup_all())
         finally:
             fixture.tearDown()
 
@@ -457,7 +471,7 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
         notices.clear()
         FakeWindow.properties["Spotify.PlayQueue.SessionId"] = "replacement-session"
         response = streamer.spotty_stream_audio_track("next", "180.wav")
-        streamer.release_stream(lambda: None)
+        streamer.release_stream(lambda spec: None)
         list(response)
         self.assertEqual([], notices)
 
@@ -702,7 +716,7 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
         import spotty_cache
 
         downloader = spotty_cache.SpottyDownloader(
-            spotty=object(),
+            spotty=types.SimpleNamespace(get_spotty_credentials_identity=lambda: ("fixture", 1)),
             track_id="current-track",
             duration_sec=600,
             start_byte=0,
@@ -748,7 +762,7 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
             )
         finally:
             manager._instances.clear()
-            manager._recent_tracks.clear()
+            manager._current_key = None
 
     def test_finished_healthy_downloader_allows_queued_handoff(self):
         module = import_http_streamer()
@@ -1097,7 +1111,7 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
         def request_replay():
             replays.append(streamer.spotty_stream_audio_track("replay-track", "180.wav"))
 
-        def release_resources():
+        def release_resources(spec):
             # A replay that arrives during the release waits for the release.
             thread = threading.Thread(target=request_replay, daemon=True)
             thread.start()
@@ -1129,7 +1143,7 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
         finish = threading.Event()
         second_cleanup = []
 
-        def first_cleanup():
+        def first_cleanup(spec):
             entered.set()
             finish.wait(timeout=2)
 
@@ -1137,7 +1151,7 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
         thread.start()
         try:
             self.assertTrue(entered.wait(timeout=1))
-            streamer.release_stream(lambda: second_cleanup.append(True))
+            streamer.release_stream(lambda spec: second_cleanup.append(True))
             self.assertEqual([], second_cleanup)
             self.assertTrue(streamer._HTTPSpottyAudioStreamer__init_in_progress)
             self.assertFalse(streamer._HTTPSpottyAudioStreamer__init_event.is_set())
@@ -1175,7 +1189,7 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
         self.assertTrue(fake_streamer.prepare_entered.wait(timeout=1.0))
         released = []
 
-        streamer.release_stream(lambda: released.append(True))
+        streamer.release_stream(lambda spec: released.append(True))
         fake_streamer.prepare_release.set()
         thread.join(timeout=1.0)
 
@@ -1237,7 +1251,7 @@ class HTTPRangeTests(unittest.TestCase):
         sent = []
         original_send = fake_streamer.send_part_audio_stream
 
-        def recording_send(range_len, range_begin, stream_spec=None):
+        def recording_send(range_len, range_begin, stream_spec=None, downloader=None, stream_generation=None):
             sent.append((range_begin, range_len))
             return original_send(range_len, range_begin, stream_spec=stream_spec)
 

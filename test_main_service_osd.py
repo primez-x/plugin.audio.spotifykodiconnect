@@ -1456,9 +1456,12 @@ class PlaybackStopReleaseTests(unittest.TestCase):
                 return playing
 
         class Streamer:
+            def stop(self):
+                events.append("stop_stream")
+
             def release_stream(self, release_resources):
                 events.append("release_stream")
-                release_resources()
+                release_resources(None)
                 return stream_held
 
         class Prebuffer:
@@ -1471,8 +1474,12 @@ class PlaybackStopReleaseTests(unittest.TestCase):
 
         class Manager:
             @staticmethod
-            def cleanup_all():
-                events.append("cleanup_all")
+            def retain_after_stop(spec):
+                events.append("retain_after_stop")
+
+            @staticmethod
+            def cleanup_all(shutdown=False):
+                events.append("shutdown_cache" if shutdown else "cleanup_all")
 
         spotty_cache = types.ModuleType("spotty_cache")
         spotty_cache.SpottyCacheManager = Manager
@@ -1492,9 +1499,40 @@ class PlaybackStopReleaseTests(unittest.TestCase):
         service._release_after_stop()
 
         # Spotify login and token processes are not stream processes: keep them.
-        self.assertEqual(["release_stream", "cancel_prebuffer", "cleanup_all"], events)
+        self.assertEqual(["release_stream", "cancel_prebuffer", "retain_after_stop"], events)
         # A deferred prebuffer for the stopped track must not start afterwards.
         self.assertEqual(8, service._prebuffer_token)
+
+    def test_shutdown_cancels_deferred_prebuffer_before_cache_cleanup(self):
+        main_service, service, events = self._service()
+        main_service.bottle_manager.stop_thread = lambda: events.append("stop_http")
+        main_service.SPOTIFY_ADDON.getSetting = lambda key: "true" if key == "prebuffer_enabled" else ""
+        main_service.get_next_playlist_item = lambda: (
+            {"file": "http://127.0.0.1:52309/track/current/180000ms"},
+            {"file": "http://127.0.0.1:52309/track/next/180000ms"},
+        )
+        pending = []
+        main_service._start_daemon_thread = lambda target, **kwargs: pending.append(target)
+        service._MainService__on_track_started = lambda *args: None
+        service._MainService__wait_for_prebuffer_window = lambda *args: True
+        service._get_prebuffer_release_delay = lambda: 0
+        service._watch_prebuffer_result = lambda *args: None
+        service._MainService__prebuffer_manager.start_prebuffer = (
+            lambda *args, **kwargs: events.append("start_prebuffer")
+        )
+        sys.modules["spotty_cache"].SpottyCacheManager.find_active_downloader = lambda track_id: None
+        service._MainService__on_spotify_playback_started("current")
+        self.assertEqual(1, len(pending))
+
+        service._MainService__close()
+        with patch.object(main_service.time, "sleep"):
+            pending[0]()
+
+        self.assertEqual(9, service._prebuffer_token)
+        self.assertEqual(
+            ["cancel_prebuffer", "stop_stream", "shutdown_cache", "kill_all_spotties", "stop_http"],
+            events,
+        )
 
     def test_late_stop_callback_leaves_replacement_playback_alone(self):
         _main_service, service, events = self._service(playing=True)

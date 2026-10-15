@@ -719,38 +719,30 @@ class MainService:
             if monitor.waitForAbort(PREBUFFER_REMAINING_POLL_SECONDS):
                 return False
 
-    def __release_audio(self) -> bool:
-        """Release the stream, the stream downloaders, Spotty processes and prebuffering.
-
-        The streamer holds new stream requests until the release completes, so a
-        request can never start on, or reuse, the released resources.  Return
-        whether a Spotify stream track was released.
-        """
+    def __release_audio(self, retain_after_stop=False) -> bool:
+        """Retire playback under the HTTP reservation and release unneeded PCM."""
         from spotty_cache import SpottyCacheManager
 
-        def release_resources():
+        def release_resources(released_spec):
             # Cancel any deferred prebuffer threads and the prebuffer state.
             with self._prebuffer_token_lock:
                 self._prebuffer_token += 1
             self.__prebuffer_manager.cancel_prebuffer()
-            # Abort all background downloaders and kill their spotty subprocesses.
-            SpottyCacheManager.cleanup_all()
+            if retain_after_stop:
+                return SpottyCacheManager.retain_after_stop(released_spec)
+            return SpottyCacheManager.cleanup_all()
 
         return self.__http_spotty_streamer.release_stream(release_resources)
 
     def _release_after_stop(self) -> None:
-        """Release Spotify audio when the user stops playback.
+        """Retire a stopped generation and retain one eligible PCM producer.
 
-        Without this, the stopped track's stream state and Spotty process stayed
-        alive until the next selection, which then inherited them.  A stop
-        callback can arrive after a replacement selection has started; Kodi then
-        reports playback, or the replacement's stream startup is in progress, and
-        the replacement keeps the replacement stream.
+        A late Stop callback preserves replacement playback or startup.
         """
         if _is_kodi_playing():
             return
-        if self.__release_audio():
-            log_msg("Playback stopped: released Spotify audio resources.", LOGINFO)
+        if self.__release_audio(retain_after_stop=True):
+            log_msg("Playback stopped: retired Spotify playback and retained eligible audio.", LOGINFO)
 
     def _teardown_for_external_playback(self) -> None:
         """Tear down all Spotify audio resources when a non-Spotify player starts.
@@ -966,6 +958,7 @@ class MainService:
                     next_dur_now,
                     bitrate=bitrate,
                     normalization_gain_type=norm,
+                    cancelled=lambda: self._prebuffer_token != my_token,
                 )
                 _start_daemon_thread(
                     self._watch_prebuffer_result,
@@ -1138,12 +1131,14 @@ class MainService:
         log_msg("Shutdown requested.")
         from spotty_cache import SpottyCacheManager
 
-        SpottyCacheManager.cleanup_all()
+        with self._prebuffer_token_lock:
+            self._prebuffer_token += 1
+        self.__prebuffer_manager.cancel_prebuffer()
+        self.__http_spotty_streamer.stop()
+        SpottyCacheManager.cleanup_all(shutdown=True)
         keepalive = getattr(self, "_MainService__cache_keepalive", None)
         if keepalive is not None:
             keepalive.close()
-        self.__prebuffer_manager.cancel_prebuffer()
-        self.__http_spotty_streamer.stop()
         self.__spotty_helper.kill_all_spotties()
         bottle_manager.stop_thread()
         log_msg("Main service stopped.")

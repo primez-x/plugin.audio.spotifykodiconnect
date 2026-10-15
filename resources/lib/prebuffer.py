@@ -42,6 +42,7 @@ class PrebufferManager:
         self.__lock = threading.Lock()
         self.__prebuffer_track_id: Optional[str] = None
         self.__prebuffer_downloader = None
+        self.__prebuffer_request = None
 
     def start_prebuffer(
         self,
@@ -49,6 +50,7 @@ class PrebufferManager:
         duration_sec: float,
         bitrate: Optional[str] = None,
         normalization_gain_type: Optional[str] = None,
+        cancelled=None,
     ):
         """Start filling the pre-buffer for the given track in a background thread."""
         br = bitrate if bitrate is not None else self.__bitrate
@@ -56,9 +58,9 @@ class PrebufferManager:
         if norm not in ("off", "auto", "track", "album"):
             norm = "auto"
 
+        request = object()
         with self.__lock:
-            if self.__prebuffer_track_id == track_id:
-                return None
+            self.__prebuffer_request = request
             self.__prebuffer_track_id = track_id
             self.__prebuffer_downloader = None
 
@@ -76,16 +78,17 @@ class PrebufferManager:
             wav_header,
             track_length,
             allow_abort_others=False,
+            cancelled=lambda: self.__prebuffer_request is not request or bool(cancelled and cancelled()),
         )
         if downloader is None:
             with self.__lock:
-                if self.__prebuffer_track_id == track_id:
+                if self.__prebuffer_request is request:
                     self.__prebuffer_track_id = None
                     self.__prebuffer_downloader = None
             log_msg(f"Prebuffer for {track_id} deferred; active stream still owns cache", LOGDEBUG)
         else:
             with self.__lock:
-                if self.__prebuffer_track_id == track_id:
+                if self.__prebuffer_request is request:
                     self.__prebuffer_downloader = downloader
         return downloader
 
@@ -119,7 +122,7 @@ class PrebufferManager:
                 return int(written_bytes or 0) > header_bytes_in_buffer
             return bool(method_result)
 
-    def get_and_clear_prebuffer(self, track_id: str) -> Tuple[Optional[PrebufferResult], bool]:
+    def get_and_clear_prebuffer(self, track_id: str, stream_spec=None) -> Tuple[Optional[PrebufferResult], bool]:
         """Return prebuffer result for *track_id* and clear internal state.
 
         With the disk cache, we just return empty bytes to signify a 'hit'
@@ -130,10 +133,14 @@ class PrebufferManager:
                 return None, False
 
             downloader = self.__prebuffer_downloader
+            self.__prebuffer_request = None
             self.__prebuffer_track_id = None
             self.__prebuffer_downloader = None
 
-        if not self._has_real_pcm(downloader):
+        compatible = downloader is not None and downloader.identity_valid()
+        if compatible and stream_spec is not None:
+            compatible = downloader.matches(stream_spec, downloader.account_identity)
+        if not compatible or not self._has_real_pcm(downloader):
             try:
                 if downloader is not None:
                     downloader.cleanup()
@@ -147,6 +154,7 @@ class PrebufferManager:
     def cancel_prebuffer(self) -> None:
         """Stop any running pre-buffer and clear state. The SpottyCacheManager handles its own cleanup."""
         with self.__lock:
+            self.__prebuffer_request = None
             self.__prebuffer_track_id = None
             self.__prebuffer_downloader = None
 

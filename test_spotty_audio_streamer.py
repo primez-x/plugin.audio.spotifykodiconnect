@@ -6,10 +6,12 @@ import sys
 import threading
 import time
 import types
+import tempfile
 import unittest
 
 REPO_ROOT = os.path.dirname(__file__)
 LIB_DIR = os.path.join(REPO_ROOT, "resources", "lib")
+_TEST_PROFILE = tempfile.TemporaryDirectory(prefix="spotify-pcm-test-")
 
 
 def install_stubs():
@@ -30,7 +32,7 @@ def install_stubs():
     utils.kill_process_by_pid = lambda pid: None
     utils.log_msg = lambda *args, **kwargs: None
     utils.log_exception = lambda *args, **kwargs: None
-    utils.ADDON_DATA_PATH = REPO_ROOT
+    utils.ADDON_DATA_PATH = _TEST_PROFILE.name
     sys.modules["utils"] = utils
 
 
@@ -62,11 +64,27 @@ class FakeDownloader:
         self.cond = threading.Condition()
         self.wait_targets = []
 
-    def wait_for_bytes(self, target_bytes, timeout=None):
+    def wait_for_bytes(self, target_bytes, timeout=None, cancelled=None):
         self.wait_targets.append(target_bytes)
         if self.auto_fill and self.written_bytes < target_bytes:
             self._buffer.extend(bytes(target_bytes - self.written_bytes))
             self.written_bytes = target_bytes
+        return True
+
+    def attach_reader_locked(self, position):
+        consumer_id = self._next_consumer_id
+        self._next_consumer_id += 1
+        self._consumer_positions[consumer_id] = position
+        return consumer_id
+
+    def release_reader_locked(self, consumer_id):
+        self._consumer_positions.pop(consumer_id, None)
+
+    def read_range(self, offset, size):
+        index = offset - self._trim_offset
+        return bytes(self._buffer[index:index + size]) if index >= 0 else b""
+
+    def identity_valid(self):
         return True
 
     def _trim_head_locked(self):
@@ -188,6 +206,9 @@ class CoordinatedKillProcess(BlockingProcess):
 
 
 class SequenceSpotty:
+    def get_spotty_credentials_identity(self):
+        return ("fixture-account", 1)
+
     def __init__(self, processes):
         self.processes = list(processes)
         self.calls = []
@@ -198,6 +219,9 @@ class SequenceSpotty:
 
 
 class FakeSpotty:
+    def get_spotty_credentials_identity(self):
+        return ("fixture-account", 1)
+
     def __init__(self, payloads):
         self.payloads = list(payloads)
         self.calls = []
@@ -214,7 +238,7 @@ class FakeSpottyCacheManager:
     budget_calls = 0
 
     @classmethod
-    def find_best_downloader(cls, track_id, request_byte):
+    def find_best_downloader(cls, track_id, request_byte, stream_spec=None, spotty=None):
         return None
 
     @classmethod
@@ -238,6 +262,12 @@ class FakeSpottyCacheManager:
             }
         )
         return cls.downloader
+
+    @classmethod
+    def notify_readers(cls):
+        if cls.downloader is not None and hasattr(cls.downloader, "cond"):
+            with cls.downloader.cond:
+                cls.downloader.cond.notify_all()
 
     @classmethod
     def enforce_memory_budget(cls):
@@ -265,11 +295,20 @@ class ManagedFakeDownloader:
         self.error = False
         self.aborted = False
         self.started = False
+        self.created_monotonic = time.monotonic()
+        self.written_bytes = 0
+        self.track_length = track_length
         self.cond = threading.Condition()
         self._consumer_positions = {}
         self._buffer = bytearray()
         self._trim_offset = 0
         ManagedFakeDownloader.created.append(self)
+
+    def matches(self, spec, identity):
+        return False
+
+    def reusable(self):
+        return not self.aborted and not self.error
 
     def start(self):
         self.started = True
@@ -765,7 +804,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
 
     def test_generator_stops_when_downloader_aborted_without_data(self):
         class AbortWhileWaitingDownloader(FakeDownloader):
-            def wait_for_bytes(self, target_bytes, timeout=None):
+            def wait_for_bytes(self, target_bytes, timeout=None, cancelled=None):
                 self.wait_targets.append(target_bytes)
                 if self.written_bytes < target_bytes:
                     # The real wait_for_bytes() returns immediately once
@@ -1011,7 +1050,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
 
         wav_header, track_length = self.module.create_wav_header_for_duration(180)
         dl = spotty_cache.SpottyDownloader(
-            spotty=object(),
+            spotty=FakeSpotty([]),
             track_id="t1",
             duration_sec=180,
             start_byte=0,
@@ -1037,14 +1076,14 @@ class SpottyAudioStreamerTests(unittest.TestCase):
 
         mgr = spotty_cache.SpottyCacheManager
         mgr._instances[("t1", 0)] = dl
-        mgr._recent_tracks = ["t1"]
+        mgr._current_key = ("t1", 0)
         try:
             self.assertIsNone(mgr.find_best_downloader("t1", 0))
             self.assertIsNone(mgr.find_best_downloader("t1", 100))
             self.assertIs(dl, mgr.find_active_downloader("t1"))
         finally:
             mgr._instances.clear()
-            mgr._recent_tracks.clear()
+            mgr._current_key = None
 
     def test_verified_terminal_classifier_seam_stops_first_attempt(self):
         from unittest.mock import patch
@@ -1354,7 +1393,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         ManagedFakeDownloader.created = []
         manager = spotty_cache.SpottyCacheManager
         manager._instances.clear()
-        manager._recent_tracks.clear()
+        manager._current_key = None
         try:
             active = ManagedFakeDownloader(
                 spotty=object(),
@@ -1368,7 +1407,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
                 track_length=1000,
             )
             manager._instances[("current-track", 0)] = active
-            manager._recent_tracks = ["current-track"]
+            manager._current_key = ("current-track", 0)
 
             result = manager.get_or_start(
                 object(),
@@ -1385,11 +1424,11 @@ class SpottyAudioStreamerTests(unittest.TestCase):
 
             self.assertIsNone(result)
             self.assertFalse(active.aborted)
-            self.assertEqual(1, len(ManagedFakeDownloader.created))
+            self.assertFalse(any(value.started for value in ManagedFakeDownloader.created[1:]))
             self.assertNotIn(("next-track", 0), manager._instances)
         finally:
             manager._instances.clear()
-            manager._recent_tracks.clear()
+            manager._current_key = None
             spotty_cache.SpottyDownloader = original_downloader_class
 
     def test_cache_restarts_downloader_when_requested_start_was_trimmed(self):
@@ -1401,7 +1440,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         ManagedFakeDownloader.created = []
         manager = spotty_cache.SpottyCacheManager
         manager._instances.clear()
-        manager._recent_tracks.clear()
+        manager._current_key = None
         try:
             old = ManagedFakeDownloader(
                 spotty=object(),
@@ -1416,10 +1455,10 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             )
             old._trim_offset = 512
             manager._instances[("trimmed-track", 0)] = old
-            manager._recent_tracks = ["trimmed-track"]
+            manager._current_key = ("trimmed-track", 0)
 
             result = manager.get_or_start(
-                object(),
+                FakeSpotty([]),
                 "trimmed-track",
                 180,
                 0,
@@ -1436,7 +1475,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             self.assertTrue(result.started)
         finally:
             manager._instances.clear()
-            manager._recent_tracks.clear()
+            manager._current_key = None
             spotty_cache.SpottyDownloader = original_downloader_class
 
     def test_cache_eviction_keeps_downloader_with_active_consumers(self):
@@ -1448,7 +1487,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         ManagedFakeDownloader.created = []
         manager = spotty_cache.SpottyCacheManager
         manager._instances.clear()
-        manager._recent_tracks.clear()
+        manager._current_key = None
         try:
 
             def make_finished(track_id):
@@ -1474,10 +1513,10 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             manager._instances[("stale-1", 0)] = make_finished("stale-1")
             manager._instances[("stale-2", 0)] = make_finished("stale-2")
             manager._instances[("stale-3", 0)] = make_finished("stale-3")
-            manager._recent_tracks = ["active-reader", "stale-1", "stale-2", "stale-3"]
+            manager._current_key = ("stale-3", 0)
 
             manager.get_or_start(
-                object(),
+                FakeSpotty([]),
                 "new-track",
                 180,
                 0,
@@ -1494,7 +1533,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             self.assertFalse(active_reader.aborted)
         finally:
             manager._instances.clear()
-            manager._recent_tracks.clear()
+            manager._current_key = None
             spotty_cache.SpottyDownloader = original_downloader_class
 
     def test_cache_byte_budget_evicts_old_finished_buffers_only(self):
@@ -1507,7 +1546,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         ManagedFakeDownloader.created = []
         manager = spotty_cache.SpottyCacheManager
         manager._instances.clear()
-        manager._recent_tracks.clear()
+        manager._current_key = None
         manager._MAX_CACHE_BYTES = 100
         try:
             def make_downloader(track_id, size, finished):
@@ -1540,7 +1579,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
                     ("prebuffer", 0): prebuffer,
                 }
             )
-            manager._recent_tracks = ["old", "recent", "active-reader", "prebuffer"]
+            manager._current_key = ("prebuffer", 0)
 
             manager.enforce_memory_budget()
 
@@ -1554,7 +1593,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
             self.assertEqual(80, len(prebuffer._buffer))
         finally:
             manager._instances.clear()
-            manager._recent_tracks.clear()
+            manager._current_key = None
             manager._MAX_CACHE_BYTES = original_budget
             spotty_cache.SpottyDownloader = original_downloader_class
 
@@ -1633,7 +1672,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
 
         wav_header, track_length = self.module.create_wav_header_for_duration(180)
         downloader = spotty_cache.SpottyDownloader(
-            spotty=object(),
+            spotty=FakeSpotty([]),
             track_id="next-track",
             duration_sec=180,
             start_byte=0,
@@ -1659,6 +1698,9 @@ class CountingFakeProcess(FakeProcess):
 
 
 class PatternSpotty:
+    def get_spotty_credentials_identity(self):
+        return ("fixture-account", 1)
+
     """Serves slices of one PCM stream, honouring --start-position like Spotty."""
 
     def __init__(self, pcm, limits, returncodes):
@@ -1704,11 +1746,11 @@ class SpottyBackpressureTests(unittest.TestCase):
 
     def tearDown(self):
         for downloader in self.downloaders:
-            downloader.abort()
+            downloader.cleanup()
             if downloader.thread is not None:
                 downloader.thread.join(timeout=2.0)
         self.cache.SpottyCacheManager._instances.clear()
-        self.cache.SpottyCacheManager._recent_tracks.clear()
+        self.cache.SpottyCacheManager._current_key = None
         for module_name in ("spotty_audio_streamer", "spotty_cache", "utils", "spotty", "xbmc"):
             sys.modules.pop(module_name, None)
 
@@ -1859,7 +1901,7 @@ class SpottyBackpressureTests(unittest.TestCase):
         process = ChunkThenBlockingProcess(bytes(1024 * 1024))
         manager = self.cache.SpottyCacheManager
         manager._instances.clear()
-        manager._recent_tracks.clear()
+        manager._current_key = None
         wav_header, track_length = self.module.create_wav_header_for_duration(300)
 
         def start():
@@ -1882,8 +1924,10 @@ class SpottyBackpressureTests(unittest.TestCase):
 
         with downloader.cond:
             self.assertEqual(0, downloader._trim_offset)
-            self.assertEqual(wav_header, bytes(downloader._buffer[: len(wav_header)]))
-            self.assertEqual(downloader.written_bytes, len(downloader._buffer))
+            written = downloader.written_bytes
+        self.assertEqual(wav_header, downloader.read_range(0, len(wav_header)))
+        self.assertEqual(written, len(downloader.read_range(0, written)))
+        with downloader.cond:
             self.assertGreaterEqual(downloader.written_bytes, self.HIGH)
         self.assertEqual(0, process.kill_calls)
         # A paused-but-untrimmed prebuffer is reused, not discarded/restarted.

@@ -50,6 +50,32 @@ class Spotty:
     def get_spotty_credentials_file(self) -> str:
         return os.path.join(self.__spotty_cache, SPOTTY_CREDENTIALS_FILENAME)
 
+    def get_spotty_credentials_identity(self):
+        """Return stable metadata for PCM admission, without reading credentials."""
+        from utils import zeroconf_pairing_in_progress
+
+        try:
+            if zeroconf_pairing_in_progress():
+                return None
+            path = self.get_spotty_credentials_file()
+
+            def fingerprint():
+                stat = os.stat(path)
+                if stat.st_size <= 0:
+                    return None
+                return (
+                    stat.st_dev, stat.st_ino, stat.st_mtime_ns,
+                    stat.st_ctime_ns, stat.st_size,
+                )
+
+            first = fingerprint()
+            second = fingerprint()
+            if first is None or first != second or zeroconf_pairing_in_progress():
+                return None
+            return (os.path.abspath(path),) + first
+        except (OSError, ValueError):
+            return None
+
     def get_spotty_credentials_backup_file(self) -> str:
         return os.path.join(self.__spotty_cache, SPOTTY_CREDENTIALS_BACKUP_FILENAME)
 

@@ -172,24 +172,25 @@ class HTTPSpottyAudioStreamer:
         else:
             log_msg("No running audio streamer. Nothing to stop.", LOGDEBUG)
 
-    def release_stream(self, release_resources: Callable[[], None]) -> bool:
+    def release_stream(self, release_resources: Callable[[Optional[SpottyStreamSpec]], bool]) -> bool:
         """Drop the active stream and run release_resources with new requests held.
 
         The release owns the initialization reservation while release_resources
         runs, so a request that arrives meanwhile waits and then starts fresh
-        instead of reusing the released stream or the stream's downloader.
+        with a new playback generation. The callback may retain eligible PCM.
 
         A stream startup in progress belongs to a newer selection: Kodi waits for
         a closing player's stream requests before reporting the stop.  The
         release then leaves the stream state and all resources alone.
 
-        Return whether the release dropped a stream track.
+        Return whether the release found playback or retained resources.
         """
         release_id = f"release-{uuid.uuid4()}"
         with self.__stream_lock:
             if self.__init_in_progress:
                 return False
             released_track = self.__current_track_id is not None
+            released_spec = self.__current_stream_spec
             self.__is_streaming = False
             self.__current_track_id = None
             self.__current_request_id = ""
@@ -200,14 +201,14 @@ class HTTPSpottyAudioStreamer:
             self.__init_event.clear()
         try:
             self.__terminate_streaming()
-            release_resources()
+            released_resources = release_resources(released_spec)
         finally:
             with self.__stream_lock:
                 if self.__initializing_request_id == release_id:
                     self.__init_in_progress = False
                     self.__initializing_request_id = ""
                     self.__init_event.set()
-        return released_track
+        return released_track or bool(released_resources)
 
     def __terminate_streaming(self) -> None:
         if self.__spotty_streamer.terminate_stream():
@@ -243,24 +244,24 @@ class HTTPSpottyAudioStreamer:
             except Exception:
                 pass
 
-    @staticmethod
-    def _find_downloader(track_id: str, request_byte: int = 0):
+    def _find_downloader(self, track_id: str, request_byte: int = 0, stream_spec=None):
         try:
             from spotty_cache import SpottyCacheManager
 
-            return SpottyCacheManager.find_best_downloader(track_id, request_byte)
+            return SpottyCacheManager.find_best_downloader(
+                track_id, request_byte, stream_spec or self.__current_stream_spec, self.__spotty,
+            )
         except Exception:
             return None
 
-    @staticmethod
-    def _find_active_downloader(track_id: str):
+    def _find_active_downloader(self, track_id: str):
         """Find a live track downloader without imposing range readability."""
         try:
             from spotty_cache import SpottyCacheManager
 
             finder = getattr(SpottyCacheManager, "find_active_downloader", None)
             if callable(finder):
-                return finder(track_id)
+                return finder(track_id, self.__current_stream_spec, self.__spotty)
             # Compatibility for older test doubles; production managers expose
             # the trim-independent API above.
             return SpottyCacheManager.find_best_downloader(track_id, 0)
@@ -513,6 +514,7 @@ class HTTPSpottyAudioStreamer:
         track_id: str,
         request_id: str,
         request_byte: int = 0,
+        stream_spec=None,
     ):
         deadline = time.monotonic() + INITIALIZATION_WAIT_SECONDS
         while True:
@@ -546,7 +548,7 @@ class HTTPSpottyAudioStreamer:
                     )
 
             if reuse_request_id is not None:
-                downloader = self._find_downloader(track_id, request_byte)
+                downloader = self._find_downloader(track_id, request_byte, stream_spec)
                 healthy = self._downloader_has_healthy_progress(
                     downloader
                 ) or self._downloader_is_paused(downloader)
@@ -853,12 +855,18 @@ class HTTPSpottyAudioStreamer:
 
         # Read settings FIRST.
         bitrate, norm = _get_current_stream_settings()
+        wav_header, track_length = create_wav_header_for_duration(duration)
+        desired_spec = SpottyStreamSpec(
+            track_id, duration, wav_header, track_length, bitrate, norm,
+            self.__spotty_streamer.initial_volume,
+        )
 
         request_range = bottle.request.headers.get("Range", "")
         coordination = self._coordinate_initialization(
             track_id,
             request_id,
             self._request_range_begin(request_range),
+            desired_spec,
         )
         if coordination is None:
             return self._initialization_busy_response(
@@ -882,7 +890,7 @@ class HTTPSpottyAudioStreamer:
             has_prebuf = False
             if is_new_track and self.__prebuffer_manager:
                 prebuf_result, has_prebuf = self.__prebuffer_manager.get_and_clear_prebuffer(
-                    track_id
+                    track_id, desired_spec,
                 )
                 if has_prebuf:
                     kind = f"{len(prebuf_result.data)} bytes"
@@ -1114,8 +1122,31 @@ class HTTPSpottyAudioStreamer:
                 LOGDEBUG,
             )
 
+        with self.__stream_lock:
+            owns_response = (
+                self.__initializing_request_id == request_id if is_new_track
+                else not self.__init_in_progress and self.__current_request_id == request_id
+            )
+            response_generation = streamer.get_stream_generation()
+        if not owns_response:
+            return self._unavailable_response("Spotify response was replaced before audio admission.")
+        downloader = streamer._get_or_start_downloader(stream_spec, range_begin, response_generation)
+        if downloader is None or not downloader.identity_valid():
+            if downloader is not None:
+                downloader.cleanup()
+            if is_new_track:
+                return self._failed_new_track_response(
+                    track_id or "", request_id or "", previous_track_id,
+                    previous_request_id, previous_was_streaming,
+                    previous_stream_spec, previous_stream_preserved,
+                )
+            return self._unavailable_response("Spotify audio identity changed before response headers.")
+
         if bottle.request.method.upper() == "GET" and is_new_track and not prebuf_data:
-            if not streamer.prepare_part_audio_stream(range_begin, stream_spec=stream_spec):
+            if not streamer.prepare_part_audio_stream(
+                range_begin, stream_spec=stream_spec, downloader=downloader,
+                stream_generation=response_generation,
+            ):
                 return self._failed_new_track_response(
                     track_id or "",
                     request_id or "",
@@ -1125,6 +1156,17 @@ class HTTPSpottyAudioStreamer:
                     previous_stream_spec,
                     previous_stream_preserved,
                 )
+
+        if streamer._is_terminated(response_generation) or not downloader.identity_valid():
+            if not streamer._is_terminated(response_generation):
+                downloader.cleanup()
+            if is_new_track:
+                self._abort_initialization(
+                    track_id or "", request_id or "", previous_track_id,
+                    previous_request_id, previous_was_streaming,
+                    previous_stream_spec, previous_stream_preserved,
+                )
+            return self._unavailable_response("Spotify audio identity changed before response headers.")
 
         if is_new_track and not self._commit_initialization(
             track_id or "",
@@ -1152,12 +1194,16 @@ class HTTPSpottyAudioStreamer:
                     rest_len,
                     rest_begin,
                     stream_spec=stream_spec,
+                    downloader=downloader,
+                    stream_generation=response_generation,
                 )
         else:
             stream_body = streamer.send_part_audio_stream(
                 r_len,
                 r_begin,
                 stream_spec=stream_spec,
+                downloader=downloader,
+                stream_generation=response_generation,
             )
 
         def generate():
