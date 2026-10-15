@@ -291,6 +291,134 @@ class HTTPSpottyAudioStreamerTests(unittest.TestCase):
         ):
             sys.modules.pop(module_name, None)
 
+    def test_real_http_releases_exact_ranges_before_bulk_pcm(self):
+        import http.client
+        from socketserver import ThreadingMixIn
+        from wsgiref.simple_server import WSGIServer, WSGIRequestHandler, make_server
+        import test_stream_seams as seams
+
+        fixture = seams.StreamSeamTests()
+        fixture.setUp()
+        release_bulk = threading.Event()
+        first_frame = threading.Event()
+
+        class GatedProcess(seams._Process):
+            def __init__(self):
+                super().__init__(seams.RAMP, None)
+                self.stdout = self
+                self.position = 0
+
+            def read(self, size):
+                if self.position < 8:
+                    end = min(8, self.position + size)
+                    chunk = seams.RAMP[self.position:end]
+                    self.position = end
+                    if end == 8:
+                        first_frame.set()
+                    return chunk
+                release_bulk.wait(2)
+                chunk = seams.RAMP[self.position:self.position + size]
+                self.position += len(chunk)
+                if not chunk:
+                    self.returncode = 0
+                return chunk
+
+            def kill(self):
+                release_bulk.set()
+                self.returncode = -9
+
+        class Server(ThreadingMixIn, WSGIServer):
+            daemon_threads = True
+
+        class Handler(WSGIRequestHandler):
+            def log_message(self, *args):
+                pass
+
+        server = None
+        try:
+            sys.modules.pop("bottle", None)
+            sys.path.insert(0, os.path.join(LIB_DIR, "deps"))
+            import bottle
+            fixture.http.bottle = bottle
+            spotty = seams.RampSpotty()
+            spotty.run_spotty = lambda args: GatedProcess()
+            streamer = fixture._server(spotty)
+            app = bottle.Bottle()
+            app.route(
+                "/track/<track_id>/<duration>",
+                callback=streamer.spotty_stream_audio_track,
+            )
+            server = make_server("127.0.0.1", 0, app, Server, Handler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            for begin, end in ((0, 3), (0, 51), (20, 51), (44, 51), (47, 51)):
+                with self.subTest(begin=begin, end=end):
+                    streamer.release_stream(fixture.cache.SpottyCacheManager.cleanup_all)
+                    release_bulk.clear()
+                    first_frame.clear()
+                    received = []
+                    errors = []
+
+                    def request():
+                        connection = http.client.HTTPConnection(
+                            "127.0.0.1", server.server_port, timeout=2
+                        )
+                        try:
+                            connection.request(
+                                "GET", "/track/synthetic/30.wav",
+                                headers={"Range": f"bytes={begin}-{end}"},
+                            )
+                            response = connection.getresponse()
+                            received.append((response.status, response.read()))
+                        except Exception as exc:
+                            errors.append(exc)
+                        finally:
+                            connection.close()
+
+                    requester = threading.Thread(target=request, daemon=True)
+                    requester.start()
+                    try:
+                        self.assertTrue(first_frame.wait(1))
+                        requester.join(0.3)
+                        self.assertFalse(
+                            requester.is_alive(),
+                            "HTTP withheld complete requested PCM until bulk release",
+                        )
+                        self.assertEqual([], errors)
+                        self.assertEqual([(206, fixture.ideal[begin:end + 1])], received)
+                        self.assertFalse(release_bulk.is_set())
+                    finally:
+                        release_bulk.set()
+                        requester.join(2)
+        finally:
+            release_bulk.set()
+            if server is not None:
+                streamer.release_stream(fixture.cache.SpottyCacheManager.cleanup_all)
+                server.shutdown()
+                server.server_close()
+                server_thread.join(2)
+            fixture.tearDown()
+
+    def test_header_only_http_rejects_clean_exit_without_complete_pcm(self):
+        import test_stream_seams as seams
+
+        fixture = seams.StreamSeamTests()
+        fixture.setUp()
+        try:
+            fixture.cache.SpottyDownloader._MAX_SESSION_RETRIES = 0
+            for pcm in (b"", b"x", b"xy", b"xyz"):
+                with self.subTest(pcm_bytes=len(pcm)):
+                    spotty = seams.RampSpotty()
+                    spotty.run_spotty = lambda args: seams._Process(pcm, 0)
+                    streamer = fixture._server(spotty)
+                    fixture.http.bottle.request.headers = {"Range": "bytes=0-3"}
+                    result = streamer.spotty_stream_audio_track("partial", "1.wav")
+                    self.assertEqual(503, fixture.http.bottle.response.status)
+                    self.assertIsInstance(result, str)
+                    streamer.release_stream(fixture.cache.SpottyCacheManager.cleanup_all)
+        finally:
+            fixture.tearDown()
+
     def test_playback_failure_notice_is_once_per_queue_session(self):
         module = import_http_streamer()
         notices = []

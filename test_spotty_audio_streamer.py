@@ -313,13 +313,6 @@ class SpottyAudioStreamerTests(unittest.TestCase):
     def test_streamer_does_not_expose_synthetic_startup_silence(self):
         self.assertFalse(hasattr(self.module, "STARTUP_SILENCE_BYTES"))
 
-    def test_real_pcm_startup_prime_is_about_three_seconds(self):
-        self.assertAlmostEqual(
-            512 * 1024 / 176400,
-            self.module.STARTUP_REAL_PCM_BUFFER_SECONDS,
-            places=3,
-        )
-
     def test_kodi_chunk_size_uses_filecache_setting_before_legacy_name(self):
         calls = []
 
@@ -385,9 +378,102 @@ class SpottyAudioStreamerTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(first_chunk), len(wav_header))
         self.assertEqual(
-            len(wav_header) + 512 * 1024,
+            len(wav_header) + 4,
             max(downloader.wait_targets),
         )
+
+    def test_startup_requires_complete_requested_real_pcm_frame(self):
+        # A byte count alone cannot prove the requested PCM frame exists.
+        cases = (
+            (0, 0, 0, False),
+            (0, 0, 1, False),
+            (20, 0, 2, False),
+            (44, 0, 3, False),
+            (0, 0, 4, True),
+            (20, 0, 4, True),
+            (44, 0, 4, True),
+            (47, 0, 4, True),
+            (48, 0, 4, False),
+            (48, 0, 7, False),
+            (48, 0, 8, True),
+            (176040, 176040, 4, True),
+            (44, 48, 4, False),
+            (0, 48, 4, False),
+            (176443, 0, 176399, False),
+            (176443, 0, 176400, True),
+        )
+        self.module.STARTUP_REAL_PCM_WAIT_SECONDS = 0.002
+        for finished in (False, True):
+            for begin, start, real_count, expected in cases:
+                for body in (False, True):
+                    with self.subTest(
+                        finished=finished, begin=begin, start=start,
+                        real_count=real_count, body=body,
+                    ):
+                        streamer = self.module.SpottyAudioStreamer(object())
+                        streamer.set_track("frame-track", 1)
+                        header = streamer.get_stream_spec().wav_header
+                        prefix = header[start:] if start < 44 else b""
+                        pcm = bytes(range(256)) * (real_count // 256)
+                        pcm += bytes(range(real_count % 256))
+                        downloader = FakeDownloader(prefix, pcm, auto_fill=False)
+                        downloader.start_byte = start
+                        downloader.real_pcm_bytes = real_count
+                        downloader.is_finished = finished
+                        FakeSpottyCacheManager.downloader = downloader
+                        if body:
+                            size = 4 if begin < 44 else 1
+                            payload = b"".join(streamer.send_part_audio_stream(size, begin))
+                            expected_bytes = (prefix + pcm)[
+                                begin - start:begin - start + size
+                            ]
+                            self.assertEqual(expected_bytes if expected else b"", payload)
+                        else:
+                            self.assertEqual(expected, streamer.prepare_part_audio_stream(begin))
+
+    def test_explicit_zero_pcm_rejects_large_synthetic_buffer(self):
+        streamer = self.module.SpottyAudioStreamer(object())
+        streamer.set_track("gap-track", 180)
+        header = streamer.get_stream_spec().wav_header
+        downloader = FakeDownloader(header, bytes(600000), auto_fill=False)
+        downloader.real_pcm_bytes = 0
+        downloader.is_finished = True
+        FakeSpottyCacheManager.downloader = downloader
+
+        self.assertFalse(streamer.prepare_part_audio_stream(44))
+        self.assertEqual(b"", b"".join(streamer.send_part_audio_stream(4, 44)))
+
+    def test_buffered_pcm_cannot_validate_stale_or_failed_startup(self):
+        for state in ("stale", "aborted", "error"):
+            with self.subTest(state=state):
+                streamer = self.module.SpottyAudioStreamer(object())
+                streamer.set_track("old-track", 10)
+                spec = streamer.get_stream_spec()
+                downloader = FakeDownloader(spec.wav_header, bytes(600000), auto_fill=False)
+                downloader.real_pcm_bytes = 600000
+                if state == "stale":
+                    streamer.terminate_stream()
+                else:
+                    setattr(downloader, state, True)
+                self.assertFalse(
+                    streamer._prime_startup_real_pcm(
+                        downloader, 0, spec.wav_header, spec.track_length,
+                        0, spec.track_id,
+                    )
+                )
+
+    def test_clean_short_complete_pcm_preserves_bounded_tail_padding(self):
+        streamer = self.module.SpottyAudioStreamer(object())
+        streamer.set_track("short-track", 1)
+        spec = streamer.get_stream_spec()
+        downloader = FakeDownloader(spec.wav_header, b"\x01\x02\x03\x04", auto_fill=False)
+        downloader.real_pcm_bytes = 4
+        downloader.is_finished = True
+        FakeSpottyCacheManager.downloader = downloader
+
+        self.assertTrue(streamer.prepare_part_audio_stream(0))
+        payload = b"".join(streamer.send_part_audio_stream(spec.track_length, 0))
+        self.assertEqual(spec.wav_header + b"\x01\x02\x03\x04" + bytes(176396), payload)
 
     def test_delayed_generator_keeps_original_track_spec_during_natural_handoff(self):
         streamer = self.module.SpottyAudioStreamer(object())

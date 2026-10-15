@@ -22,9 +22,8 @@ _DEFAULT_GAIN_TYPE = "track"
 
 _PCM_BYTES_PER_SEC = 176400  # 44.1 kHz * 2 ch * 2 bytes/sample
 _WAV_HEADER_SIZE = 44
-_STARTUP_REAL_PCM_BUFFER_BYTES = 512 * 1024
+_PCM_FRAME_BYTES = 4
 _THROTTLE_LEAD_BYTES = 2097152
-STARTUP_REAL_PCM_BUFFER_SECONDS = _STARTUP_REAL_PCM_BUFFER_BYTES / _PCM_BYTES_PER_SEC
 STARTUP_REAL_PCM_WAIT_SECONDS = 15.0
 
 # Maximum bytes of PCM silence to pad at the end of a stream when spotty exits
@@ -183,21 +182,29 @@ class SpottyAudioStreamer:
         track_length: int,
         stream_generation: int,
         track_id: str,
-        allow_clean_short: bool = False,
     ) -> bool:
         pcm_start = len(wav_header)
         downloader_real_start = max(pcm_start, int(downloader.start_byte))
         requested_real_start = max(pcm_start, int(range_begin))
-        requested_real_end = min(
-            track_length,
-            requested_real_start + _STARTUP_REAL_PCM_BUFFER_BYTES,
-        )
-        # real_pcm_bytes is relative to the downloader's own real-PCM start.
-        # Include any bytes before the requested range so readiness proves that
-        # the requested position (plus a bounded buffer window) is actually buffered.
-        target_real_pcm_bytes = max(0, requested_real_end - downloader_real_start)
-        if target_real_pcm_bytes <= 0:
-            return True
+        if (
+            downloader_real_start > requested_real_start
+            or requested_real_start >= track_length
+            or self._is_terminated(stream_generation)
+        ):
+            return False
+        # Require the complete requested frame, plus a complete frame after any
+        # partial frame discarded by an unaligned downloader start.
+        requested_frame = (requested_real_start - pcm_start) // _PCM_FRAME_BYTES
+        first_full_frame = (
+            downloader_real_start - pcm_start + _PCM_FRAME_BYTES - 1
+        ) // _PCM_FRAME_BYTES
+        requested_real_end = pcm_start + (
+            max(requested_frame, first_full_frame) + 1
+        ) * _PCM_FRAME_BYTES
+        if requested_real_end > track_length:
+            return False
+        # real_pcm_bytes starts at downloader_real_start, excluding header/gap bytes.
+        target_real_pcm_bytes = requested_real_end - downloader_real_start
 
         header_bytes_in_buffer = max(0, pcm_start - downloader.start_byte)
         target_bytes_in_buf = header_bytes_in_buffer + target_real_pcm_bytes
@@ -214,6 +221,7 @@ class SpottyAudioStreamer:
                 _real_pcm_bytes() >= target_real_pcm_bytes
                 and not downloader.error
                 and not downloader.aborted
+                and not self._is_terminated(stream_generation)
             ):
                 return True
             written = downloader.written_bytes
@@ -253,15 +261,6 @@ class SpottyAudioStreamer:
             and not aborted
             and not self._is_terminated(stream_generation)
         )
-        if (
-            allow_clean_short
-            and finished
-            and real_pcm_bytes > 0
-            and not error
-            and not aborted
-            and not self._is_terminated(stream_generation)
-        ):
-            ready = True
         self._log_transfer(
             "startup-prime-ready",
             stream_track_id=track_id,
@@ -491,7 +490,6 @@ class SpottyAudioStreamer:
                 track_length,
                 stream_generation,
                 track_id,
-                True,
             )
             if not ready or self._startup_failed_before_real_pcm(
                 downloader, range_begin, wav_header
