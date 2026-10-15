@@ -22,6 +22,7 @@ from like_actions import LIKED_STATE_LOCK, notify_not_connected, set_current_tra
 from play_queue import clear as play_queue_clear
 from play_queue import ITEM_OWNER_PROPERTY
 from play_queue import bind_stream_item as play_queue_bind_stream_item
+from play_queue import build_stream_url
 from play_queue import should_fire_autoplay as play_queue_should_fire_autoplay
 from playlist_next import (
     get_current_playback_time_seconds,
@@ -36,7 +37,6 @@ from string_ids import WELCOME_AUTHENTICATED_STR_ID
 from utils import (
     ADDON_ID,
     ADDON_WINDOW_ID,
-    PROXY_HOST,
     PROXY_PORT,
     get_cached_auth_token,
     get_valid_cached_auth_token,
@@ -1030,8 +1030,7 @@ class MainService:
                     images = album.get("images") or []
                     art_url = images[0].get("url") if images else ""
                     duration_sec = math.ceil(duration_ms / 1000) if duration_ms else 1
-                    url_duration = f"{max(1.0, duration_ms / 1000):.3f}"
-                    url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{tid}/{url_duration}.wav"
+                    url = build_stream_url(tid, duration_ms)
                     li = xbmcgui.ListItem(label=name)
                     li.setProperty("IsPlayable", "true")
                     play_queue_bind_stream_item(li, tid)

@@ -22,6 +22,7 @@
         <news>v1.4.1
 - Release available audio without an extra startup buffer wait.
 - Require a complete audio frame at the requested stream position.
+- Avoid duplicate stream reads before song playback.
 
 v1.4.0
 - Show clear messages for rate-limit, permission, and connection failures in listings.

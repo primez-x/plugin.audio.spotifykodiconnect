@@ -9,6 +9,8 @@ repeated or missing frame at a seam fails the comparison.
 
 import array
 from contextlib import contextmanager
+import hashlib
+import io
 import os
 import subprocess
 import sys
@@ -16,6 +18,7 @@ import threading
 import time
 import types
 import unittest
+import wave
 
 REPO_ROOT = os.path.dirname(__file__)
 LIB_DIR = os.path.join(REPO_ROOT, "resources", "lib")
@@ -186,9 +189,10 @@ if sys.stdin.buffer.read(1):
 class _RetryPipeSpotty(RampSpotty):
     """Real helper pipes with optional first-attempt exit control."""
 
-    def __init__(self, cuts, gate_first=False):
+    def __init__(self, cuts, gate_first=False, frames=DURATION * FRAMES_PER_SEC):
         super().__init__(cuts)
         self.gate_first = gate_first
+        self.frames = frames
         self.processes = []
         self.process = None
         self.status_thread = None
@@ -201,8 +205,8 @@ class _RetryPipeSpotty(RampSpotty):
         cut = self.cuts.pop(0) if self.cuts else None
         producer = """
 import array, sys
-start, cut, gate = map(int, sys.argv[1:])
-pcm = array.array('I', range(30 * 44100)).tobytes()[start:]
+start, cut, gate, frames = map(int, sys.argv[1:])
+pcm = array.array('I', range(frames)).tobytes()[start:]
 sys.stdout.buffer.write(pcm if cut < 0 else pcm[:cut])
 sys.stdout.buffer.flush()
 if gate:
@@ -211,7 +215,7 @@ sys.exit(0 if cut < 0 else 1)
 """
         self.process = subprocess.Popen(
             [sys.executable, "-c", producer, str(start), str(-1 if cut is None else cut),
-             str(int(self.gate_first and len(self.calls) == 1))],
+             str(int(self.gate_first and len(self.calls) == 1)), str(self.frames)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             bufsize=1048576,
         )
@@ -436,6 +440,92 @@ class StreamSeamTests(unittest.TestCase):
                 self.assertIsNotNone(spotty.process.returncode, "producer was not reaped")
                 print(f"real-pipe reaped pid={spotty.process.pid} rc={spotty.process.returncode} "
                       "downloader_joined=True status_joined=True server_joined=True")
+
+    def test_canonical_http_duration_matches_pcm_and_head(self):
+        import http.client
+
+        frames = 9_417_996
+        spotty = _RetryPipeSpotty([], frames=frames)
+        with self._pipe_http(spotty=spotty) as (streamer, _, port):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                path = f"/track/{TRACK}/213560ms"
+                connection.request("HEAD", path)
+                with connection.getresponse() as response:
+                    self.assertEqual(200, response.status)
+                    head_length = int(response.getheader("Content-Length"))
+                    self.assertEqual("audio/x-wav", response.getheader("Content-Type"))
+                    self.assertEqual("bytes", response.getheader("Accept-Ranges"))
+                    self.assertEqual(b"", response.read())
+                self.assertEqual([], spotty.calls)
+                connection.request("GET", path)
+                with connection.getresponse() as response:
+                    self.assertEqual(200, response.status)
+                    self.assertEqual(head_length, int(response.getheader("Content-Length")))
+                    self.assertEqual("audio/x-wav", response.getheader("Content-Type"))
+                    served = response.read()
+                self.assertEqual(head_length, len(served))
+                with wave.open(io.BytesIO(served), "rb") as wav:
+                    self.assertEqual((2, 2, 44100, frames, "NONE", "not compressed"), wav.getparams())
+                    pcm = wav.readframes(frames)
+                    self.assertEqual(_ramp(frames), pcm)
+                    self.assertEqual(213.560, wav.getnframes() / wav.getframerate())
+                self.assertEqual(213.560, streamer._HTTPSpottyAudioStreamer__spotty_streamer.get_stream_spec().track_duration)
+                print(f"canonical-http token=213560ms seconds=213.560 frames={frames} "
+                      f"head_bytes={head_length} get_bytes={len(served)} "
+                      f"pcm_sha256={hashlib.sha256(pcm).hexdigest()} exact_pcm=True")
+            finally:
+                connection.close()
+
+    def test_http_duration_fractions_legacy_and_minimum(self):
+        import http.client
+
+        for token, frames in (
+            ("1250ms", 55125),
+            ("1.250.wav", 55125),
+            ("1.250", 55125),
+            ("250ms", 44100),
+            ("0ms", 44100),
+            ("0.wav", 44100),
+        ):
+            with self.subTest(token=token), self._pipe_http(spotty=_RetryPipeSpotty([])) as (_, spotty, port):
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                try:
+                    path = f"/track/{TRACK}/{token}"
+                    connection.request("HEAD", path)
+                    with connection.getresponse() as response:
+                        self.assertEqual(200, response.status)
+                        self.assertEqual(44 + frames * 4, int(response.getheader("Content-Length")))
+                        response.read()
+                    self.assertEqual([], spotty.calls)
+                    connection.request("GET", path)
+                    with connection.getresponse() as response:
+                        self.assertEqual(200, response.status)
+                        self.assertEqual(44 + frames * 4, int(response.getheader("Content-Length")))
+                        served = response.read()
+                    self.assertEqual(44 + frames * 4, len(served))
+                    self.assertEqual(_ramp(frames), served[44:])
+                finally:
+                    connection.close()
+
+    def test_http_rejects_invalid_milliseconds_before_stream_changes(self):
+        import http.client
+
+        spotty = _RetryPipeSpotty([])
+        with self._pipe_http(spotty=spotty) as (streamer, _, port):
+            for token in ("1.5ms", "-1ms", "+1000ms", "nanms", "1e3ms", "ms", "213560ms.wav", "1" + "0" * 400 + "ms"):
+                for method in ("HEAD", "GET"):
+                    with self.subTest(token=token, method=method):
+                        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+                        try:
+                            connection.request(method, f"/track/{TRACK}/{token}")
+                            with connection.getresponse() as response:
+                                self.assertEqual(400, response.status)
+                                response.read()
+                        finally:
+                            connection.close()
+            self.assertEqual([], spotty.calls)
+            self.assertFalse(streamer._HTTPSpottyAudioStreamer__is_streaming)
 
     def _assert_pipe_http(self, begin=None, end=None, prefix_bytes=4):
         import http.client

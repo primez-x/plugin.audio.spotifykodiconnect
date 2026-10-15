@@ -26,6 +26,7 @@ from spotty_helper import SpottyHelper
 from string_ids import *
 from play_queue import (
     bind_stream_item as play_queue_bind_stream_item,
+    build_stream_url,
     mark_original_complete as play_queue_mark_original_complete,
     report_loaded as play_queue_report_loaded,
     session_guard as play_queue_session_guard,
@@ -36,8 +37,6 @@ from utils import (
     ADDON_ID,
     ADDON_WINDOW_ID,
     LOGINFO,
-    PROXY_HOST,
-    PROXY_PORT,
     get_chunks,
     log_exception,
     log_msg,
@@ -1566,11 +1565,7 @@ class PluginContent:
             elif isinstance(genre, (list, tuple)) and genre:
                 genres_list = [str(g) for g in genre if g]
 
-        # Local playback by using proxy on this machine.
-        # The URL carries milliseconds: it sets the WAV length, and whole seconds
-        # rounded up left up to a second of silence after the music.
-        url_duration = f"{max(1.0, (track.get('duration_ms') or 0) / 1000):.3f}"
-        url = f"http://{PROXY_HOST}:{PROXY_PORT}/track/{track['id']}/{url_duration}.wav"
+        url = build_stream_url(track["id"], track.get("duration_ms"))
 
         li = xbmcgui.ListItem(label, offscreen=True)
         li.setProperty("isPlayable", "true")

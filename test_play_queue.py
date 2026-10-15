@@ -38,6 +38,8 @@ def install_stubs(window, profile):
     utils = types.ModuleType("utils")
     utils.ADDON_WINDOW_ID = 10000
     utils.ADDON_DATA_PATH = profile
+    utils.PROXY_HOST = "127.0.0.1"
+    utils.PROXY_PORT = 52309
     utils.log_msg = lambda *args, **kwargs: None
     sys.modules["utils"] = utils
 
@@ -56,8 +58,37 @@ class PlayQueueTests(unittest.TestCase):
         self.play_queue = play_queue
 
     def tearDown(self):
-        for module_name in ("play_queue", "xbmc", "xbmcgui", "utils"):
+        for module_name in ("play_queue", "playlist_next", "xbmc", "xbmcgui", "utils"):
             sys.modules.pop(module_name, None)
+
+    def test_stream_url_preserves_milliseconds_and_minimum_duration(self):
+        import playlist_next
+
+        for duration_ms, token, seconds in (
+            (213560, "213560ms", 213.560),
+            (1250, "1250ms", 1.250),
+            (999, "1000ms", 1.0),
+            (0, "1000ms", 1.0),
+            (None, "1000ms", 1.0),
+        ):
+            with self.subTest(duration_ms=duration_ms):
+                url = self.play_queue.build_stream_url("track-1", duration_ms)
+                self.assertEqual(f"http://127.0.0.1:52309/track/track-1/{token}", url)
+                self.assertNotIn(".", url.rsplit("/", 1)[-1])
+                self.assertEqual(("track-1", seconds), playlist_next.parse_track_url(url))
+
+    def test_saved_track_urls_keep_second_duration_interface(self):
+        import playlist_next
+
+        for host in ("localhost", "127.0.0.1"):
+            for token in ("213.560", "213.560.wav", "213.560.wav/", "213560ms", "213560ms/"):
+                with self.subTest(host=host, token=token):
+                    url = f"http://{host}:52309/track/track-1/{token}"
+                    self.assertEqual(("track-1", 213.560), playlist_next.parse_track_url(url))
+        for token in ("1.5ms", "-1ms", "nanms", "1e3ms", "213560ms.wav", "ms"):
+            with self.subTest(invalid=token):
+                self.assertEqual((None, None), playlist_next.parse_track_url(
+                    f"http://127.0.0.1:52309/track/track-1/{token}"))
 
     # --- start_session / mark_original_complete ---------------------------------
 

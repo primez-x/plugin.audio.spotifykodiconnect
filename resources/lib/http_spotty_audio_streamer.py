@@ -3,6 +3,8 @@ HTTP server for Spotify audio streams. WAV (PCM) path only.
 We serve standard HTTP range semantics so Kodi's cache/buffer settings take effect.
 """
 
+import math
+import re
 import threading
 import time
 import uuid
@@ -613,7 +615,7 @@ class HTTPSpottyAudioStreamer:
         self,
         track_id: str,
         request_id: str,
-        duration: str,
+        duration: float,
         bitrate: str,
         normalization: str,
     ) -> Optional[SpottyStreamSpec]:
@@ -632,7 +634,7 @@ class HTTPSpottyAudioStreamer:
                 return None
             self.__spotty_streamer.bitrate = bitrate
             self.__spotty_streamer.normalization_gain_type = normalization
-            self.__spotty_streamer.set_track(track_id, float(duration))
+            self.__spotty_streamer.set_track(track_id, duration)
             return self.__spotty_streamer.get_stream_spec()
 
     def _commit_initialization(
@@ -823,10 +825,21 @@ class HTTPSpottyAudioStreamer:
     SPOTTY_AUDIO_TRACK_ROUTE = "/track/<track_id>/<duration>"
 
     def spotty_stream_audio_track(self, track_id: str, duration: str) -> bottle.Response:
-        # Strip optional .wav suffix — URLs include it so Kodi selects PAPlayer
-        # directly instead of trying VideoPlayer first (demuxer error + retry).
-        if duration.endswith(".wav"):
-            duration = duration[:-4]
+        # MIME selects PAPlayer. Extension-free URLs skip the empty WAV TagLib probe.
+        # Normalize saved decimal-second URLs and canonical milliseconds before HEAD/GET.
+        try:
+            if re.fullmatch(r"[0-9]+ms", duration):
+                duration = int(duration[:-2]) / 1000.0
+            elif re.fullmatch(r"[0-9]+(?:\.[0-9]+)?(?:\.wav)?", duration):
+                duration = float(duration[:-4] if duration.endswith(".wav") else duration)
+            else:
+                raise ValueError("Invalid track duration")
+            if not math.isfinite(duration):
+                raise ValueError("Invalid track duration")
+            duration = max(1.0, duration)
+        except (ValueError, OverflowError):
+            bottle.response.status = 400
+            return "Invalid track duration."
         log_msg(f"{bottle.request.method} request: {bottle.request}", LOGDEBUG)
 
         # HEAD requests: return headers only. NEVER mutate state, call set_track(),
@@ -965,7 +978,7 @@ class HTTPSpottyAudioStreamer:
                 prebuf_result,
                 has_prebuf,
                 track_id=track_id,
-                duration_str=duration,
+                duration_sec=duration,
                 request_id=request_id,
                 previous_track_id=_previous_track_id,
                 previous_request_id=_previous_request_id,
@@ -992,17 +1005,12 @@ class HTTPSpottyAudioStreamer:
 
     spotty_stream_audio_track.route = SPOTTY_AUDIO_TRACK_ROUTE
 
-    def _handle_head_only(self, track_id: str, duration: str):
+    def _handle_head_only(self, track_id: str, duration: float):
         """Return headers for HEAD requests without touching any streaming state."""
-        try:
-            dur = max(1.0, float(duration))
-        except (ValueError, TypeError):
-            dur = 1.0
-
         # Always derive size from the URL's duration — the current streamer may have a
         # different track loaded, which would return the wrong Content-Length for queued
         # (non-current) tracks and confuse Kodi's prefetch queue.
-        _, file_size = create_wav_header_for_duration(dur)
+        _, file_size = create_wav_header_for_duration(duration)
 
         bottle.response.status = 200
         bottle.response.content_type = "audio/x-wav"
@@ -1026,7 +1034,7 @@ class HTTPSpottyAudioStreamer:
         prebuf_result,
         has_prebuf,
         track_id=None,
-        duration_str=None,
+        duration_sec=1.0,
         request_id=None,
         previous_track_id=None,
         previous_request_id="",
@@ -1037,14 +1045,6 @@ class HTTPSpottyAudioStreamer:
     ):
         streamer = self.__spotty_streamer
         stream_spec = stream_spec or streamer.get_stream_spec()
-        # Parse duration from request URL
-        _duration_sec = 1.0
-        if track_id and duration_str:
-            try:
-                _duration_sec = max(1.0, float(duration_str))
-            except (ValueError, TypeError):
-                pass
-
         file_size = stream_spec.track_length
         range_begin = 0
         range_end = file_size
@@ -1057,11 +1057,11 @@ class HTTPSpottyAudioStreamer:
             # Compute WAV header length without mutating shared streamer state to
             # ensure HEAD/early requests can return accurate Content-Length.
             try:
-                _, total_length = create_wav_header_for_duration(_duration_sec)
+                _, total_length = create_wav_header_for_duration(duration_sec)
                 file_size = total_length
                 range_end = file_size
                 log_msg(
-                    f"Computed WAV header length from duration={_duration_sec}s -> file_size={file_size}.",
+                    f"Computed WAV header length from duration={duration_sec}s -> file_size={file_size}.",
                     LOGDEBUG,
                 )
             except Exception:

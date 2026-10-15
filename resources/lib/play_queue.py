@@ -15,7 +15,7 @@ from contextlib import contextmanager
 
 import xbmcgui
 
-from utils import ADDON_DATA_PATH, ADDON_WINDOW_ID, log_msg
+from utils import ADDON_DATA_PATH, ADDON_WINDOW_ID, PROXY_HOST, PROXY_PORT, log_msg
 from xbmc import LOGDEBUG
 
 ITEM_OWNER_PROPERTY = "_spotify_queue_owner"
@@ -33,6 +33,12 @@ _PLAY_QUEUE_PROPS = (
     PROP_ORIGINAL_COMPLETE,
     PROP_AUTOPLAY_FETCHED,
 )
+
+
+def build_stream_url(track_id: str, duration_ms: int) -> str:
+    """Preserve millisecond WAV length without a file extension that triggers TagLib."""
+    duration_ms = max(1000, int(duration_ms or 0))
+    return f"http://{PROXY_HOST}:{PROXY_PORT}/track/{track_id}/{duration_ms}ms"
 
 
 def bind_stream_item(listitem, track_id: str, owner: str = "") -> None:

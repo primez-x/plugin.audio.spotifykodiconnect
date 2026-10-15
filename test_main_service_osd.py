@@ -8,6 +8,7 @@ _REAL_THREAD = threading.Thread
 import types
 import tempfile
 import unittest
+from unittest.mock import patch
 
 REPO_ROOT = os.path.dirname(__file__)
 LIB_DIR = os.path.join(REPO_ROOT, "resources", "lib")
@@ -655,23 +656,46 @@ class SpotifyOSDPlayerMonitorTests(unittest.TestCase):
         self.assertEqual(0, service._prebuffer_token)
 
     def test_confirmed_spotify_playback_publishes_current_track_hook(self):
-        main_service = import_main_service(
-            {"Player.FileNameAndPath": "http://127.0.0.1:52309/track/track-1/213.560.wav"},
-            {"prebuffer_enabled": "false", "spotify_autoplay": "false"},
-        )
+        for token in ("213.560.wav", "213560ms"):
+            with self.subTest(token=token):
+                url = f"http://127.0.0.1:52309/track/track-1/{token}"
+                main_service = import_main_service(
+                    {"Player.FileNameAndPath": url},
+                    {"prebuffer_enabled": "false", "spotify_autoplay": "false"},
+                )
+                main_service.get_next_playlist_item = lambda: ({"file": url}, None)
+                service = object.__new__(main_service.MainService)
+                published = []
+                service._MainService__on_track_started = lambda track_id, duration: published.append(
+                    (track_id, duration)
+                )
+
+                service._MainService__on_spotify_playback_started("track-1")
+
+                self.assertEqual([("track-1", 213.56)], published)
+
+    def test_canonical_next_track_prebuffer_receives_seconds(self):
+        main_service = import_main_service({}, {"prebuffer_enabled": "true"})
         main_service.get_next_playlist_item = lambda: (
-            {"file": "http://127.0.0.1:52309/track/track-1/213.560.wav"},
-            None,
+            {"file": "http://127.0.0.1:52309/track/current/180000ms"},
+            {"file": "http://127.0.0.1:52309/track/next/213560ms"},
         )
+        calls = []
         service = object.__new__(main_service.MainService)
-        published = []
-        service._MainService__on_track_started = lambda track_id, duration: published.append(
-            (track_id, duration)
+        service._prebuffer_token = 0
+        service._prebuffer_token_lock = threading.Lock()
+        service._MainService__wait_for_prebuffer_window = lambda *args: True
+        service._get_prebuffer_release_delay = lambda: 0
+        service._get_bitrate_setting = lambda: "320"
+        service._MainService__prebuffer_manager = types.SimpleNamespace(
+            start_prebuffer=lambda track_id, duration, **kwargs: calls.append((track_id, duration))
         )
-
-        service._MainService__on_spotify_playback_started("track-1")
-
-        self.assertEqual([("track-1", 213.56)], published)
+        service._watch_prebuffer_result = lambda *args: None
+        cache = types.ModuleType("spotty_cache")
+        cache.SpottyCacheManager = types.SimpleNamespace(find_active_downloader=lambda track_id: None)
+        with patch.dict(sys.modules, {"spotty_cache": cache}), patch.object(main_service.time, "sleep"):
+            service._MainService__on_spotify_playback_started("current")
+        self.assertEqual([("next", 213.560)], calls)
 
 
 class ServiceCacheAndFanartTests(unittest.TestCase):
@@ -1300,7 +1324,7 @@ class SpotifyAutoplayGatingTests(unittest.TestCase):
             return {
                 "id": f"rec-{index}",
                 "name": f"Rec {index}",
-                "duration_ms": 180500,
+                "duration_ms": 213560,
                 "artists": [{"id": "a", "name": f"Artist {index}"}],
                 "album": {"name": "Album", "images": [{"url": f"img-{index}"}]},
             }
@@ -1362,8 +1386,8 @@ class SpotifyAutoplayGatingTests(unittest.TestCase):
         self.assertEqual([("recommendations", ("seed",), 49)], calls)
         self.assertEqual(
             [
-                "http://127.0.0.1:52309/track/rec-1/180.500.wav",
-                "http://127.0.0.1:52309/track/rec-3/180.500.wav",
+                "http://127.0.0.1:52309/track/rec-1/213560ms",
+                "http://127.0.0.1:52309/track/rec-3/213560ms",
             ],
             [url for url, _li in added],
         )
@@ -1376,6 +1400,19 @@ class SpotifyAutoplayGatingTests(unittest.TestCase):
         # Kodi must open queued items without probing the local stream first.
         self.assertEqual("audio/x-wav", first.mime_type)
         self.assertFalse(first.content_lookup)
+
+        from test_playlist_fastpath import import_plugin_content
+
+        with patch.dict(sys.modules), patch.object(sys, "argv", sys.argv[:]), patch.object(threading, "Thread", _REAL_THREAD):
+            sys.modules.pop("string_ids", None)
+            plugin_content = import_plugin_content()
+            content = object.__new__(plugin_content.PluginContent)
+            for url, _li in added:
+                track = _track(1 if "/rec-1/" in url else 3)
+                browse_url, browse_item = content._PluginContent__get_track_item(track)
+                self.assertEqual(url, browse_url)
+                self.assertEqual("audio/x-wav", browse_item.mime_type)
+                self.assertFalse(browse_item.content_lookup)
 
     def test_osd_clear_wipes_play_queue_session_state(self):
         """A current manual stop clears the queue and allows ordinary autoplay."""
