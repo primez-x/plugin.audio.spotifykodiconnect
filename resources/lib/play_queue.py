@@ -53,9 +53,6 @@ def bind_stream_item(listitem, track_id: str, owner: str = "") -> None:
     listitem.setProperty(ITEM_OWNER_PROPERTY, f"{owner}:{track_id}")
     # Spotify proxy tracks have no entry in Kodi's local music library.
     listitem.setProperty("database-lookup", "false")
-    # Extensionless proxy URLs carry no media type, so PlayMedia needs the music playlist hint
-    # (Kodi PLAYLIST::TYPE_MUSIC) to start the song inside the existing queue.
-    listitem.setProperty("playlist_type_hint", "0")
     listitem.setMimeType("audio/x-wav")
     listitem.setContentLookup(False)
 

@@ -77,27 +77,6 @@ class PlayQueueTests(unittest.TestCase):
                 self.assertNotIn(".", url.rsplit("/", 1)[-1])
                 self.assertEqual(("track-1", seconds), playlist_next.parse_track_url(url))
 
-    def test_bound_stream_item_starts_in_music_playlist(self):
-        class FakeListItem:
-            def __init__(self):
-                self.properties = {}
-
-            def setProperty(self, key, value):
-                self.properties[key] = value
-
-            def setMimeType(self, mime_type):
-                self.mime_type = mime_type
-
-            def setContentLookup(self, enabled):
-                self.content_lookup = enabled
-
-        listitem = FakeListItem()
-        self.play_queue.bind_stream_item(listitem, "track-1", "owner")
-        # Kodi PLAYLIST::TYPE_MUSIC; extensionless URLs give Kodi no other media type.
-        self.assertEqual("0", listitem.properties["playlist_type_hint"])
-        self.assertEqual("audio/x-wav", listitem.mime_type)
-        self.assertFalse(listitem.content_lookup)
-
     def test_saved_track_urls_keep_second_duration_interface(self):
         import playlist_next
 

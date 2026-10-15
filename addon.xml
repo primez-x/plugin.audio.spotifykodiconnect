@@ -25,7 +25,6 @@
 - Avoid duplicate stream reads before song playback.
 - Reuse downloaded audio when a stopped song starts again.
 - Skip local-library searches for Spotify song queues.
-- Start a selected song inside the existing Spotify queue.
 
 v1.4.0
 - Show clear messages for rate-limit, permission, and connection failures in listings.
