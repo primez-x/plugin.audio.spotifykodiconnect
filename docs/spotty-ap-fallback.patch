@@ -1,0 +1,214 @@
+diff --git a/core/Cargo.toml b/core/Cargo.toml
+index 4e1855b..f5e7e42 100644
+--- a/core/Cargo.toml
++++ b/core/Cargo.toml
+@@ -39,7 +39,7 @@ serde_json = "1.0"
+ sha-1 = "0.9"
+ shannon = "0.2.0"
+ thiserror = "1.0.7"
+-tokio = { version = "1.0", features = ["io-util", "net", "rt", "sync"] }
++tokio = { version = "1.0", features = ["io-util", "net", "rt", "sync", "time"] }
+ tokio-stream = "0.1.1"
+ tokio-util = { version = "0.7", features = ["codec"] }
+ url = "2.1"
+diff --git a/core/src/apresolve.rs b/core/src/apresolve.rs
+index dc3a5cc..9962412 100644
+--- a/core/src/apresolve.rs
++++ b/core/src/apresolve.rs
+@@ -1,3 +1,4 @@
++use std::collections::HashSet;
+ use std::error::Error;
+ 
+ use hyper::client::HttpConnector;
+@@ -18,7 +19,7 @@ struct ApResolveData {
+ async fn try_apresolve(
+     proxy: Option<&Url>,
+     ap_port: Option<u16>,
+-) -> Result<String, Box<dyn Error>> {
++) -> Result<Vec<String>, Box<dyn Error>> {
+     let port = ap_port.unwrap_or(443);
+ 
+     let mut req = Request::new(Body::empty());
+@@ -58,29 +59,37 @@ async fn try_apresolve(
+         })
+         .collect();
+ 
+-    let ap = if ap_port.is_some() || proxy.is_some() {
++    let mut aps: Vec<String> = if ap_port.is_some() || proxy.is_some() {
+         // filter on ports if specified on the command line...
+-        aps.into_iter().find_map(|ap| {
+-            if ap.parse::<Uri>().ok()?.port()? == port {
+-                Some(ap)
+-            } else {
+-                None
+-            }
+-        })
++        aps.into_iter()
++            .filter(|ap| {
++                ap.parse::<Uri>()
++                    .ok()
++                    .and_then(|uri| uri.port_u16())
++                    .map_or(false, |p| p == port)
++            })
++            .collect()
+     } else {
+-        // ...or pick the first on the list
+-        aps.into_iter().next()
++        // ...or keep the whole list in resolver order
++        aps
++    };
++
++    // the same AP may be listed more than once: try each only once
++    let mut seen = HashSet::new();
++    aps.retain(|ap| seen.insert(ap.clone()));
++
++    if aps.is_empty() {
++        return Err("Unable to resolve any viable access points.".into());
+     }
+-    .ok_or("Unable to resolve any viable access points.")?;
+ 
+-    Ok(ap)
++    Ok(aps)
+ }
+ 
+-pub async fn apresolve(proxy: Option<&Url>, ap_port: Option<u16>) -> String {
++pub async fn apresolve(proxy: Option<&Url>, ap_port: Option<u16>) -> Vec<String> {
+     try_apresolve(proxy, ap_port).await.unwrap_or_else(|e| {
+         warn!("Failed to resolve Access Point: {}", e);
+         warn!("Using fallback \"{}\"", AP_FALLBACK);
+-        AP_FALLBACK.into()
++        vec![AP_FALLBACK.into()]
+     })
+ }
+ 
+@@ -92,7 +101,7 @@ mod test {
+ 
+     #[tokio::test]
+     async fn test_apresolve() {
+-        let ap = try_apresolve(None, None).await.unwrap();
++        let ap = try_apresolve(None, None).await.unwrap().remove(0);
+ 
+         // Assert that the result contains a valid host and port
+         ap.to_socket_addrs().unwrap().next().unwrap();
+@@ -100,7 +109,7 @@ mod test {
+ 
+     #[tokio::test]
+     async fn test_apresolve_port_443() {
+-        let ap = try_apresolve(None, Some(443)).await.unwrap();
++        let ap = try_apresolve(None, Some(443)).await.unwrap().remove(0);
+ 
+         let port = ap.to_socket_addrs().unwrap().next().unwrap().port();
+         assert_eq!(port, 443);
+diff --git a/core/src/connection/mod.rs b/core/src/connection/mod.rs
+index 58d3e83..6aa618f 100644
+--- a/core/src/connection/mod.rs
++++ b/core/src/connection/mod.rs
+@@ -143,7 +143,10 @@ pub async fn authenticate(
+     let data = packet.write_to_bytes().unwrap();
+ 
+     transport.send((cmd, data)).await?;
+-    let (cmd, data) = transport.next().await.expect("EOF")?;
++    let (cmd, data) = transport
++        .next()
++        .await
++        .ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "EOF"))??;
+     match cmd {
+         0xac => {
+             let welcome_data = APWelcome::parse_from_bytes(data.as_ref())?;
+diff --git a/core/src/session.rs b/core/src/session.rs
+index 6c8bf93..4e0faaa 100644
+--- a/core/src/session.rs
++++ b/core/src/session.rs
+@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::{Arc, RwLock, Weak};
+ use std::task::Context;
+ use std::task::Poll;
+-use std::time::{SystemTime, UNIX_EPOCH};
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
+ 
+ use byteorder::{BigEndian, ByteOrder};
+ use bytes::Bytes;
+@@ -14,6 +14,7 @@ use futures_util::{future, ready, StreamExt, TryStreamExt};
+ use once_cell::sync::OnceCell;
+ use thiserror::Error;
+ use tokio::sync::mpsc;
++use tokio::time::timeout;
+ use tokio_stream::wrappers::UnboundedReceiverStream;
+ 
+ use crate::apresolve::apresolve;
+@@ -24,6 +25,7 @@ use crate::channel::ChannelManager;
+ use crate::config::SessionConfig;
+ use crate::connection::{self, AuthenticationError};
+ use crate::mercury::MercuryManager;
++use crate::protocol::keyexchange::ErrorCode;
+ 
+ #[derive(Debug, Error)]
+ pub enum SessionError {
+@@ -56,6 +58,9 @@ struct SessionInternal {
+     session_id: usize,
+ }
+ 
++// Leaves time for a fallback AP within the 5 s first-PCM watchdog of the add-on.
++const AP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
++
+ static SESSION_COUNTER: AtomicUsize = AtomicUsize::new(0);
+ 
+ #[derive(Clone)]
+@@ -68,13 +73,25 @@ impl Session {
+         cache: Option<Cache>,
+         store_credentials: bool,
+     ) -> Result<(Session, Credentials), SessionError> {
+-        let ap = apresolve(config.proxy.as_ref(), config.ap_port).await;
+-
+-        info!("Connecting to AP \"{}\"", ap);
+-        let mut conn = connection::connect(ap, config.proxy.as_ref()).await?;
+-
+-        let reusable_credentials =
+-            connection::authenticate(&mut conn, credentials, &config.device_id).await?;
++        let aps = apresolve(config.proxy.as_ref(), config.ap_port).await;
++
++        // Try the access points in order. Failing to reach one, or being told to try
++        // another, moves on to the next. Any other login failure is final.
++        let mut result =
++            Err(io::Error::new(io::ErrorKind::NotFound, "No access point to connect to").into());
++        for ap in aps {
++            result = Self::connect_ap(&ap, &config, credentials.clone()).await;
++            match &result {
++                Ok(_) => break,
++                Err(SessionError::AuthenticationError(AuthenticationError::LoginFailed(code)))
++                    if *code != ErrorCode::TryAnotherAP =>
++                {
++                    break
++                }
++                Err(e) => warn!("Failed to use AP \"{}\": {}", ap, e),
++            }
++        }
++        let (conn, reusable_credentials) = result?;
+         info!("Authenticated as \"{}\" !", reusable_credentials.username);
+         if let Some(cache) = &cache {
+             if store_credentials {
+@@ -93,6 +110,24 @@ impl Session {
+         Ok((session, reusable_credentials))
+     }
+ 
++    async fn connect_ap(
++        ap: &str,
++        config: &SessionConfig,
++        credentials: Credentials,
++    ) -> Result<(connection::Transport, Credentials), SessionError> {
++        info!("Connecting to AP \"{}\"", ap);
++        let mut conn = timeout(
++            AP_CONNECT_TIMEOUT,
++            connection::connect(ap.to_string(), config.proxy.as_ref()),
++        )
++        .await
++        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timed out connecting to AP"))??;
++
++        let reusable_credentials =
++            connection::authenticate(&mut conn, credentials, &config.device_id).await?;
++        Ok((conn, reusable_credentials))
++    }
++
+     fn create(
+         transport: connection::Transport,
+         config: SessionConfig,

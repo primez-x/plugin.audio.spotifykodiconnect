@@ -88,6 +88,28 @@ These commands match `.primez-publish.json`.
 - Follow the [Primez versioning rules](https://github.com/primez-x/kodi.addons/blob/main/VERSIONING.md) and the [central repository guide](https://github.com/primez-x/kodi.addons/blob/main/README.md).
 - Report add-on issues in the [Primez SpotifyKodiConnect repository](https://github.com/primez-x/plugin.audio.spotifykodiconnect/issues).
 
+## Spotty ARM helper
+
+The ARMv7 hard-float helper uses Spotty 1.3.1 and librespot 0.4.2 with connection fallback.
+The patch preserves the original login, token, and PCM paths.
+Other platform binaries retain their existing builds and ABIs.
+The shipped ARM helper SHA-256 is `8ed6bef8e81229d81e7cbe7559bfc07f4e29c4adc87475fe03db15b6f65b0c33`.
+
+Rebuild with Docker and Rust 1.71.0:
+
+```sh
+rustup toolchain install 1.71.0 --profile minimal --target armv7-unknown-linux-musleabihf
+spotty_source=$(mktemp -d)
+git clone --no-checkout https://github.com/michaelherger/librespot "$spotty_source"
+git -C "$spotty_source" checkout --detach d19782444e3c50cba6b0d47fb881a0de6774ce4c
+git -C "$spotty_source" config core.abbrev 7
+touch "$spotty_source/src/client_id.txt"
+git -C "$spotty_source" apply "$PWD/docs/spotty-ap-fallback.patch"
+sh docs/build-spotty.sh "$spotty_source" /tmp/spotty-muslhf
+```
+
+The build date changes the binary hash across days.
+
 ## Credits and license
 
 - Based on [plugin.audio.spotify](https://github.com/glk1001/plugin.audio.spotify) by glk1001.
