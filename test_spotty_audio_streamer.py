@@ -910,8 +910,6 @@ class SpottyAudioStreamerTests(unittest.TestCase):
 
                 args, pcm_skip = downloader._build_args()
                 self.assertNotIn("--ap-port", args)
-                ap_args, _ = downloader._build_args(ap_port=443)
-                self.assertEqual("443", ap_args[ap_args.index("--ap-port") + 1])
 
                 if expected_start_position is None:
                     self.assertNotIn("--start-position", args)
@@ -1139,7 +1137,7 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         self.assertIsNone(spotty_cache._classify_spotty_failure("unverified diagnostic"))
         header, length = self.module.create_wav_header_for_duration(1)
         spotty = FakeSpotty([b"", bytes(length - len(header))])
-        with patch.object(spotty_cache.SpottyDownloader, "_RETRY_DELAYS", (0,)):
+        with patch.object(spotty_cache.SpottyDownloader, "_KEY_DENIED_RETRY_DELAY", 0):
             downloader = spotty_cache.SpottyDownloader(
                 spotty, "t1", 1, 0, "320", "off", 35, header, length)
             downloader.start()
@@ -1386,6 +1384,10 @@ class SpottyAudioStreamerTests(unittest.TestCase):
         remaining = self.module.STARTUP_REAL_PCM_WAIT_SECONDS - elapsed_before_third_attempt
 
         self.assertGreaterEqual(remaining, 3.0)
+        # A key denial exits about a second after launch; its single spaced
+        # retry must also start well inside the window.
+        denial_retry_start = 1.5 + spotty_cache.SpottyDownloader._KEY_DENIED_RETRY_DELAY
+        self.assertGreaterEqual(self.module.STARTUP_REAL_PCM_WAIT_SECONDS - denial_retry_start, 3.0)
 
     def test_cache_start_without_abort_refuses_to_interrupt_active_downloader(self):
         sys.modules.pop("spotty_cache", None)
@@ -1802,25 +1804,35 @@ class SpottyBackpressureTests(unittest.TestCase):
                 downloader.cond.wait(0.02)
             downloader.advance_consumer_locked(consumer_id, downloader.written_bytes)
 
-    def test_zero_pcm_retries_cycle_spotify_ap_ports(self):
+    def test_zero_pcm_retries_once_after_spaced_wait(self):
+        # Spotify limits audio keys per account: a denied start retries once,
+        # after a wait, on the same access-point selection.
         _, track_length = self.module.create_wav_header_for_duration(2)
         pcm = _pattern_pcm(track_length - 44)
-        spotty = PatternSpotty(pcm, limits=[0, 0, None], returncodes=[0, 0, 0])
-        downloader, wav_header, track_length = self._make(spotty, duration=2)
-        downloader._consumer_positions[0] = 0
-        downloader.start()
+        cls = self.cache.SpottyDownloader
+        original_delay = cls._KEY_DENIED_RETRY_DELAY
+        cls._KEY_DENIED_RETRY_DELAY = 0.3
+        try:
+            for limits, recovered in (([0, None], True), ([0, 0, None], False)):
+                with self.subTest(limits=limits):
+                    spotty = PatternSpotty(pcm, limits=limits, returncodes=[0] * len(limits))
+                    downloader, wav_header, track_length = self._make(spotty, duration=2)
+                    downloader._consumer_positions[0] = 0
+                    started = time.monotonic()
+                    downloader.start()
 
-        self._read_until_finished(downloader, 0)
-        downloader.thread.join(timeout=2.0)
+                    self._read_until_finished(downloader, 0)
+                    downloader.thread.join(timeout=2.0)
 
-        self.assertTrue(downloader.is_finished)
-        self.assertFalse(downloader.error)
-        self.assertEqual(wav_header + pcm, bytes(downloader._buffer))
-        ports = [
-            call[call.index("--ap-port") + 1] if "--ap-port" in call else None
-            for call in spotty.calls
-        ]
-        self.assertEqual([None, "443", "80"], ports)
+                    self.assertGreaterEqual(time.monotonic() - started, 0.3)
+                    self.assertTrue(downloader.is_finished)
+                    self.assertEqual(2, len(spotty.calls))
+                    self.assertFalse(any("--ap-port" in call for call in spotty.calls))
+                    self.assertEqual(not recovered, downloader.error)
+                    if recovered:
+                        self.assertEqual(wav_header + pcm, bytes(downloader._buffer))
+        finally:
+            cls._KEY_DENIED_RETRY_DELAY = original_delay
 
     def test_high_water_mark_stays_below_unread_tail_cap(self):
         sys.modules.pop("spotty_cache", None)

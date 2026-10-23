@@ -645,7 +645,7 @@ class SpottyDownloader:
             self.first_real_pcm_monotonic = now
         self.last_progress_monotonic = now
 
-    def _build_args(self, start_byte=None, lead_sec=0, ap_port=None):
+    def _build_args(self, start_byte=None, lead_sec=0):
         """Spotty args and the byte skip from its nominal start to *start_byte*."""
         # Calculate start position in seconds. 176400 bytes per second (44.1kHz, 16-bit, stereo)
         target_start_byte = self.start_byte if start_byte is None else int(start_byte)
@@ -667,8 +667,6 @@ class SpottyDownloader:
                 "--normalisation-gain-type",
                 self.normalization,
             ]
-        if ap_port is not None:
-            args += ["--ap-port", str(ap_port)]
         args += ["--single-track", f"spotify:track:{self.track_id}"]
         if start_sec_wav > 0:
             args += ["--start-position", str(start_sec_wav)]
@@ -701,11 +699,12 @@ class SpottyDownloader:
     # Small tail mismatches can be padded, but large gaps are stream failures.
     _MAX_SESSION_RETRIES = 3
     _RETRY_DELAYS = [0.5, 1.0, 1.5]
-    # A zero-PCM exit usually means the selected Spotify access point accepted
-    # the session but delivered no audio. Keep the first attempt on Spotify's
-    # resolver order, then force the other published AP ports on retries so a
-    # bad endpoint is not simply selected again three times.
-    _ZERO_PCM_AP_PORTS = (443, 80, 4070)
+    # A clean exit without PCM means Spotify denied the audio key (0x0002).
+    # Spotify limits key requests per account, on every access point, so a
+    # retry within seconds is nearly always denied too and spends more of the
+    # budget. Retry once, after a wait that still fits the startup window.
+    _MAX_KEY_DENIED_RETRIES = 1
+    _KEY_DENIED_RETRY_DELAY = 10.0
 
     def _download_loop(self):
         log_msg(f"Starting background download for {self.track_id} at {self.start_byte}")
@@ -716,8 +715,7 @@ class SpottyDownloader:
         # _MAX_SESSION_RETRIES restarts in total.
         attempt = -1
         failures = 0
-        ap_port = None
-        zero_pcm_failures = 0
+        key_denials = 0
         while True:
             attempt += 1
             self._wait_for_room({"bp_paused": False}, threading.Lock())
@@ -749,13 +747,11 @@ class SpottyDownloader:
                 if attempt > 0 and self._ever_retained and not resume_ref:
                     raise ValueError("Retained PCM has no exact resume reference")
                 lead_sec = _RESUME_LEAD_SECONDS if resume_ref is not None else 0
-                args, pcm_skip = self._build_args(
-                    attempt_start_byte, lead_sec, ap_port=ap_port)
+                args, pcm_skip = self._build_args(attempt_start_byte, lead_sec)
                 log_msg(
                     f"Spotty attempt {attempt + 1} for {self.track_id} at byte "
                     f"{attempt_start_byte}: skip {pcm_skip}"
-                    f"{', content-aligned' if resume_ref is not None else ''}"
-                    f"{f', AP port {ap_port}' if ap_port is not None else ''}",
+                    f"{', content-aligned' if resume_ref is not None else ''}",
                     LOGDEBUG,
                 )
                 process = self.spotty.run_spotty(args)
@@ -1005,22 +1001,23 @@ class SpottyDownloader:
                     LOGDEBUG,
                 )
                 failures = 0
+            key_denied = (
+                pcm_bytes_read == 0 and not timeout_reason and attempt_exception is None
+            )
+            if not key_denied:
+                key_denials = 0
             if (
                 retryable_finish
                 and terminal_cause is None
                 and failures < self._MAX_SESSION_RETRIES
+                and (not key_denied or key_denials < self._MAX_KEY_DENIED_RETRIES)
             ):
-                delay = self._RETRY_DELAYS[min(failures, len(self._RETRY_DELAYS) - 1)]
-                failures += 1
-                next_ap_port = None
-                if pcm_bytes_read == 0:
-                    next_ap_port = self._ZERO_PCM_AP_PORTS[
-                        min(zero_pcm_failures, len(self._ZERO_PCM_AP_PORTS) - 1)]
-                    zero_pcm_failures += 1
-                    ap_port = next_ap_port
+                if key_denied:
+                    delay = self._KEY_DENIED_RETRY_DELAY
+                    key_denials += 1
                 else:
-                    zero_pcm_failures = 0
-                    ap_port = None
+                    delay = self._RETRY_DELAYS[min(failures, len(self._RETRY_DELAYS) - 1)]
+                failures += 1
                 if timeout_reason:
                     reason = timeout_reason
                 elif attempt_exception is not None:
@@ -1034,8 +1031,7 @@ class SpottyDownloader:
                 log_msg(
                     f"Spotty {reason} for {self.track_id} "
                     f"(rc={rc}, transient stream failure). "
-                    f"Retry {failures}/{self._MAX_SESSION_RETRIES} after {delay}s"
-                    f"{f' via AP port {next_ap_port}' if next_ap_port else ''}.",
+                    f"Retry {failures}/{self._MAX_SESSION_RETRIES} after {delay}s.",
                     LOGWARNING,
                 )
                 # Use condition wait so abort() can interrupt the delay.
@@ -1076,7 +1072,7 @@ class SpottyDownloader:
                     elif (timeout_reason or attempt_exception is not None) and remaining > 0:
                         reason = timeout_reason or type(attempt_exception).__name__
                         log_msg(
-                            f"Spotty {reason} after {self._MAX_SESSION_RETRIES} retries for "
+                            f"Spotty {reason} after {failures} retries for "
                             f"{self.track_id} (rc={rc}). Marking as error.",
                             LOGWARNING,
                         )
@@ -1084,7 +1080,7 @@ class SpottyDownloader:
                     elif pcm_bytes_read == 0 and remaining > 0:
                         log_msg(
                             f"Spotty produced 0 PCM bytes after "
-                            f"{self._MAX_SESSION_RETRIES} retries for "
+                            f"{failures} retries for "
                             f"{self.track_id} (rc={rc}). Marking as error.",
                             LOGWARNING,
                         )
@@ -1092,7 +1088,7 @@ class SpottyDownloader:
                     elif remaining > 0:
                         log_msg(
                             f"Spotty ended {remaining} bytes short for {self.track_id}"
-                            f" after {self._MAX_SESSION_RETRIES} retries (rc={rc})."
+                            f" after {failures} retries (rc={rc})."
                             f" Marking downloader as errored.",
                             LOGWARNING,
                         )

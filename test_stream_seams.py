@@ -356,6 +356,7 @@ class StreamSeamTests(unittest.TestCase):
         self.prebuffer = prebuffer
         spotty_audio_streamer._THROTTLE_LEAD_BYTES = 1 << 40  # no real-time pacing
         spotty_cache.SpottyDownloader._RETRY_DELAYS = [0.0, 0.0, 0.0]
+        spotty_cache.SpottyDownloader._KEY_DENIED_RETRY_DELAY = 0.0
         self.header, self.track_length = spotty_audio_streamer.create_wav_header_for_duration(
             DURATION
         )
@@ -1697,7 +1698,8 @@ class StreamSeamTests(unittest.TestCase):
     def test_real_pipe_post_commit_failure_truncates_once_then_replay_recovers(self):
         import http.client
 
-        spotty = _RetryPipeSpotty([4, 0, 0, 0, None], gate_first=True)
+        # A partial first attempt, then key denials: one spaced retry, then failure.
+        spotty = _RetryPipeSpotty([4, 0, 0, None], gate_first=True)
         notices, finished = [], []
         with self._pipe_http(spotty=spotty) as (server, _, port):
             sys.modules["xbmcgui"].Dialog = lambda: types.SimpleNamespace(
@@ -1724,7 +1726,7 @@ class StreamSeamTests(unittest.TestCase):
                 failed.thread.join(2)
                 self.assertFalse(failed.thread.is_alive())
                 self.assertTrue(failed.error)
-                self.assertEqual(4, len(spotty.calls))
+                self.assertEqual(3, len(spotty.calls))
                 self.assertEqual([], finished)
                 self.assertEqual(1, len(notices))
                 server._notify_playback_failure(TRACK)
@@ -1746,7 +1748,7 @@ class StreamSeamTests(unittest.TestCase):
                 self.assertFalse(fresh.aborted)
                 self.assertEqual([TRACK], finished)
                 self.assertEqual(1, len(notices))
-                self.assertEqual(5, len(spotty.calls))
+                self.assertEqual(4, len(spotty.calls))
                 self.assertEqual([], spotty.seeks())
                 print("post-commit status=200 declared=5292044 received=48 "
                       "client=IncompleteRead failures=1 false_finished=0 replay_exact=True")
