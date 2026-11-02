@@ -22,6 +22,8 @@ STREAM_ROWS_PARAM = "rows"
 STREAM_ROWS_VALUE = "stream"
 FIRST_PARAM = "first"
 LAST_PARAM = "last"
+# A song click carries the row count of its list. Kodi rejects a Playlist.Add of an empty directory.
+SIZE_PARAM = "size"
 PROP_LISTING = "Spotify.PlayQueue.Listing"
 
 _HOME_WINDOW_ID = 10000
@@ -74,7 +76,7 @@ def _clicked_song(play_queue, query, track_id, duration_ms, owner):
     return url, li
 
 
-def _play_and_load_list(query, listing, track_id, duration_ms, position, playlist):
+def _play_and_load_list(query, listing, track_id, duration_ms, position, size, playlist):
     import play_queue
 
     # The session holds autoplay until the list is in the queue.
@@ -109,10 +111,11 @@ def _play_and_load_list(query, listing, track_id, duration_ms, position, playlis
                     "item": _stream_rows(listing, 0, position),
                 },
             )
-        _rpc(
-            "Playlist.Add",
-            {"playlistid": xbmc.PLAYLIST_MUSIC, "item": _stream_rows(listing, position + 1)},
-        )
+        if position + 1 < size:
+            _rpc(
+                "Playlist.Add",
+                {"playlistid": xbmc.PLAYLIST_MUSIC, "item": _stream_rows(listing, position + 1)},
+            )
         window.setProperty(PROP_LISTING, listing)
     play_queue.mark_original_complete(owner)
 
@@ -123,10 +126,11 @@ def run(query):
     track_id = params.get("track", "")
     try:
         position = int(params.get("position", ""))
+        size = int(params.get(SIZE_PARAM, ""))
         duration_ms = int(params.get("ms", ""))
     except ValueError:
-        position = duration_ms = -1
-    if not listing or not track_id or position < 0 or duration_ms < 0:
+        position = size = duration_ms = -1
+    if not listing or not track_id or not 0 <= position < size or duration_ms < 0:
         xbmc.log(f"plugin.audio.spotifykodiconnect: invalid song click '{query}'.", xbmc.LOGWARNING)
         return
 
@@ -136,4 +140,4 @@ def run(query):
         if index >= 0:
             xbmc.Player().play(playlist, startpos=index)
             return
-    _play_and_load_list(query, listing, track_id, duration_ms, position, playlist)
+    _play_and_load_list(query, listing, track_id, duration_ms, position, size, playlist)

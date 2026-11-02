@@ -29,6 +29,7 @@ from play_in_queue import (
     ACTION as PLAY_IN_QUEUE_ACTION,
     FIRST_PARAM,
     LAST_PARAM,
+    SIZE_PARAM,
     STREAM_ROWS_PARAM,
     STREAM_ROWS_VALUE,
 )
@@ -1499,19 +1500,21 @@ class PluginContent:
                     track.get("artist_followed"),
                 )
             item = self.__get_track_item(track, append_artist_to_label, context_items)
-            if item is None:
-                continue
-            if not stream_rows:
-                item = self.__get_song_click_row(item, len(result), listing)
-            result.append(item + (False,))
+            if item is not None:
+                result.append(item)
         if stream_rows:
             # Click-row positions index the full list, so slice after the rows exist.
             last = self.__params.get(LAST_PARAM)
-            return result[int(self.__params[FIRST_PARAM][0]) : int(last[0]) if last else None]
-        return result
+            result = result[int(self.__params[FIRST_PARAM][0]) : int(last[0]) if last else None]
+            return [item + (False,) for item in result]
+        size = len(result)
+        return [
+            self.__get_song_click_row(item, position, size, listing) + (False,)
+            for position, item in enumerate(result)
+        ]
 
     def __get_song_click_row(
-        self, item: Tuple[str, xbmcgui.ListItem], position: int, listing: str
+        self, item: Tuple[str, xbmcgui.ListItem], position: int, size: int, listing: str
     ) -> Tuple[str, xbmcgui.ListItem]:
         """Route a click to play_in_queue. Kodi rebuilds the whole queue for a playable row."""
         stream_url, li = item
@@ -1521,6 +1524,7 @@ class PluginContent:
             {
                 "action": PLAY_IN_QUEUE_ACTION,
                 "position": position,
+                SIZE_PARAM: size,
                 "track": track_id,
                 "ms": round(duration_sec * 1000),
                 "list": listing,

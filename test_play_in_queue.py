@@ -43,10 +43,14 @@ class FakeKodi:
         request = json.loads(request)
         method, params = request["method"], request["params"]
         self.calls.append((method, params))
+        rows = self.rows(params["item"]["directory"])
+        if not rows:
+            # Kodi rejects a directory item that holds no files.
+            return json.dumps({"error": {"code": -32602, "message": "Invalid params."}})
         if method == "Playlist.Insert":
-            self.queue[params["position"] : params["position"]] = self.rows(params["item"]["directory"])
+            self.queue[params["position"] : params["position"]] = rows
         elif method == "Playlist.Add":
-            self.queue += self.rows(params["item"]["directory"])
+            self.queue += rows
         return json.dumps({"result": "OK"})
 
 
@@ -57,7 +61,7 @@ class PlayInQueueTests(unittest.TestCase):
         xbmc.LOGWARNING = 2
         xbmc.log = lambda *args: None
         xbmc.executeJSONRPC = kodi.rpc
-        row = "plugin://plugin.audio.spotifykodiconnect/?action=play_in_queue&position=2&track=c&ms=1000&list=" + LIST
+        row = "plugin://plugin.audio.spotifykodiconnect/?action=play_in_queue&position=2&size=5&track=c&ms=1000&list=" + LIST
         labels = {"ListItem.FileNameAndPath": row if kodi.focused else "other", "ListItem.Title": "Song C"}
         xbmc.getInfoLabel = lambda name: labels.get(name, "")
 
@@ -151,8 +155,10 @@ class PlayInQueueTests(unittest.TestCase):
         self.addCleanup(sys.modules.pop, "play_in_queue", None)
         return play_in_queue
 
-    def click(self, kodi, position, track_id):
-        self.install(kodi).run(f"?action=play_in_queue&position={position}&track={track_id}&ms=1000&list={LIST}")
+    def click(self, kodi, position, track_id, size=5):
+        self.install(kodi).run(
+            f"?action=play_in_queue&position={position}&size={size}&track={track_id}&ms=1000&list={LIST}"
+        )
 
     def test_click_in_the_list_queue_plays_without_a_rebuild(self):
         kodi = FakeKodi([song("a"), song("b"), song("c")])
@@ -184,13 +190,27 @@ class PlayInQueueTests(unittest.TestCase):
     def test_first_song_loads_only_the_songs_after_the_click(self):
         listing = [song(t) for t in "ab"]
         kodi = FakeKodi(listing=listing)
-        self.click(kodi, 0, "a")
+        self.click(kodi, 0, "a", size=2)
         self.assertNotIn("Playlist.Insert", [call[0] for call in kodi.calls])
         self.assertEqual(listing, [item.getPath() for item in kodi.queue])
 
+    def test_last_song_loads_only_the_songs_before_the_click(self):
+        listing = [song(t) for t in "abc"]
+        kodi = FakeKodi(listing=listing)
+        self.click(kodi, 2, "c", size=3)
+        self.assertNotIn("Playlist.Add", [call[0] for call in kodi.calls])
+        self.assertEqual(listing, [item.getPath() for item in kodi.queue])
+        self.assertEqual(LIST, kodi.properties["Spotify.PlayQueue.Listing"])
+
+    def test_only_song_of_a_single_needs_no_list_load(self):
+        kodi = FakeKodi(listing=[song("a")])
+        self.click(kodi, 0, "a", size=1)
+        self.assertEqual(["clear", "add", "play", "complete"], [call[0] for call in kodi.calls])
+        self.assertEqual(LIST, kodi.properties["Spotify.PlayQueue.Listing"])
+
     def test_unfocused_click_plays_without_row_tags(self):
         kodi = FakeKodi(listing=[song("c")], focused=False)
-        self.click(kodi, 0, "c")
+        self.click(kodi, 0, "c", size=1)
         self.assertEqual(("add", ""), kodi.calls[1])
 
     def test_newer_click_stops_the_list_load(self):
@@ -203,23 +223,25 @@ class PlayInQueueTests(unittest.TestCase):
             kodi.properties["Spotify.PlayQueue.SessionId"] = "newer"
 
         module.xbmc.Player.play = play_then_supersede
-        module.run(f"?action=play_in_queue&position=1&track=b&ms=1000&list={LIST}")
+        module.run(f"?action=play_in_queue&position=1&size=3&track=b&ms=1000&list={LIST}")
         self.assertNotIn("Playlist.Add", [call[0] for call in kodi.calls])
         self.assertNotIn("Spotify.PlayQueue.Listing", kodi.properties)
 
     def test_song_that_never_starts_ends_the_load(self):
         kodi = FakeKodi(listing=[song(t) for t in "abc"], starts=False)
-        self.click(kodi, 1, "b")
+        self.click(kodi, 1, "b", size=3)
         self.assertEqual(["clear", "add", "play", "complete"], [call[0] for call in kodi.calls])
 
     def test_invalid_click_changes_nothing(self):
         kodi = FakeKodi([song("a")])
         module = self.install(kodi)
         for query in (
-            f"?action=play_in_queue&track=a&ms=1&list={LIST}",
-            f"?action=play_in_queue&position=z&track=a&ms=1&list={LIST}",
-            f"?action=play_in_queue&position=0&track=a&list={LIST}",
-            "?action=play_in_queue&position=0&track=a&ms=1",
+            f"?action=play_in_queue&size=1&track=a&ms=1&list={LIST}",
+            f"?action=play_in_queue&position=z&size=1&track=a&ms=1&list={LIST}",
+            f"?action=play_in_queue&position=0&track=a&ms=1&list={LIST}",
+            f"?action=play_in_queue&position=1&size=1&track=a&ms=1&list={LIST}",
+            f"?action=play_in_queue&position=0&size=1&track=a&list={LIST}",
+            "?action=play_in_queue&position=0&size=1&track=a&ms=1",
         ):
             module.run(query)
         self.assertEqual([], kodi.calls)
