@@ -3,6 +3,7 @@ import sys
 import types
 import tempfile
 import unittest
+from urllib.parse import parse_qs, urlsplit
 
 REPO_ROOT = os.path.dirname(__file__)
 LIB_DIR = os.path.join(REPO_ROOT, "resources", "lib")
@@ -2209,6 +2210,150 @@ class SavedTracksPagingTests(unittest.TestCase):
         self.assertEqual(list(range(50, 600, 50)), results)
         self.assertGreater(state["peak"], 1)
         self.assertLessEqual(state["peak"], self.plugin_content.PAGED_FETCH_WORKERS)
+
+
+
+def catalog_track(track_id, artist_ids, isrc, release_date, number):
+    return {
+        "id": track_id,
+        "uri": f"spotify:track:{track_id}",
+        "name": track_id,
+        "duration_ms": 180000,
+        "popularity": 50,
+        "track_number": number,
+        "disc_number": 1,
+        "external_ids": {"isrc": isrc},
+        "artists": [{"id": artist_id, "name": artist_id} for artist_id in artist_ids],
+        "album": {"name": "Release", "images": [], "release_date": release_date},
+    }
+
+
+class ArtistCatalogSpotify(FakeSpotify):
+    """Artist "me" with an album, a long album, a single that repeats an album song,
+    and a compilation that holds another artist's song."""
+
+    RELEASES = [
+        ("album-new", "2025-05-01", [("new-1", ["me"], "I1"), ("new-2", ["me", "guest"], "I2")]),
+        ("album-long", "2024-06-01", [("long-1", ["me"], "L1"), ("long-2", ["me"], "L2"), ("long-3", ["me"], "L3")]),
+        ("single-old", "2024-03-01", [("single-1", ["me"], "I1")]),
+        ("compilation", "2023-01-01", [("other-1", ["other"], "O1"), ("comp-1", ["me"], "C1")]),
+    ]
+    # The long album embeds only its first two songs, like an album with more than 50.
+    EMBEDDED = {"album-long": 2}
+
+    def __init__(self, events):
+        super().__init__(events)
+        self.artist_album_requests = []
+        self.album_track_requests = []
+        self.tracks_by_id = {}
+        for album_id, release_date, songs in self.RELEASES:
+            for number, (track_id, artist_ids, isrc) in enumerate(songs, 1):
+                self.tracks_by_id[track_id] = catalog_track(track_id, artist_ids, isrc, release_date, number)
+
+    def __simple(self, album_id):
+        songs = next(songs for release_id, _date, songs in self.RELEASES if release_id == album_id)
+        return [
+            {"id": track_id, "artists": [{"id": artist_id} for artist_id in artist_ids]}
+            for track_id, artist_ids, _isrc in songs
+        ]
+
+    def artist_albums(self, artist_id, album_type=None, country=None, limit=50, offset=0):
+        self.artist_album_requests.append((artist_id, album_type, offset))
+        items = [{"id": album_id} for album_id, _date, _songs in self.RELEASES]
+        return {"total": len(items), "items": items[offset : offset + limit]}
+
+    def albums(self, album_ids, market=None):
+        albums = []
+        for album_id in album_ids:
+            songs = self.__simple(album_id)
+            shown = self.EMBEDDED.get(album_id, len(songs))
+            albums.append({"id": album_id, "tracks": {"total": len(songs), "items": songs[:shown]}})
+        return {"albums": albums}
+
+    def album_tracks(self, album_id, market=None, limit=50, offset=0):
+        self.album_track_requests.append((album_id, offset))
+        return {"items": self.__simple(album_id)[offset : offset + limit]}
+
+    def tracks(self, track_ids, market=None):
+        self.track_detail_requests.append((tuple(track_ids), market))
+        return {"tracks": [self.tracks_by_id[track_id] for track_id in track_ids]}
+
+
+class ArtistTracksTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin_content = import_plugin_content()
+        FakeWindow.windows.clear()
+        module = self.plugin_content.xbmcplugin
+        for name in ("TRACKNUM", "TITLE", "VIDEO_YEAR", "SONG_RATING"):
+            setattr(module, f"SORT_METHOD_{name}", 0)
+        self.rows = []
+        self.content_types = []
+        saved = (module.addDirectoryItems, module.setContent)
+        module.addDirectoryItems = lambda handle, items, totalItems=None: self.rows.extend(items)
+        module.setContent = lambda handle, content_type: self.content_types.append(content_type)
+        self.addCleanup(lambda: (setattr(module, "addDirectoryItems", saved[0]), setattr(module, "setContent", saved[1])))
+
+    def browse(self, spotify, content=None):
+        content = content or PlaylistFastPathTests.build_content(self, spotify)
+        content._PluginContent__artist_id = "me"
+        content._PluginContent__params = {"action": ["browse_artist_everything"], "artistid": ["me"]}
+        self.rows.clear()
+        content.browse_artist_everything()
+        return content
+
+    def track_ids(self):
+        return [parse_qs(urlsplit(url).query)["track"][0] for url, _li, _folder in self.rows]
+
+    def test_all_tracks_lists_songs_not_album_folders(self):
+        self.browse(ArtistCatalogSpotify(RecordingPlayer.events))
+        self.assertEqual(["songs"], self.content_types)
+        self.assertTrue(self.rows)
+        self.assertFalse(any(folder for _url, _li, folder in self.rows))
+
+    def test_songs_are_newest_release_first_in_track_order(self):
+        self.browse(ArtistCatalogSpotify(RecordingPlayer.events))
+        self.assertEqual(["new-1", "new-2", "long-1", "long-2", "long-3", "comp-1"], self.track_ids())
+
+    def test_other_artists_songs_on_a_compilation_are_left_out(self):
+        self.browse(ArtistCatalogSpotify(RecordingPlayer.events))
+        self.assertNotIn("other-1", self.track_ids())
+        self.assertIn("new-2", self.track_ids(), "a song with a guest artist stays")
+
+    def test_a_single_that_repeats_an_album_song_shows_once(self):
+        self.browse(ArtistCatalogSpotify(RecordingPlayer.events))
+        self.assertNotIn("single-1", self.track_ids())
+
+    def test_songs_past_the_embedded_album_page_are_listed(self):
+        spotify = ArtistCatalogSpotify(RecordingPlayer.events)
+        self.browse(spotify)
+        self.assertEqual([("album-long", 2)], spotify.album_track_requests)
+
+    def test_guest_appearances_are_not_requested(self):
+        spotify = ArtistCatalogSpotify(RecordingPlayer.events)
+        self.browse(spotify)
+        self.assertEqual({"album,single,compilation"}, {request[1] for request in spotify.artist_album_requests})
+
+    def test_rows_play_inside_the_combined_list(self):
+        self.browse(ArtistCatalogSpotify(RecordingPlayer.events))
+        params = parse_qs(urlsplit(self.rows[2][0]).query)
+        self.assertEqual("play_in_queue", params["action"][0])
+        self.assertEqual(("2", "6"), (params["position"][0], params["size"][0]))
+        self.assertEqual({"action": ["browse_artist_everything"], "artistid": ["me"]}, parse_qs(params["list"][0]))
+
+    def test_second_visit_uses_the_cache(self):
+        spotify = ArtistCatalogSpotify(RecordingPlayer.events)
+        content = self.browse(spotify)
+        requests = len(spotify.artist_album_requests)
+        first = self.track_ids()
+        self.browse(spotify, content)
+        self.assertEqual(requests, len(spotify.artist_album_requests))
+        self.assertEqual(first, self.track_ids())
+
+    def test_artist_without_releases_lists_nothing(self):
+        spotify = ArtistCatalogSpotify(RecordingPlayer.events)
+        spotify.RELEASES = []
+        self.browse(spotify)
+        self.assertEqual([], self.rows)
 
 
 if __name__ == "__main__":

@@ -1950,6 +1950,24 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
 
+    def __get_album_track_items(self, album: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Simplified tracks of an album from GET /albums/{id} or GET /albums."""
+        # The album object already embeds the first page of tracks; only page
+        # album_tracks for whatever lies beyond it.
+        album_track_page = album.get("tracks") or {}
+        total = int(album_track_page.get("total") or 0)
+        items = list(album_track_page.get("items") or [])
+        count = len(items)
+        while total > count:
+            page = self.__spotipy.album_tracks(
+                album["id"], market=self.__user_country, limit=50, offset=count
+            )["items"]
+            if not page:
+                break
+            items += page
+            count += len(page)
+        return [track for track in items if track and track.get("id")]
+
     def __get_album_tracks(self, album: Dict[str, Any]) -> List[Dict[str, Any]]:
         cache_str = f"spotify.albumtracks{album['id']}"
         checksum = self.__content_checksum("albumtracks")
@@ -1960,21 +1978,7 @@ class PluginContent:
                 f'Retrieved {album["tracks"]["total"]} cached tracks for album "{album["name"]}".'
             )
         else:
-            # GET /albums/{id} already embeds the first page of tracks; only page
-            # album_tracks for whatever lies beyond it.
-            album_track_page = album.get("tracks") or {}
-            total = int(album_track_page.get("total") or 0)
-            items = list(album_track_page.get("items") or [])
-            count = len(items)
-            while total > count:
-                page = self.__spotipy.album_tracks(
-                    album["id"], market=self.__user_country, limit=50, offset=count
-                )["items"]
-                if not page:
-                    break
-                items += page
-                count += len(page)
-            track_ids = [track["id"] for track in items if track and track.get("id")]
+            track_ids = [track["id"] for track in self.__get_album_track_items(album)]
             # Every track references album_details; leave out the embedded
             # track page so it is not serialised once per track in the cache.
             album_details = {key: value for key, value in album.items() if key != "tracks"}
@@ -3689,7 +3693,61 @@ class PluginContent:
             )
 
     def browse_artist_everything(self) -> None:
-        self.browse_artist_albums(album_type="album,single,appears_on,compilation")
+        """List the songs of the artist's own releases as one song list."""
+        xbmcplugin.setContent(self.__addon_handle, "songs")
+        xbmcplugin.setProperty(
+            self.__addon_handle,
+            "FolderName",
+            self.__addon.getLocalizedString(EVERYTHING_FOR_ARTIST_STR_ID),
+        )
+        cache_str = f"spotify.artisttracks.{self.__artist_id}"
+        checksum = self.__content_checksum("artisttracks", self.__user_country)
+        tracks = self.cache.get(cache_str, checksum=checksum)
+        if tracks is None:
+            tracks = self.__prepare_track_listitems(tracks=self.__get_artist_tracks())
+            self.cache.set(
+                cache_str, tracks, checksum=checksum, expiration=ARTIST_CONTENT_CACHE_EXPIRATION
+            )
+        else:
+            cache_log(f'Retrieved {len(tracks)} cached tracks for artist "{self.__artist_id}".')
+
+        self.__add_track_listitems(tracks)
+        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
+        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_TITLE)
+        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_VIDEO_YEAR)
+        xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_SONG_RATING)
+        xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+
+    def __get_artist_tracks(self) -> List[Dict[str, Any]]:
+        """Full tracks that credit the artist, newest release first, each recording once.
+
+        Guest appearances stay out: other artists' compilations add hundreds of releases.
+        """
+        album_ids = self.__get_artist_album_ids("album,single,compilation")
+        track_ids = []
+        for chunk in get_chunks(album_ids, 20):
+            for album in self.__spotipy.albums(chunk, market=self.__user_country)["albums"]:
+                if not album:
+                    continue
+                track_ids += [
+                    track["id"]
+                    for track in self.__get_album_track_items(album)
+                    if any(artist.get("id") == self.__artist_id for artist in track.get("artists") or [])
+                ]
+        tracks = []
+        recordings = set()
+        # The release that Spotify lists first keeps a recording that several releases share.
+        for chunk in get_chunks(track_ids, 50):
+            for track in self.__spotipy.tracks(chunk, market=self.__user_country)["tracks"]:
+                if not track:
+                    continue
+                recording = (track.get("external_ids") or {}).get("isrc") or track["id"]
+                if recording not in recordings:
+                    recordings.add(recording)
+                    tracks.append(track)
+        # Stable sort keeps the track order inside each release.
+        tracks.sort(key=lambda track: (track.get("album") or {}).get("release_date") or "", reverse=True)
+        return tracks
 
     def browse_artist_just_albums(self) -> None:
         self.browse_artist_albums(album_type="album,compilation")
@@ -3722,27 +3780,7 @@ class PluginContent:
                 f'Retrieved {len(albums)} cached albums of type "{album_type}" for artist "{self.__artist_id}".'
             )
         else:
-            artist_albums = self.__spotipy.artist_albums(
-                self.__artist_id,
-                album_type=album_type,
-                country=self.__user_country,
-                limit=50,
-                offset=0,
-            )
-            count = len(artist_albums["items"])
-            albumids = []
-            while artist_albums["total"] > count:
-                artist_albums["items"] += self.__spotipy.artist_albums(
-                    self.__artist_id,
-                    album_type=album_type,
-                    country=self.__user_country,
-                    limit=50,
-                    offset=count,
-                )["items"]
-                count += 50
-            for album in artist_albums["items"]:
-                albumids.append(album["id"])
-            albums = self.__prepare_album_listitems(albumids)
+            albums = self.__prepare_album_listitems(self.__get_artist_album_ids(album_type))
             self.cache.set(
                 cache_str, albums, checksum=checksum, expiration=ARTIST_CONTENT_CACHE_EXPIRATION
             )
@@ -3753,6 +3791,23 @@ class PluginContent:
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_SONG_RATING)
         xbmcplugin.addSortMethod(self.__addon_handle, xbmcplugin.SORT_METHOD_UNSORTED)
         xbmcplugin.endOfDirectory(handle=self.__addon_handle)
+
+    def __get_artist_album_ids(self, album_type: str) -> List[str]:
+        album_ids = []
+        total = 1
+        while len(album_ids) < total:
+            page = self.__spotipy.artist_albums(
+                self.__artist_id,
+                album_type=album_type,
+                country=self.__user_country,
+                limit=50,
+                offset=len(album_ids),
+            )
+            if not page["items"]:
+                break
+            total = page["total"]
+            album_ids += [album["id"] for album in page["items"]]
+        return album_ids
 
     def __saved_albums_cache_checksum(
         self, total: int, first_items: Optional[List[Dict[str, Any]]] = None
